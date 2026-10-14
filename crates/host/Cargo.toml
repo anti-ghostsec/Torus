@@ -1,0 +1,21 @@
+[package]
+name = "torus-host"
+description = "The process that faces the network: Tor and the page server for one site, and nothing else"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-host-api.workspace = true
+torus-runtime.workspace = true
+torus-core.workspace = true
+torus-tor.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+zeroize = "1"
+
+[dev-dependencies]
+torus-core.workspace = true
+torus-onion-key.workspace = true
+tor-rtcompat = "0.47"
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

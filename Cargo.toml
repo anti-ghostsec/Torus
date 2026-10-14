@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/runtime", "crates/tor", "crates/vault", "crates/host-api", "crates/host", "crates/onion-key", "crates/seal", "app/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+torus-core = { path = "crates/core" }
+torus-runtime = { path = "crates/runtime" }
+torus-tor = { path = "crates/tor" }
+torus-vault = { path = "crates/vault" }
+torus-host-api = { path = "crates/host-api" }
+torus-onion-key = { path = "crates/onion-key" }
+torus-seal = { path = "crates/seal" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util"] }
+
+# Dependencies are always optimised: unoptimised, Tor's cryptography cannot
+# keep up with the network and key derivation takes many seconds. Their debug
+# info is dropped because it costs over 10 GB of disk.
+[profile.dev.package."*"]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+debug = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[patch.crates-io]
+# Upstream saturating-time 0.5.0 never returns on Windows: the clock counts in
+# 100ns, so its search for the largest time stops making progress. Arti calls
+# it while reading the Tor network directory, so Tor never connects. Vendored
+# with a one-line fix in src/internal.rs.
+saturating-time = { path = "patches/saturating-time" }
+# Upstream wry cannot turn on WebView2's custom crash reporting, so the
+# browser engine's crash dumps could be uploaded to Microsoft. Vendored with
+# that one option switched on in src/webview2/mod.rs.
+wry = { path = "patches/wry" }
+# Upstream fs-mistrust canonicalises every folder it is given, which Windows
+# refuses inside an AppContainer, so Tor could not open its own folders in the
+# sandbox. Vendored with a fallback to the path as given (src/lib.rs).
+fs-mistrust = { path = "patches/fs-mistrust" }

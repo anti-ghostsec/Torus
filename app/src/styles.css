@@ -1,0 +1,384 @@
+:root {
+  --bg: #16151a;
+  --panel: #1e1d23;
+  --line: #33313a;
+  --fg: #e8e6ea;
+  --dim: #9d99a6;
+  --accent: #9b5fb8;
+  --error: #e5484d;
+  --warn: #e2a336;
+  font: 14px/1.45 system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.group.grow {
+  flex: 1;
+}
+
+.pages {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.tab.active {
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.status {
+  flex-basis: 100%;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.status:empty {
+  display: none;
+}
+
+.work {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 160px minmax(360px, 1fr) 260px;
+}
+
+.work > * {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  border-right: 1px solid var(--line);
+}
+
+.palette,
+.side {
+  background: var(--panel);
+}
+
+h2 {
+  margin: 14px 0 8px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+h2:first-child {
+  margin-top: 0;
+}
+
+.hint,
+.empty {
+  color: var(--dim);
+  margin: 6px 0;
+}
+
+.palette-item {
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  cursor: grab;
+}
+
+.palette-item:hover {
+  border-color: var(--accent);
+}
+
+.canvas {
+  padding: 0;
+}
+
+#canvas {
+  display: flex;
+  min-height: 100%;
+}
+.field {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.field span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--dim);
+}
+
+.field input:not([type="checkbox"]):not([type="color"]),
+.field select,
+.field textarea {
+  width: 100%;
+  user-select: text;
+}
+
+.field textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+.side button {
+  margin: 0 6px 6px 0;
+}
+
+.findings {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.findings li {
+  margin-bottom: 6px;
+  padding-left: 8px;
+  border-left: 3px solid var(--line);
+  user-select: text;
+}
+
+.findings .error {
+  border-color: var(--error);
+}
+
+.findings .warning {
+  border-color: var(--warn);
+}
+
+.findings .ok {
+  color: var(--dim);
+}
+
+.lock {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: var(--bg);
+}
+
+.lock[hidden] {
+  display: none;
+}
+
+.lock h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.lock p {
+  max-width: 340px;
+  margin: 0 0 6px;
+  text-align: center;
+  color: var(--dim);
+}
+
+.lock input {
+  width: 300px;
+  user-select: text;
+}
+
+.lock-error {
+  min-height: 1.5em;
+  color: var(--error) !important;
+}
+
+#sites {
+  max-width: 170px;
+}
+
+.collection {
+  margin-bottom: 10px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.collection > input {
+  width: 100%;
+  margin-bottom: 6px;
+  font-weight: 600;
+  user-select: text;
+}
+
+/* Phones and narrow windows: one column. The blocks to add sit in a strip
+   under the header, then the page, then the settings of the selected block. */
+@media (max-width: 800px) {
+  html,
+  body {
+    height: auto;
+  }
+
+  body {
+    font-size: 15px;
+  }
+
+  .bar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+
+  .work {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .work > * {
+    overflow: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .palette {
+    padding: 8px 12px;
+  }
+
+  .palette h2,
+  .palette .hint {
+    display: none;
+  }
+
+  #palette {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .palette-item {
+    flex: none;
+    margin: 0;
+    white-space: nowrap;
+  }
+
+  .canvas > #canvas {
+    min-height: 50vh;
+  }
+}
+
+/* Fingers need bigger targets than a mouse pointer does. */
+@media (pointer: coarse) {
+  button,
+  select,
+  input:not([type="checkbox"]):not([type="color"]),
+  .palette-item,
+  .tab {
+    min-height: 40px;
+  }
+
+  input[type="checkbox"] {
+    width: 22px;
+    height: 22px;
+  }
+}
+
+.record {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 4px;
+  user-select: text;
+}
+
+.record span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record button {
+  margin: 0;
+  padding: 2px 7px;
+}
+
+.field-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.field-row input:not([type="checkbox"]) {
+  flex: 1;
+  min-width: 0;
+  user-select: text;
+}
+
+.field-row select {
+  width: 68px;
+}
+
+.field-row button {
+  margin: 0;
+  padding: 2px 7px;
+}

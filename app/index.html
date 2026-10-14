@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Torus</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <form id="lock" class="lock" hidden>
+      <h1>Torus</h1>
+      <p id="lock-text"></p>
+      <input id="passphrase" type="password" placeholder="Passphrase" autocomplete="off" />
+      <input id="passphrase-again" type="password" placeholder="Repeat passphrase" autocomplete="off" hidden />
+      <button class="primary">Unlock</button>
+      <p id="lock-error" class="lock-error"></p>
+    </form>
+
+    <!-- Which site, which page, and putting it online. -->
+    <header class="bar">
+      <div class="group">
+        <select id="sites" aria-label="Site"></select>
+        <button id="add-site" title="Add site">+ Site</button>
+        <button id="lock-now" title="Forget the passphrase until it is typed again">Lock</button>
+      </div>
+      <div class="group grow">
+        <div id="pages" class="pages"></div>
+        <button id="add-page" title="Add page">+ Page</button>
+      </div>
+      <div class="group">
+        <button id="stop" hidden>Take offline</button>
+        <button id="test">Test here</button>
+        <button id="publish" class="primary">Publish to Tor</button>
+      </div>
+      <span id="status" class="status"></span>
+    </header>
+
+    <div class="work">
+      <aside class="palette">
+        <h2>Add a block</h2>
+        <div id="palette"></div>
+        <p class="hint">Drag one onto the page, or tap it on a touch screen.</p>
+      </aside>
+
+      <section class="canvas">
+        <div id="canvas"></div>
+      </section>
+
+      <!-- Ordered from what is being worked on right now to what is rarely touched. -->
+      <aside class="side">
+        <h2 id="selected">Selected block</h2>
+        <div id="inspector"></div>
+        <h2>This page</h2>
+        <div id="page-settings"></div>
+        <h2>Checks</h2>
+        <ul id="findings" class="findings"></ul>
+        <h2>Collections</h2>
+        <div id="collections"></div>
+        <h2>Whole site</h2>
+        <label class="field"><span>Site name</span><input id="site-title" /></label>
+        <div id="site-settings"></div>
+      </aside>
+    </div>
+  </body>
+</html>

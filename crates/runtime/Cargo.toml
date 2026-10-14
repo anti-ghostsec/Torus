@@ -1,0 +1,31 @@
+[package]
+name = "torus-runtime"
+description = "Serves a compiled bundle with a fixed, minimal set of response headers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-core.workspace = true
+tokio.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+chacha20poly1305 = "0.10"
+getrandom = { version = "0.2", features = ["std"] }
+serde_json.workspace = true
+zeroize = "1"
+torus-seal.workspace = true
+serde.workspace = true
+argon2 = "0.5"
+sha2 = "0.10"
+multer = "3"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
+[dev-dependencies]
+zeroize = "1"
+torus-seal.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+crc32fast = "1"
+torus-core.workspace = true

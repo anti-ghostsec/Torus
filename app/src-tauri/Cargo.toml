@@ -1,0 +1,36 @@
+[package]
+name = "torus"
+description = "Torus visual builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "torus_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# Where programs cannot start others, the host runs inside the app.
+[target.'cfg(target_os = "android")'.dependencies]
+torus-host = { path = "../../crates/host" }
+
+[dev-dependencies]
+torus-host = { path = "../../crates/host" }
+
+[dependencies]
+torus-core.workspace = true
+torus-host-api.workspace = true
+torus-onion-key.workspace = true
+torus-vault.workspace = true
+serde_json.workspace = true
+zeroize = "1"
+torus-seal.workspace = true
+getrandom = { version = "0.2", features = ["std"] }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+tokio.workspace = true

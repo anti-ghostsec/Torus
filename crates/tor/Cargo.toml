@@ -1,0 +1,46 @@
+[package]
+name = "torus-tor"
+description = "Publishes the runtime as a Tor v3 onion service using Arti"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+torus-runtime.workspace = true
+tokio.workspace = true
+arti-client = { version = "0.47", default-features = false, features = [
+    "tokio",
+    # rustls rather than Windows' own TLS, which stalls on Tor handshakes.
+    "rustls",
+    "compression",
+    # Protects the service's entry relays from discovery by hostile relays.
+    "vanguards",
+    "onion-service-service",
+    # Not used directly: Arti's experimental API does not compile without it.
+    "onion-service-client",
+    "static-sqlite",
+    # Keys stay in RAM; the identity key is supplied from the vault.
+    "ephemeral-keystore",
+    "experimental-api",
+    "hs-pow-full",
+] }
+tor-hsservice = "0.47"
+tor-hscrypto = "0.47"
+tor-llcrypto = "0.47"
+tor-keymgr = "0.47"
+tor-config = "0.47"
+tor-proto = "0.47"
+tor-cell = "0.47"
+tor-rtcompat = "0.47"
+safelog = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures = "0.3"
+getrandom = { version = "0.2", features = ["std"] }
+zeroize = "1"
+
+[dev-dependencies]
+torus-core.workspace = true
+torus-onion-key.workspace = true
+tracing = "0.1"
+tracing-subscriber = "0.3"
+saturating-time = "0.5"

@@ -1,0 +1,18 @@
+[package]
+name = "torus-vault"
+description = "Passphrase-encrypted single-file storage for a project and its keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = { version = "0.2", features = ["std"] }
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Memory"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": ["binaries/torus-host", "binaries/ffmpeg"],
+    "resources": {
+      "../../tools/ffmpeg/LICENSE.txt": "licenses/FFmpeg-LICENSE.txt"
+    }
+  }
+}
