@@ -92,6 +92,14 @@ pub type Reach = Arc<dyn Fn(String, Zeroizing<Vec<u8>>) -> Pin<Box<dyn Future<Ou
 
 struct Loaded {
     wallet: tokio::sync::Mutex<Wallet>,
+    /// For pages, which must never wait on the wallet: its addresses, and
+    /// what it held when last looked at.
+    addresses: torus_wallet::Addresses,
+    seen: Mutex<Seen>,
+    /// The wallet's state as last saved, and its key, so the books can be
+    /// saved without waiting for the wallet.
+    saved_state: Mutex<State>,
+    spend_hex: Zeroizing<String>,
     ledger: Mutex<Ledger>,
     node: Mutex<Option<String>>,
     tor_key: Zeroizing<Vec<u8>>,
@@ -108,6 +116,20 @@ pub struct Treasury {
     reach: Reach,
     /// The highest fee per unit of weight a node may ask; see `Wallet`.
     max_fee: Option<u64>,
+}
+
+/// The wallet as last seen, for whoever cannot wait for it.
+#[derive(Default, Clone, Copy)]
+struct Seen {
+    height: usize,
+    unborn: bool,
+    spendable: Piconero,
+    arriving: Piconero,
+}
+
+fn seen(wallet: &Wallet) -> Seen {
+    let (spendable, arriving) = wallet.balance();
+    Seen { height: wallet.state.height(), unborn: wallet.state.is_unborn(), spendable, arriving }
 }
 
 fn today() -> u64 {
@@ -150,6 +172,10 @@ impl Treasury {
             wallet.max_fee_per_weight = max;
         }
         let loaded = Loaded {
+            addresses: wallet.addresses(),
+            seen: Mutex::new(seen(&wallet)),
+            saved_state: Mutex::new(wallet.state.clone()),
+            spend_hex: wallet.spend_key_hex(),
             wallet: tokio::sync::Mutex::new(wallet),
             ledger: Mutex::new(stored.ledger.clone()),
             node: Mutex::new(stored.node.clone()),
@@ -190,6 +216,22 @@ impl Treasury {
         self.load(Some(&stored))
     }
 
+    /// Saves the books, with the wallet as it was last saved: for changes
+    /// that touch only the books, which must not wait on the wallet.
+    fn save_books(&self, loaded: &Loaded) -> Result<(), String> {
+        // Held until saved: one save at a time, so an older state is never
+        // saved over a newer one.
+        let saving = loaded.saved_state.lock().unwrap_or_else(|e| e.into_inner());
+        let stored = StoredMoney {
+            spend: loaded.spend_hex.to_string(),
+            state: saving.clone(),
+            ledger: loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            node: loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            tor_key: hex::encode(&loaded.tor_key[..]),
+        };
+        (self.keep)(stored)
+    }
+
     /// Saves what the wallet is now.
     async fn save(&self, loaded: &Loaded) -> Result<(), String> {
         let wallet = loaded.wallet.lock().await;
@@ -197,6 +239,9 @@ impl Treasury {
     }
 
     fn save_with(&self, loaded: &Loaded, wallet: &Wallet) -> Result<(), String> {
+        *loaded.seen.lock().unwrap_or_else(|e| e.into_inner()) = seen(wallet);
+        let mut saving = loaded.saved_state.lock().unwrap_or_else(|e| e.into_inner());
+        *saving = wallet.state.clone();
         let stored = StoredMoney {
             spend: wallet.spend_key_hex().to_string(),
             state: wallet.state.clone(),
@@ -273,6 +318,18 @@ impl Treasury {
             }
         };
         let mut wallet = loaded.wallet.lock().await;
+        // Watched from now on: every address the books have handed out.
+        let handed_out: Vec<Slot> = {
+            let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            ledger
+                .sites
+                .values()
+                .map(|book| Slot { account: book.account, address: book.users.values().map(|p| p.address).max().unwrap_or(0) })
+                .collect()
+        };
+        for slot in handed_out {
+            wallet.claim(slot);
+        }
         let before = wallet.state.height();
         let arrivals = match wallet.sync(&daemon, STEP).await {
             Ok(arrivals) => arrivals,
@@ -296,22 +353,24 @@ impl Treasury {
         }
         if wallet.state.height() != before {
             self.save_with(&loaded, &wallet)?;
+        } else {
+            *loaded.seen.lock().unwrap_or_else(|e| e.into_inner()) = seen(&wallet);
         }
         Ok(wallet.state.height() < tip)
     }
 
     pub async fn summary(&self) -> Option<Summary> {
         let loaded = self.loaded()?;
-        let wallet = loaded.wallet.lock().await;
         let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let (spendable, arriving) = wallet.balance();
+        let now = *loaded.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let (spendable, arriving) = (now.spendable, now.arriving);
         let sites = ledger
             .sites
             .iter()
             .filter_map(|(site, book)| {
                 Some(SiteMoney {
                     site: site.parse().ok()?,
-                    address: wallet.address(Slot { account: book.account, address: 0 }),
+                    address: loaded.addresses.address(Slot { account: book.account, address: 0 }),
                     earned: book.earned,
                     users: book.users.len(),
                     held_by_users: book.users.values().map(|p| p.balance).sum(),
@@ -323,13 +382,13 @@ impl Treasury {
         let tip = *loaded.tip.lock().unwrap_or_else(|e| e.into_inner());
         let trouble = loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some(Summary {
-            address: wallet.address(Slot::OWNER),
+            address: loaded.addresses.address(Slot::OWNER),
             node,
             own: ledger.own,
             spendable,
             arriving,
             owed: ledger.owed(),
-            height: if wallet.state.is_unborn() { 0 } else { wallet.state.height() },
+            height: if now.unborn { 0 } else { now.height },
             tip,
             trouble,
             sites,
@@ -410,7 +469,7 @@ impl Treasury {
             Some(amount) => amount,
             None => {
                 let guess = held.saturating_sub(torus_core::money::PER_XMR / 1000).max(1);
-                let fee = wallet.fee_for(&daemon, to.clone(), guess).await.map_err(|e| self.explain(e))?;
+                let fee = wallet.fee_for(&daemon, to, guess).await.map_err(|e| self.explain(e))?;
                 held.checked_sub(fee).filter(|a| *a > 0).ok_or_else(|| format!("{} would not even pay the network's fee.", format_xmr(held)))?
             }
         };
@@ -451,15 +510,14 @@ impl Treasury {
                     let had = ledger.sites.get(&key).is_some_and(|b| b.users.contains_key(&user));
                     (ledger.slot(&key, &me), !had)
                 };
-                let address = {
-                    let mut wallet = loaded.wallet.lock().await;
-                    let address = wallet.claim(slot);
-                    if made {
-                        // A new address is watched from now on, and kept.
-                        let _ = self.save_with(&loaded, &wallet);
+                // The wallet watches it from its next read of the chain on;
+                // the books, saved now, remember it was handed out.
+                if made {
+                    if let Err(e) = self.save_books(&loaded) {
+                        return Told::Refused(format!("The wallet could not be saved: {e}"));
                     }
-                    address
-                };
+                }
+                let address = loaded.addresses.address(slot);
                 let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
                 let book = &ledger.sites[&key];
                 Told::Purse(Purse {
@@ -472,8 +530,7 @@ impl Treasury {
             }
             Ask::SiteAddress => {
                 let slot = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).slot(&key, &Party::Site);
-                let address = loaded.wallet.lock().await.claim(slot);
-                Told::SiteAddress(Some(address))
+                Told::SiteAddress(Some(loaded.addresses.address(slot)))
             }
             Ask::Pay { from, to, amount } => {
                 let done = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).transfer(&key, &Party::User(from), &party(to), amount);
@@ -509,7 +566,7 @@ impl Treasury {
                         &address,
                         amount,
                         from,
-                        move |ledger, total| ledger.withdraw(&site_key, &me_take, total - total.min(0), 0, day).map(|_| ()),
+                        move |ledger, total| ledger.withdraw(&site_key, &me_take, total, 0, day).map(|_| ()),
                         move |ledger, total| {
                             ledger.refund(&torus_wallet::ledger::Withdrawal { site: back_key, party: me_back, amount: total, fee: 0, day })
                         },
@@ -521,8 +578,8 @@ impl Treasury {
                 }
             }
         };
-        if !matches!(answer, Told::Purse(_) | Told::SiteAddress(_) | Told::Refused(_)) {
-            if let Err(e) = self.save(&loaded).await {
+        if matches!(answer, Told::Done) {
+            if let Err(e) = self.save_books(&loaded) {
                 return Told::Refused(format!("That was done but could not be saved: {e}"));
             }
         }

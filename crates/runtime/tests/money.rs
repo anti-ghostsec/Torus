@@ -215,10 +215,12 @@ async fn visitors_hold_tip_subscribe_and_withdraw() {
 }
 
 #[tokio::test]
-async fn without_a_wallet_the_blocks_say_so() {
+async fn without_a_wallet_the_blocks_stay_out_of_sight() {
     let (addr, _live) = start(site()).await;
     let (ada, token) = join(addr, "Ada").await;
-    assert!(get(addr, "/account", Some(&ada)).await.text().contains("The wallet cannot be reached right now."));
+    let account = get(addr, "/account", Some(&ada)).await.text();
+    assert!(!account.contains("Your Monero") && !account.contains("wallet"), "nothing of a wallet shows: {account}");
+    assert!(!get(addr, "/account", None).await.text().contains("Sign in to see your wallet."));
     assert!(!get(addr, "/", None).await.text().contains("Support this site"), "no address to show");
     let fields = [("_token", token.as_str()), ("_next", "/account"), ("address", "8x"), ("amount", "")];
     assert_eq!(post(addr, "/_wallet/withdraw", Some(&ada), &fields).await.status, 503);

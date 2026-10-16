@@ -594,10 +594,11 @@ impl View<'_> {
             let sample = Purse { address: "8 your own address".into(), balance: money::PER_XMR / 4, ..Purse::default() };
             return self.wallet_of(html, label, &sample);
         }
+        // Without a site address there is no wallet at all: nothing to show.
         match (self.viewer, self.purse) {
-            (None, _) => html.push_str("<p class=\"empty\">Sign in to see your wallet.</p>\n"),
-            (Some(_), None) => html.push_str("<p class=\"empty\">The wallet cannot be reached right now.</p>\n"),
+            (None, _) if self.site_address.is_some() => html.push_str("<p class=\"empty\">Sign in to see your wallet.</p>\n"),
             (Some(_), Some(purse)) => self.wallet_of(html, label, purse),
+            _ => {}
         }
     }
 
@@ -654,7 +655,7 @@ impl View<'_> {
     fn tip(&self, html: &mut String, amount: &str, label: &str, shown: Option<Shown<'_>>) {
         let Some(amount) = parse_xmr(amount) else { return };
         let payee = money::payee(shown.map(|s| s.collection.name.as_str()), shown.map(|s| s.record));
-        if !self.tagged && (self.viewer.is_none() || self.is_payee(&payee)) {
+        if !self.tagged && (self.viewer.is_none() || self.purse.is_none() || self.is_payee(&payee)) {
             return;
         }
         self.open_wallet_form(html, "tip", shown);
