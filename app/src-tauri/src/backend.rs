@@ -813,6 +813,7 @@ mod tests {
         accounts: false,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
             pages: vec![Page {
                 slug: "index".into(),
                 title: "Home".into(),

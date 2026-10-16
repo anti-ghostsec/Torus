@@ -795,6 +795,13 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
         Ok(fields) => fields,
         Err(reply) => return reply,
     };
+    // A blocked word in any text field: refuse it, or hold it for approval.
+    // A moderator's own posts are never caught by the word filter.
+    let is_moderator = viewer.as_ref().is_some_and(|v| v.moderator);
+    let blocked = !is_moderator && fields.values().any(|value| site.moderation.blocks(value));
+    if blocked && !site.moderation.blocked_held {
+        return bad("That could not be posted. Go back and change it, then try again.\n");
+    }
     let mut store = live.store();
     let parent = match &collection.parent {
         None => None,
@@ -807,7 +814,7 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
         }
     };
     // What a moderator adds needs nobody's approval.
-    let held = collection.review && !viewer.as_ref().is_some_and(|viewer| viewer.moderator);
+    let held = blocked || (collection.review && !is_moderator);
     let owner = if collection.members_only { viewer.map(|v| v.id) } else { None };
     // One per member: pressing again takes it back.
     if collection.once_each {
@@ -842,16 +849,22 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
     if held {
         // Sent back to the page they would find nothing new on, a visitor
         // would think it was lost and send it again.
-        let back = escape_attribute(&return_path(site, submission.text(NEXT_FIELD)));
-        let page = format!(
-            "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-             <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Received</title>\n\
-             <link rel=\"stylesheet\" href=\"{STYLE_PATH}\">\n</head>\n<body>\n<main>\n\
-             <p>Received. It will show once it has been approved.</p>\n<p><a href=\"{back}\">Back</a></p>\n</main>\n</body>\n</html>\n"
-        );
-        return build(StatusCode::OK, HTML, page.into(), false);
+        return waiting_page(site, "Received. It will show once it has been approved.");
     }
     see_other(site, submission.text(NEXT_FIELD))
+}
+
+/// A plain page telling the visitor their submission is waiting, with a link
+/// back to the site. Used for held posts and for accounts awaiting approval.
+fn waiting_page(_site: &Site, message: &str) -> Reply {
+    let message = escape_attribute(message);
+    let page = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Received</title>\n\
+         <link rel=\"stylesheet\" href=\"{STYLE_PATH}\">\n</head>\n<body>\n<main>\n\
+         <p>{message}</p>\n<p><a href=\"/\">Back</a></p>\n</main>\n</body>\n</html>\n"
+    );
+    build(StatusCode::OK, HTML, page.into(), false)
 }
 
 /// `return_path` only lets through addresses made of plain characters, but
@@ -988,12 +1001,15 @@ async fn sign_up(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
         return refusal(Refused::NameTaken);
     }
     keep_files(&mut store, users, &mut submission);
-    let opened = store
-        .create_account(site, Record { fields, ..Record::default() }, hash)
-        .and_then(|id| store.open_session(&id));
+    // Where the owner reviews new accounts, the account waits, held, and no
+    // session is opened: it cannot be used until it is approved.
+    let held = site.moderation.approve_accounts;
+    let created = store.create_account(site, Record { fields, held, ..Record::default() }, hash);
+    let opened = if held { created.map(|_| None) } else { created.and_then(|id| store.open_session(&id)).map(Some) };
     drop(store);
     match opened {
-        Ok(cookie) => session_reply(site, submission.text(NEXT_FIELD), &cookie, 30 * 24 * 60 * 60),
+        Ok(Some(cookie)) => session_reply(site, submission.text(NEXT_FIELD), &cookie, 30 * 24 * 60 * 60),
+        Ok(None) => waiting_page(site, "Your account was created. You can sign in once it has been approved."),
         Err(refused) => refusal(refused),
     }
 }
@@ -1014,13 +1030,16 @@ async fn sign_in(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
     };
     let account = live.store().account(submission.text(USER_NAME).trim());
     let password = submission.text(PASSWORD_FIELD).to_owned();
-    let (id, hash) = match account {
-        Some((id, hash)) => (Some(id), hash),
-        None => (None, decoy_hash().to_owned()),
+    let (id, hash, held) = match account {
+        Some((id, hash, held)) => (Some(id), hash, held),
+        // The password is still checked against a decoy, so a wrong name
+        // takes as long to refuse as a wrong password.
+        None => (None, decoy_hash().to_owned(), false),
     };
     let correct = tokio::task::spawn_blocking(move || verify_password(&password, &hash)).await.unwrap_or(false);
-    let Some(id) = id.filter(|_| correct) else {
-        // The same answer for an unknown name and a wrong password.
+    // An account waiting for approval cannot be signed in to yet. The answer
+    // is the same as a wrong password, so a guess learns nothing either way.
+    let Some(id) = id.filter(|_| correct && !held) else {
         return bad("Wrong name or password. Go back and try again.\n");
     };
     let opened = live.store().open_session(&id);

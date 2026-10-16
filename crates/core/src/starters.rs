@@ -169,6 +169,7 @@ pub fn video_site() -> Site {
         accounts: true,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
         collections: vec![
             collection(
                 USERS,
@@ -269,6 +270,7 @@ pub fn board() -> Site {
         accounts: true,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
         collections: Vec::new(),
         pages: vec![page(
             HOME_SLUG,
@@ -363,6 +365,7 @@ pub fn microblog() -> Site {
         accounts: true,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
         collections: vec![
             collection(
                 USERS,
