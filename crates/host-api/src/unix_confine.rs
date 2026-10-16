@@ -256,14 +256,18 @@ pub fn surroundings(files: &[&Path], programs: &[&Path], offline: bool) -> Vec<(
 }
 
 /// Prepares a freshly forked child, between fork and exec: only the given
-/// descriptors survive (moved to 3, 4, ...), and it dies with its parent.
+/// descriptors survive (moved to 3, 4, ...). With `die_with_parent`, it is
+/// killed the moment its parent dies; a host is not, so that it can pack
+/// its Tor bookkeeping away first (it stops by itself once its input closes).
 ///
 /// # Safety
 /// Only to be called in a `pre_exec` hook: it uses async-signal-safe
 /// system calls only.
-pub unsafe fn keep_only(ends: &[RawFd]) -> std::io::Result<()> {
+pub unsafe fn keep_only(ends: &[RawFd], die_with_parent: bool) -> std::io::Result<()> {
     unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        if die_with_parent {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        }
         // Moved above every number they will be given, then into place.
         let mut moved = [0 as RawFd; 8];
         for (at, end) in ends.iter().enumerate() {

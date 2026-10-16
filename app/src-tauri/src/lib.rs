@@ -99,6 +99,9 @@ async fn stop(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
     Ok(())
 }
 
+/// The folder the window's browser engine keeps its files in.
+struct Engine(std::path::PathBuf);
+
 /// Where everything this app keeps lives. On a computer that is one folder,
 /// `TorusData`, beside the program itself, so the app is portable and
 /// leaves nothing in the user's profile or anywhere else. On Android, the
@@ -133,6 +136,7 @@ pub fn run() {
             // and left behind by an earlier run is erased.
             let engine = root.join("webview");
             let _ = torus_vault::folder::erase(&engine);
+            app.manage(Engine(engine.clone()));
             let builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
                 .data_directory(engine)
                 .incognito(true)
@@ -172,6 +176,16 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(backend) = app.try_state::<Backend>() {
                     tauri::async_runtime::block_on(backend.shutdown());
+                }
+                // The window's browser engine kept a private session, but its
+                // folder is erased too, once its own processes have let go.
+                if let Some(Engine(folder)) = app.try_state::<Engine>().map(|e| Engine(e.0.clone())) {
+                    for _ in 0..20 {
+                        if torus_vault::folder::erase(&folder).is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
                 }
             }
         });

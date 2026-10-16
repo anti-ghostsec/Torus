@@ -41,8 +41,20 @@ pub enum Target {
     /// A port on this computer only, for trying a site out.
     Loopback,
     /// A Tor onion service. `identity` is the site's secret key; the two
-    /// folders hold Tor's own bookkeeping for this site.
-    Onion { identity: Vec<u8>, state_dir: PathBuf, cache_dir: PathBuf },
+    /// folders hold Tor's own bookkeeping for this site. That bookkeeping is
+    /// readable only while the site is online: the host unpacks it from
+    /// `kept`, encrypted with `kept_key`, and packs it back and erases the
+    /// readable copy when it stops. The editor never reads the host's
+    /// folder, so nothing the host puts there can mislead it.
+    Onion {
+        identity: Vec<u8>,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+        #[serde(default)]
+        kept: Option<PathBuf>,
+        #[serde(default)]
+        kept_key: Vec<u8>,
+    },
 }
 
 /// Where a host keeps what visitors submit, and the key it is encrypted
@@ -183,8 +195,15 @@ fn confined(program: &Path, sandbox: &Sandbox<'_>, converter: Option<&Path>) -> 
     use confine::Terms;
     let container = sandbox.name;
     let failed = |e: io::Error| format!("could not start the sandbox: {e}");
-    let mut terms =
-        Terms { network: true, processes: 1, memory: HOST_MEMORY, tell: Vec::new(), give: Vec::new(), run: Vec::new() };
+    let mut terms = Terms {
+        network: true,
+        processes: 1,
+        memory: HOST_MEMORY,
+        die_with_editor: false,
+        tell: Vec::new(),
+        give: Vec::new(),
+        run: Vec::new(),
+    };
     // The converter is the same program started in another role, in a
     // container that has no network, with the one program it may run.
     let link = converter.map(|_| confine::link()).transpose().map_err(failed)?;
@@ -195,6 +214,7 @@ fn confined(program: &Path, sandbox: &Sandbox<'_>, converter: Option<&Path>) -> 
             network: false,
             processes: 2,
             memory: CONVERTER_MEMORY,
+            die_with_editor: true,
             tell: vec![
                 (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
                 (CONVERTER_ROLE, format!("{},{}", reads.number(), writes.number()).into()),
@@ -265,9 +285,11 @@ fn unix_launch(
         launch.env(name, value);
     }
     let raw: Vec<i32> = ends.iter().map(|end| end.as_raw_fd()).collect();
+    // Only the host is piped to the editor; the converter dies with whoever started it.
+    let die_with_parent = !piped;
     // SAFETY: `keep_only` makes async-signal-safe system calls only.
     unsafe {
-        launch.pre_exec(move || unix_confine::keep_only(&raw));
+        launch.pre_exec(move || unix_confine::keep_only(&raw, die_with_parent));
     }
     let child = launch.spawn();
     // Our copies of the child's ends close here.
@@ -327,6 +349,7 @@ pub fn converter_alone(
         network: false,
         processes: 2,
         memory: CONVERTER_MEMORY,
+        die_with_editor: true,
         tell: vec![
             (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
             (CONVERTER_ROLE, format!("{},{}", reads.number(), writes.number()).into()),
@@ -599,6 +622,19 @@ impl Host {
             *asked = None;
         }
         answered.map_err(|_| "the host process did not answer".to_owned())?.map_err(|_| GONE.to_owned())
+    }
+}
+
+impl Host {
+    /// Asks the host to stop and waits, for a while, until it has: a host
+    /// stopping on its own packs its Tor bookkeeping away and erases the
+    /// readable copy first. Then the process is ended either way.
+    pub async fn stop(mut self) {
+        let asked = write_frame(&mut *self.stdin.lock().await, &Command::Stop).await;
+        if asked.is_ok() {
+            // The reader ends when the host closes its output, by exiting.
+            let _ = tokio::time::timeout(Duration::from_secs(30), &mut self.reader).await;
+        }
     }
 }
 

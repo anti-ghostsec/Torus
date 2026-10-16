@@ -71,7 +71,7 @@ async fn host_serves_republishes_and_dies_with_its_owner() {
 #[tokio::test]
 async fn a_damaged_key_is_reported_not_served() {
     let dir = std::env::temp_dir().join(format!("torus-host-test-{}", std::process::id()));
-    let target = Target::Onion { identity: vec![1, 2, 3], state_dir: dir.join("state"), cache_dir: dir.join("cache") };
+    let target = Target::Onion { identity: vec![1, 2, 3], state_dir: dir.join("state"), cache_dir: dir.join("cache"), kept: None, kept_key: Vec::new() };
     let error = Host::start(Path::new(HOST), None, None, target, site("x"), None).await.err().unwrap();
     assert!(error.contains("damaged"), "unexpected error: {error}");
 }

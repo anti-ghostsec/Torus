@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use torus_core::{check, lint, render_canvas, Canvas, Finding, Site};
@@ -21,10 +20,6 @@ use torus_host_api::{Host, Records, Sandbox, Target};
 use torus_onion_key::Identity;
 use torus_vault::{folder, Vault};
 use zeroize::Zeroizing;
-
-/// How often Tor's bookkeeping for an online site is packed away, so that
-/// little is lost if the app is closed abruptly.
-const KEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// What the vault file holds once decrypted.
 #[derive(Serialize, Deserialize, Default)]
@@ -99,7 +94,9 @@ impl Session {
             })
             .collect();
         let payload = Payload { sites, next_id: self.next_id, ..Payload::default() };
-        let bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
+        let mut bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
+        // The vault's size says only roughly how much is in it.
+        torus_vault::pad_json(&mut bytes);
         self.vault.save(&bytes).map_err(Failure::new)
     }
 
@@ -169,58 +166,26 @@ pub struct OnionStatus {
     pub files_confined: bool,
 }
 
-/// Tor's bookkeeping for one site: readable only while the site is online.
-struct TorFolder {
-    state: PathBuf,
-    cache: PathBuf,
-    /// The encrypted copy, kept in the editor's own folder, out of the host's reach.
-    kept: PathBuf,
-    key: Zeroizing<[u8; 32]>,
+/// A site that is online. Its host keeps Tor's bookkeeping readable only
+/// while it runs: it unpacks it on start and packs it away and erases the
+/// readable copy when it stops. The editor never reads the host's folder,
+/// so nothing a compromised host puts there can lead the editor anywhere.
+struct Hosted {
+    host: Option<Host>,
+    files_confined: bool,
 }
 
-impl TorFolder {
-    /// Unpacks the bookkeeping for a host to use. The directory cache is
-    /// public information and is fetched afresh instead of being kept.
-    fn open(&self) -> std::io::Result<()> {
-        folder::erase(&self.cache)?;
-        std::fs::create_dir_all(&self.cache)?;
-        folder::unpack(&self.kept, &self.key, &self.state)
-    }
-
-    fn keep(&self) -> std::io::Result<()> {
-        folder::pack(&self.state, &self.key, &self.kept)
-    }
-
-    /// Packs the bookkeeping away and erases the readable copy. A host that
-    /// has just been stopped may still hold its files for a moment.
-    fn close(&self) {
-        let _ = self.keep();
-        for _ in 0..20 {
-            let erased = folder::erase(&self.state).is_ok() && folder::erase(&self.cache).is_ok();
-            if erased {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(250));
+impl Hosted {
+    /// Stops the host the orderly way, so that it tidies up first.
+    async fn retire(mut self) {
+        if let Some(host) = self.host.take() {
+            host.stop().await;
         }
     }
 }
 
-/// A site that is online: its host, and what must happen when it stops.
-struct Hosted {
-    host: Option<Host>,
-    tor: Arc<TorFolder>,
-    keeper: tokio::task::JoinHandle<()>,
-    files_confined: bool,
-}
-
-impl Drop for Hosted {
-    fn drop(&mut self) {
-        self.keeper.abort();
-        // The host goes first, so that nothing writes while the folder is packed.
-        drop(self.host.take());
-        self.tor.close();
-    }
-}
+/// The shortest passphrase a vault may be made with.
+const MIN_PASSPHRASE: usize = 10;
 
 type Slot = Arc<tokio::sync::Mutex<Option<Hosted>>>;
 
@@ -330,10 +295,17 @@ impl Backend {
         Ok(self.data_dir.join("project.vault"))
     }
 
+    /// Where a site's Tor bookkeeping is kept encrypted between runs: in
+    /// the site's own folder, where its host reads and writes it.
     fn kept_tor_path(&self, id: u32) -> Result<PathBuf, Failure> {
-        let dir = self.data_dir.join("tor");
-        std::fs::create_dir_all(&dir).map_err(Failure::new)?;
-        Ok(dir.join(format!("site-{id}.bin")))
+        let kept = self.site_dir(id)?.join("tor-state.bin");
+        // Copies made by the first release, which packed them here itself.
+        let earlier = self.data_dir.join("tor").join(format!("site-{id}.bin"));
+        if earlier.is_file() && !kept.exists() {
+            std::fs::create_dir_all(self.site_dir(id)?).map_err(Failure::new)?;
+            std::fs::rename(&earlier, &kept).map_err(Failure::new)?;
+        }
+        Ok(kept)
     }
 
     fn with_session<T>(&self, f: impl FnOnce(&mut Session) -> Result<T, Failure>) -> Result<T, Failure> {
@@ -356,6 +328,10 @@ impl Backend {
     /// Creates the vault with a first site. Never replaces an existing vault.
     pub fn create_vault(&self, passphrase: String, site: Site) -> Result<Vec<Listed>, Failure> {
         let passphrase = Zeroizing::new(passphrase);
+        // Checked here too, not only in the window: everything rests on it.
+        if passphrase.chars().count() < MIN_PASSPHRASE {
+            return Err(Failure::new(format!("Use a passphrase of at least {MIN_PASSPHRASE} characters.")));
+        }
         let path = self.vault_path()?;
         if path.exists() {
             return Err(Failure::new("A vault already exists."));
@@ -543,7 +519,9 @@ impl Backend {
             self.save(id, site)?;
             return Ok(host.address().to_owned());
         }
-        *hosted = None;
+        if let Some(old) = hosted.take() {
+            old.retire().await;
+        }
 
         let Some(container) = self.container(id) else {
             return Err(Failure::new("This system cannot confine the program that faces the network, so sites are not put on Tor here."));
@@ -551,34 +529,20 @@ impl Backend {
         let (identity, records_key, tor_key) = self.secrets_for(id, site.clone())?;
         let dir = self.site_dir(id)?;
         std::fs::create_dir_all(&dir).map_err(Failure::new)?;
-        let tor_key = <[u8; 32]>::try_from(tor_key.as_slice()).map_err(|_| Failure::new("A stored key is damaged."))?;
-        let tor = Arc::new(TorFolder {
-            state: dir.join("state"),
-            cache: dir.join("cache"),
-            kept: self.kept_tor_path(id)?,
-            key: Zeroizing::new(tor_key),
-        });
-        tor.open().map_err(Failure::new)?;
+        let kept = self.kept_tor_path(id)?;
         let records = Records { file: dir.join("records.bin"), key: records_key.to_vec() };
-        let target = Target::Onion { identity: identity.to_vec(), state_dir: tor.state.clone(), cache_dir: tor.cache.clone() };
-        let started = self.start_host(Some(Sandbox { name: &container, folder: &dir }), target, site, Some(records)).await;
-        let host = match started {
-            Ok(host) => host,
-            Err(message) => {
-                tor.close();
-                return Err(Failure::new(message));
-            }
+        let target = Target::Onion {
+            identity: identity.to_vec(),
+            state_dir: dir.join("state"),
+            cache_dir: dir.join("cache"),
+            kept: Some(kept),
+            kept_key: tor_key.to_vec(),
         };
-        // From here on, dropping `online` stops the host and packs Tor's folder away.
-        let saving = tor.clone();
-        let keeper = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(KEEP_EVERY).await;
-                let tor = saving.clone();
-                let _ = tokio::task::spawn_blocking(move || tor.keep()).await;
-            }
-        });
-        let mut online = Hosted { host: Some(host), tor, keeper, files_confined: true };
+        let host = self
+            .start_host(Some(Sandbox { name: &container, folder: &dir }), target, site, Some(records))
+            .await
+            .map_err(Failure::new)?;
+        let mut online = Hosted { host: Some(host), files_confined: true };
         // Trust nothing: ask the running host to open the vault. If it can,
         // its files are not confined.
         let host = online.host.as_ref().expect("set above");
@@ -588,6 +552,7 @@ impl Backend {
             // host there is still confined in every other way, and what it
             // could read is encrypted. Anywhere else, the site goes offline.
             if !cfg!(target_os = "android") {
+                online.retire().await;
                 return Err(Failure::new(
                     "The sandbox check failed: the host process could read the vault. The site was not published.",
                 ));
@@ -681,8 +646,9 @@ impl Backend {
         let slot = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         if let Some(slot) = slot {
             let hosted = slot.lock().await.take();
-            // Packing and erasing touch the disk: off the threads that answer the window.
-            let _ = tokio::task::spawn_blocking(move || drop(hosted)).await;
+            if let Some(hosted) = hosted {
+                hosted.retire().await;
+            }
         }
     }
 
@@ -794,30 +760,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Tor's bookkeeping is readable only while a site is online, and left
-    /// readable by a run that was killed is erased by the next.
+    /// Tor's bookkeeping left readable by a run that was killed is erased
+    /// by the next start of the app, whether or not the site goes online.
     #[test]
-    fn tor_bookkeeping_is_kept_encrypted() {
+    fn readable_leftovers_are_erased_on_start() {
         let (backend, dir) = backend("tor-folder");
-        let tor = TorFolder {
-            state: dir.join("tor/site-1/state"),
-            cache: dir.join("tor/site-1/cache"),
-            kept: dir.join("kept.bin"),
-            key: Zeroizing::new([5; 32]),
-        };
-        tor.open().unwrap();
-        std::fs::write(tor.state.join("guards.json"), b"SECRET-GUARDS").unwrap();
-        std::fs::write(tor.cache.join("dir.sqlite3"), b"public directory").unwrap();
-        tor.close();
-        assert!(!tor.state.exists() && !tor.cache.exists());
-        assert!(!std::fs::read(&tor.kept).unwrap().windows(6).any(|w| w == b"SECRET"));
-        tor.open().unwrap();
-        assert_eq!(std::fs::read(tor.state.join("guards.json")).unwrap(), b"SECRET-GUARDS");
-
-        // As if the app had been killed while the site was online.
+        let state = dir.join("tor/site-1/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("guards.json"), b"SECRET-GUARDS").unwrap();
+        std::fs::write(dir.join("tor/site-1/records.bin"), b"encrypted, kept").unwrap();
         drop(backend);
         let again = Backend::new(dir.join("data"), dir.join("tor"), PathBuf::from("unused"));
-        assert!(!tor.state.exists(), "readable bookkeeping survived a restart");
+        assert!(!state.exists(), "readable bookkeeping survived a restart");
+        assert!(dir.join("tor/site-1/records.bin").exists(), "visitors' encrypted data was erased");
         drop(again);
         let _ = std::fs::remove_dir_all(dir);
     }

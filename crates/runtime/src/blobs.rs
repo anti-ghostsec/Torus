@@ -35,6 +35,28 @@ pub(crate) enum Source {
     Disk { path: PathBuf, key: Zeroizing<[u8; 32]> },
 }
 
+/// Gives a file the same times as every other file this app writes, so that
+/// the disk says nothing about when anything was added or changed.
+pub(crate) fn hide_times(file: &std::fs::File) {
+    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800); // 2000-01-01
+    let times = std::fs::FileTimes::new().set_accessed(fixed).set_modified(fixed);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(fixed)
+    };
+    let _ = file.set_times(times);
+}
+
+/// Pads `bytes` with spaces to a whole number of 64 KiB, so that the size of
+/// what is stored says little about how much is in it. JSON readers skip
+/// trailing spaces.
+pub(crate) fn pad_json(bytes: &mut Vec<u8>) {
+    const STEP: usize = 64 * 1024;
+    let padded = bytes.len().div_ceil(STEP).max(1) * STEP;
+    bytes.resize(padded, b' ');
+}
+
 pub(crate) fn random_id() -> io::Result<String> {
     let mut random = [0u8; 12];
     getrandom::getrandom(&mut random).map_err(io::Error::other)?;
@@ -113,14 +135,21 @@ impl Writer {
     }
 
     pub fn finish(mut self) -> io::Result<Staged> {
-        let rest = std::mem::take(&mut self.pending);
+        let mut rest = std::mem::take(&mut self.pending);
         if !rest.is_empty() {
+            // The last piece is padded to full length, so the stored file
+            // tells its size only to the nearest 64 KiB. The real size is
+            // kept, encrypted, with the site's data, and reads stop at it.
+            if self.file.is_some() {
+                rest.resize(CHUNK, 0);
+            }
             self.seal(&rest)?;
         }
         let memory = match self.file.take() {
             None => Some(std::mem::take(&mut self.memory)),
             Some((file, path)) => {
                 file.sync_all()?;
+                hide_times(&file);
                 drop(file);
                 std::fs::rename(&path, path.with_extension(""))?;
                 None

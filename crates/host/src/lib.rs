@@ -33,7 +33,41 @@ impl Drop for Task {
 /// Keeps whatever is serving the site alive.
 enum Serving {
     Loopback(Task),
-    Onion { onion: Onion, _tor: Tor },
+    Onion { onion: Onion, _tor: Tor, _keeping: Option<Task> },
+}
+
+/// Tor's bookkeeping for the site, readable only while the host runs.
+#[derive(Clone)]
+struct Kept {
+    state: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    file: std::path::PathBuf,
+    key: Zeroizing<[u8; 32]>,
+}
+
+/// How often the bookkeeping is packed away while online, so that little is
+/// lost if the device loses power.
+const KEEP_EVERY: Duration = Duration::from_secs(5 * 60);
+
+impl Kept {
+    /// Erases whatever an earlier run left readable, and unpacks the copy.
+    /// The directory cache is public, and fetched afresh instead.
+    fn open(&self) -> std::io::Result<()> {
+        torus_vault::folder::erase(&self.cache)?;
+        std::fs::create_dir_all(&self.cache)?;
+        torus_vault::folder::unpack(&self.file, &self.key, &self.state)
+    }
+
+    fn keep(&self) -> std::io::Result<()> {
+        torus_vault::folder::pack(&self.state, &self.key, &self.file)
+    }
+
+    /// Packs the bookkeeping away and erases the readable copies.
+    fn close(&self) {
+        let _ = self.keep();
+        let _ = torus_vault::folder::erase(&self.state);
+        let _ = torus_vault::folder::erase(&self.cache);
+    }
 }
 
 impl Serving {
@@ -45,22 +79,38 @@ impl Serving {
     }
 }
 
-async fn start(target: Target, live: Live) -> Result<(Serving, String), String> {
+async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(Serving, String), String> {
     match target {
         Target::Loopback => {
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
             let address = format!("http://{}", listener.local_addr().map_err(|e| e.to_string())?);
             Ok((Serving::Loopback(Task(tokio::spawn(serve(listener, live)))), address))
         }
-        Target::Onion { identity, state_dir, cache_dir } => {
+        Target::Onion { identity, state_dir, cache_dir, kept: file, kept_key } => {
             let identity = Zeroizing::new(identity);
             let identity = <[u8; 64]>::try_from(identity.as_slice())
                 .map(Zeroizing::new)
                 .map_err(|_| "the onion key is damaged".to_owned())?;
+            let key = Zeroizing::new(kept_key);
+            if let Some(file) = file {
+                let key = <[u8; 32]>::try_from(key.as_slice()).map_err(|_| "the bookkeeping key is damaged".to_owned())?;
+                let opened = Kept { state: state_dir.clone(), cache: cache_dir.clone(), file, key: Zeroizing::new(key) };
+                opened.open().map_err(|e| format!("could not unpack Tor's bookkeeping: {e}"))?;
+                *kept = Some(opened);
+            }
             let tor = Tor::connect(&state_dir, &cache_dir).await.map_err(|e| e.to_string())?;
             let onion = tor.launch("site", &identity, live).map_err(|e| e.to_string())?;
             let address = onion.address().to_owned();
-            Ok((Serving::Onion { onion, _tor: tor }, address))
+            let keeping = kept.clone().map(|kept| {
+                Task(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(KEEP_EVERY).await;
+                        let kept = kept.clone();
+                        let _ = tokio::task::spawn_blocking(move || kept.keep()).await;
+                    }
+                }))
+            });
+            Ok((Serving::Onion { onion, _tor: tor, _keeping: keeping }, address))
         }
     }
 }
@@ -83,7 +133,23 @@ fn open(site: torus_core::Site, records: Option<Records>) -> Result<Live, String
 
 /// Serves as told over `stdin`, reporting over `stdout`, until told to stop
 /// or until `stdin` closes. Returns the exit code for a host program.
-pub async fn run<R, W>(mut stdin: R, mut stdout: W) -> i32
+///
+/// However it ends, Tor's bookkeeping is packed away and its readable copy
+/// erased before this returns.
+pub async fn run<R, W>(stdin: R, stdout: W) -> i32
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let mut kept = None;
+    let code = serve_site(stdin, stdout, &mut kept).await;
+    if let Some(kept) = kept {
+        let _ = tokio::task::spawn_blocking(move || kept.close()).await;
+    }
+    code
+}
+
+async fn serve_site<R, W>(mut stdin: R, mut stdout: W, kept: &mut Option<Kept>) -> i32
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
@@ -104,7 +170,7 @@ where
             return 1;
         }
     };
-    let serving = match start(target, live.clone()).await {
+    let serving = match start(target, live.clone(), kept).await {
         Ok((serving, address)) => {
             if write_frame(&mut stdout, &Event::Ready { address }).await.is_err() {
                 return 0;

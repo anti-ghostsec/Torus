@@ -10,6 +10,7 @@ torus-host-api.workspace = true
 torus-runtime.workspace = true
 torus-core.workspace = true
 torus-tor.workspace = true
+torus-vault.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 zeroize = "1"
 
