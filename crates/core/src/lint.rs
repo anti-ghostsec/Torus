@@ -112,6 +112,9 @@ pub fn lint(site: &Site) -> Vec<Finding> {
                     | Block::Author { .. }
                     | Block::Remove { .. }
                     | Block::Approve { .. }
+                    | Block::Wallet { .. }
+                    | Block::Tip { .. }
+                    | Block::Paid { .. }
             )
         };
         if site.any_block(&needs_accounts) || site.collections.iter().any(|c| c.members_only) {
@@ -259,6 +262,10 @@ fn lint_link(href: &str, scope: &Scope<'_>, add: &mut impl FnMut(Severity, Strin
     }
 }
 
+fn shows_a_field(block: &Block) -> bool {
+    matches!(block, Block::Field { .. }) || block.children().iter().any(|inner| inner.iter().any(shows_a_field))
+}
+
 fn lint_blocks(blocks: &[Block], scope: &Scope<'_>, add: &mut impl FnMut(Severity, String)) {
     let here = scope.record.map(|c| c.name.as_str());
     for block in blocks {
@@ -327,7 +334,29 @@ fn lint_blocks(blocks: &[Block], scope: &Scope<'_>, add: &mut impl FnMut(Severit
                 }
                 Some(_) => {}
             },
-            Block::Views { .. } => {}
+            Block::Views { .. } | Block::Wallet { .. } | Block::Donate { .. } => {}
+            Block::Tip { amount, .. } => match crate::money::parse_xmr(amount) {
+                None | Some(0) => add(Severity::Error, format!("A tip of \"{amount}\" is not an amount of XMR, such as 0.01.")),
+                Some(_) => {}
+            },
+            Block::Paid { price, blocks, .. } => {
+                match crate::money::parse_xmr(price) {
+                    None | Some(0) => add(Severity::Error, format!("A price of \"{price}\" is not an amount of XMR, such as 0.05.")),
+                    Some(_) => {}
+                }
+                // A feed shows records' text to anyone, paid for or not.
+                if let Some(shown) = scope.record {
+                    let fed = scope.site.any_block(&|b| matches!(b, Block::Feed { collection, .. } if *collection == shown.name));
+                    let shows_fields = blocks.iter().any(|b| shows_a_field(b));
+                    if fed && shows_fields {
+                        add(
+                            Severity::Warning,
+                            format!("\"{}\" has a feed, which shows its records to anyone: what is behind this payment is not hidden there.", shown.name),
+                        );
+                    }
+                }
+                lint_blocks(blocks, scope, add);
+            }
             Block::Form { collection, open, prefill, .. } => match scope.site.collection(collection) {
                 None => add(Severity::Error, format!("A form adds to the collection \"{collection}\", which does not exist.")),
                 Some(_) if collection == USERS => {

@@ -1,0 +1,696 @@
+//! The wallet as the editor runs it: kept in the vault, read up to date in
+//! the background through the relay, and asked by the sites on their
+//! visitors' behalf.
+//!
+//! Two locks, so that nothing slow holds up a page: the books (who holds
+//! what) answer at once, while the wallet itself may be busy for a minute
+//! reading the chain or making a transaction over Tor.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use torus_core::money::{format_xmr, Ask, Payee, Piconero, Purse, Told};
+use torus_wallet::ledger::{Ledger, Party, Refused};
+use torus_wallet::transport::Fetcher;
+use torus_wallet::{Chain, Keys, MoneroDaemon, Slot, State, Wallet};
+use zeroize::Zeroizing;
+
+/// How often the chain is read once the wallet has caught up: about one
+/// block's time.
+const SYNC_EVERY: Duration = Duration::from_secs(90);
+/// After a failure, wait this long before trying the node again.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Blocks read in one go while catching up, between which others may use the wallet.
+const STEP: usize = 200;
+
+/// What the vault keeps of the wallet.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredMoney {
+    /// The secret spend key, in hex.
+    spend: String,
+    state: State,
+    ledger: Ledger,
+    /// The node: `host:port`, an onion address or a name.
+    #[serde(default)]
+    node: Option<String>,
+    /// The key Tor's bookkeeping for the relay is kept encrypted with, in hex.
+    tor_key: String,
+}
+
+impl Drop for StoredMoney {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.spend);
+    }
+}
+
+/// The wallet as the window sees it.
+#[derive(Debug, Serialize)]
+pub struct Summary {
+    pub address: String,
+    pub node: Option<String>,
+    /// The owner's own account, apart from every site.
+    pub own: Piconero,
+    /// What the wallet can spend now, and what is on its way.
+    pub spendable: Piconero,
+    pub arriving: Piconero,
+    /// What the sites and their users hold, in all.
+    pub owed: Piconero,
+    /// How far the wallet has read, and how far the chain goes, when known.
+    pub height: usize,
+    pub tip: Option<usize>,
+    /// The last trouble reaching the node, if the last try failed.
+    pub trouble: Option<String>,
+    pub sites: Vec<SiteMoney>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SiteMoney {
+    pub site: u32,
+    pub address: String,
+    pub earned: Piconero,
+    pub users: usize,
+    pub held_by_users: Piconero,
+    pub daily_limit: Piconero,
+}
+
+/// The keys someone needs to restore the wallet in another Monero wallet.
+#[derive(Debug, Serialize)]
+pub struct Restore {
+    pub address: String,
+    pub spend_key: String,
+    pub view_key: String,
+    pub height: usize,
+}
+
+/// Saves the wallet into the vault.
+pub type Keep = Arc<dyn Fn(StoredMoney) -> Result<(), String> + Send + Sync>;
+/// Starts the relay to a node and returns a way to reach it.
+pub type Reach = Arc<dyn Fn(String, Zeroizing<Vec<u8>>) -> Pin<Box<dyn Future<Output = Result<Fetcher, String>> + Send>> + Send + Sync>;
+
+struct Loaded {
+    wallet: tokio::sync::Mutex<Wallet>,
+    ledger: Mutex<Ledger>,
+    node: Mutex<Option<String>>,
+    tor_key: Zeroizing<Vec<u8>>,
+    /// The node, once reached.
+    daemon: tokio::sync::Mutex<Option<MoneroDaemon<Fetcher>>>,
+    tip: Mutex<Option<usize>>,
+    trouble: Mutex<Option<String>>,
+}
+
+pub struct Treasury {
+    loaded: Mutex<Option<Arc<Loaded>>>,
+    syncing: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    keep: Keep,
+    reach: Reach,
+    /// The highest fee per unit of weight a node may ask; see `Wallet`.
+    max_fee: Option<u64>,
+}
+
+fn today() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0)
+}
+
+fn party(payee: Payee) -> Party {
+    match payee {
+        Payee::Site => Party::Site,
+        Payee::Account(id) => Party::User(id),
+    }
+}
+
+fn refused(why: Refused) -> Told {
+    Told::Refused(format!("That could not be done: {why}."))
+}
+
+impl Treasury {
+    pub fn new(keep: Keep, reach: Reach) -> Arc<Treasury> {
+        Arc::new(Treasury { loaded: Mutex::new(None), syncing: Mutex::new(None), keep, reach, max_fee: None })
+    }
+
+    fn loaded(&self) -> Option<Arc<Loaded>> {
+        self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn require(&self) -> Result<Arc<Loaded>, String> {
+        self.loaded().ok_or_else(|| "There is no wallet yet.".to_owned())
+    }
+
+    /// Takes up the wallet the vault holds, if any, as the vault is unlocked.
+    pub fn load(self: &Arc<Self>, stored: Option<&StoredMoney>) -> Result<(), String> {
+        self.unload();
+        let Some(stored) = stored else { return Ok(()) };
+        let spend = Zeroizing::new(hex::decode(&stored.spend).map_err(|_| "The wallet's key is damaged.")?);
+        let keys = Keys::from_bytes(&spend).map_err(|e| e.to_string())?;
+        let tor_key = Zeroizing::new(hex::decode(&stored.tor_key).map_err(|_| "The wallet's relay key is damaged.")?);
+        let mut wallet = Wallet::new(keys, stored.state.clone());
+        if let Some(max) = self.max_fee {
+            wallet.max_fee_per_weight = max;
+        }
+        let loaded = Loaded {
+            wallet: tokio::sync::Mutex::new(wallet),
+            ledger: Mutex::new(stored.ledger.clone()),
+            node: Mutex::new(stored.node.clone()),
+            tor_key,
+            daemon: tokio::sync::Mutex::new(None),
+            tip: Mutex::new(None),
+            trouble: Mutex::new(None),
+        };
+        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(loaded));
+        self.start_syncing();
+        Ok(())
+    }
+
+    /// Forgets the wallet, as the vault is locked. The relay stops with it.
+    pub fn unload(&self) {
+        if let Some(task) = self.syncing.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Makes a new wallet. There is one per compartment of the vault.
+    pub async fn create(self: &Arc<Self>) -> Result<(), String> {
+        if self.loaded().is_some() {
+            return Err("There is a wallet already.".into());
+        }
+        let mut tor_key = Zeroizing::new(vec![0u8; 32]);
+        getrandom::getrandom(&mut tor_key).map_err(|e| e.to_string())?;
+        let keys = Keys::generate();
+        let stored = StoredMoney {
+            spend: hex::encode(&keys.to_bytes()[..]),
+            state: State::unborn(Chain::Mainnet),
+            ledger: Ledger::default(),
+            node: None,
+            tor_key: hex::encode(&tor_key[..]),
+        };
+        (self.keep)(stored.clone())?;
+        self.load(Some(&stored))
+    }
+
+    /// Saves what the wallet is now.
+    async fn save(&self, loaded: &Loaded) -> Result<(), String> {
+        let wallet = loaded.wallet.lock().await;
+        self.save_with(loaded, &wallet)
+    }
+
+    fn save_with(&self, loaded: &Loaded, wallet: &Wallet) -> Result<(), String> {
+        let stored = StoredMoney {
+            spend: wallet.spend_key_hex().to_string(),
+            state: wallet.state.clone(),
+            ledger: loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            node: loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            tor_key: hex::encode(&loaded.tor_key[..]),
+        };
+        (self.keep)(stored)
+    }
+
+    pub async fn set_node(self: &Arc<Self>, node: String) -> Result<(), String> {
+        let loaded = self.require()?;
+        let node = node.trim().to_owned();
+        if torus_host_api::node::Node::parse(&node).is_none() {
+            return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
+        }
+        *loaded.node.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+        *loaded.daemon.lock().await = None;
+        *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.save(&loaded).await?;
+        self.start_syncing();
+        Ok(())
+    }
+
+    fn start_syncing(self: &Arc<Self>) {
+        let mut syncing = self.syncing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = syncing.take() {
+            task.abort();
+        }
+        let treasury = Arc::downgrade(self);
+        *syncing = Some(tokio::spawn(async move {
+            loop {
+                let Some(treasury) = treasury.upgrade() else { return };
+                let pause = match treasury.sync_step().await {
+                    Ok(true) => Duration::ZERO,
+                    Ok(false) => SYNC_EVERY,
+                    Err(trouble) => {
+                        if let Some(loaded) = treasury.loaded() {
+                            *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = Some(trouble);
+                        }
+                        RETRY_AFTER
+                    }
+                };
+                drop(treasury);
+                tokio::time::sleep(pause).await;
+            }
+        }));
+    }
+
+    /// The node, reached through the relay, started on first use.
+    async fn daemon(&self, loaded: &Loaded) -> Result<MoneroDaemon<Fetcher>, String> {
+        let mut daemon = loaded.daemon.lock().await;
+        if let Some(daemon) = daemon.as_ref() {
+            return Ok(daemon.clone());
+        }
+        let node = loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("No Monero node is set.")?;
+        let fetcher = (self.reach)(node, loaded.tor_key.clone()).await?;
+        let reached = MoneroDaemon::new(fetcher).await.map_err(|e| format!("The node did not answer as a Monero node does: {e:?}"))?;
+        *daemon = Some(reached.clone());
+        Ok(reached)
+    }
+
+    /// Reads the chain some way further. `Ok(true)` if there is more to read.
+    pub(crate) async fn sync_step(&self) -> Result<bool, String> {
+        let Some(loaded) = self.loaded() else { return Ok(false) };
+        if loaded.node.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            return Ok(false);
+        }
+        let daemon = match self.daemon(&loaded).await {
+            Ok(daemon) => daemon,
+            Err(e) => {
+                *loaded.daemon.lock().await = None;
+                return Err(e);
+            }
+        };
+        let mut wallet = loaded.wallet.lock().await;
+        let before = wallet.state.height();
+        let arrivals = match wallet.sync(&daemon, STEP).await {
+            Ok(arrivals) => arrivals,
+            Err(e) => {
+                drop(wallet);
+                // Start again with a fresh connection next time.
+                *loaded.daemon.lock().await = None;
+                return Err(e.to_string());
+            }
+        };
+        let tip = torus_wallet::monero_wallet::interface::prelude::ProvidesBlockchainMeta::latest_block_number(&daemon)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        *loaded.tip.lock().unwrap_or_else(|e| e.into_inner()) = Some(tip);
+        *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            ledger.arrived(arrivals);
+            let height = wallet.state.height();
+            ledger.confirm(height, |id| wallet.owns(id));
+        }
+        if wallet.state.height() != before {
+            self.save_with(&loaded, &wallet)?;
+        }
+        Ok(wallet.state.height() < tip)
+    }
+
+    pub async fn summary(&self) -> Option<Summary> {
+        let loaded = self.loaded()?;
+        let wallet = loaded.wallet.lock().await;
+        let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (spendable, arriving) = wallet.balance();
+        let sites = ledger
+            .sites
+            .iter()
+            .filter_map(|(site, book)| {
+                Some(SiteMoney {
+                    site: site.parse().ok()?,
+                    address: wallet.address(Slot { account: book.account, address: 0 }),
+                    earned: book.earned,
+                    users: book.users.len(),
+                    held_by_users: book.users.values().map(|p| p.balance).sum(),
+                    daily_limit: book.daily_limit,
+                })
+            })
+            .collect();
+        let node = loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let tip = *loaded.tip.lock().unwrap_or_else(|e| e.into_inner());
+        let trouble = loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Some(Summary {
+            address: wallet.address(Slot::OWNER),
+            node,
+            own: ledger.own,
+            spendable,
+            arriving,
+            owed: ledger.owed(),
+            height: if wallet.state.is_unborn() { 0 } else { wallet.state.height() },
+            tip,
+            trouble,
+            sites,
+        })
+    }
+
+    /// What it takes to restore the wallet elsewhere.
+    pub async fn restore_keys(&self) -> Result<Restore, String> {
+        let loaded = self.require()?;
+        let wallet = loaded.wallet.lock().await;
+        Ok(Restore {
+            address: wallet.address(Slot::OWNER),
+            spend_key: wallet.spend_key_hex().to_string(),
+            view_key: wallet.view_key_hex().to_string(),
+            height: wallet.state.birth,
+        })
+    }
+
+    pub async fn set_daily_limit(&self, site: u32, limit: Piconero) -> Result<(), String> {
+        let loaded = self.require()?;
+        loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).open(&site.to_string()).daily_limit = limit;
+        self.save(&loaded).await
+    }
+
+    /// Moves what a site has earned into the owner's own account.
+    pub async fn collect(&self, site: u32, amount: Option<Piconero>) -> Result<(), String> {
+        let loaded = self.require()?;
+        {
+            let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            let key = site.to_string();
+            let all = ledger.sites.get(&key).map_or(0, |b| b.earned);
+            ledger.collect(&key, amount.unwrap_or(all)).map_err(|e| e.to_string())?;
+        }
+        self.save(&loaded).await
+    }
+
+    /// A site is deleted: what it held becomes the owner's own.
+    pub async fn close_site(&self, site: u32) -> Result<(), String> {
+        let Some(loaded) = self.loaded() else { return Ok(()) };
+        loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).close(&site.to_string());
+        self.save(&loaded).await
+    }
+
+    /// What a site's users hold, so the owner can be warned before deleting it.
+    pub fn held_by(&self, site: u32) -> Piconero {
+        let Some(loaded) = self.loaded() else { return 0 };
+        let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        ledger.sites.get(&site.to_string()).map_or(0, |b| b.earned + b.users.values().map(|p| p.balance).sum::<Piconero>())
+    }
+
+    /// Sends from the owner's own account. `None` sends all of it.
+    pub async fn send_own(&self, address: String, amount: Option<Piconero>) -> Result<(Piconero, Piconero), String> {
+        let loaded = self.require()?;
+        let own = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).own;
+        self.send_out(&loaded, &address, amount, own, |ledger, total| ledger.spend_own(total).map(|_| ()), |ledger, total| {
+            ledger.own = ledger.own.saturating_add(total)
+        })
+        .await
+    }
+
+    /// Makes, signs and sends a payment out of the wallet, taking it and its
+    /// fee from a balance in the books first and giving it back if sending
+    /// fails. `held` is the balance it is paid from.
+    async fn send_out(
+        &self,
+        loaded: &Loaded,
+        address: &str,
+        amount: Option<Piconero>,
+        held: Piconero,
+        take: impl FnOnce(&mut Ledger, Piconero) -> Result<(), Refused>,
+        give_back: impl FnOnce(&mut Ledger, Piconero),
+    ) -> Result<(Piconero, Piconero), String> {
+        let daemon = self.daemon(loaded).await?;
+        let mut wallet = loaded.wallet.lock().await;
+        let to = wallet.parse_address(address).map_err(|e| e.to_string())?;
+        // Everything: the fee is found first, then taken from what is sent.
+        let wanted = match amount {
+            Some(amount) => amount,
+            None => {
+                let guess = held.saturating_sub(torus_core::money::PER_XMR / 1000).max(1);
+                let fee = wallet.fee_for(&daemon, to.clone(), guess).await.map_err(|e| self.explain(e))?;
+                held.checked_sub(fee).filter(|a| *a > 0).ok_or_else(|| format!("{} would not even pay the network's fee.", format_xmr(held)))?
+            }
+        };
+        let prepared = wallet.prepare(&daemon, vec![(to, wanted)]).await.map_err(|e| self.explain(e))?;
+        let fee = prepared.fee;
+        let total = wanted.saturating_add(fee);
+        if amount.is_none() && total > held {
+            return Err("The fee changed while the payment was being made. Try again.".into());
+        }
+        take(&mut loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()), total).map_err(|e| e.to_string())?;
+        if let Err(e) = wallet.publish(&daemon, prepared).await {
+            give_back(&mut loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()), total);
+            return Err(format!("The payment could not be sent, and nothing was taken: {e}"));
+        }
+        self.save_with(loaded, &wallet)?;
+        Ok((wanted, fee))
+    }
+
+    fn explain(&self, error: torus_wallet::Error) -> String {
+        match error {
+            torus_wallet::Error::NotEnough { .. } => {
+                "The wallet's coins are still settling from an earlier payment. Try again in about 20 minutes.".into()
+            }
+            e => e.to_string(),
+        }
+    }
+
+    /// Answers a site's question, on behalf of one of its visitors.
+    pub async fn ask(&self, site: u32, ask: Ask) -> Told {
+        let Some(loaded) = self.loaded() else { return Told::Refused("This site has no wallet.".into()) };
+        let key = site.to_string();
+        let day = today();
+        let answer = match ask {
+            Ask::Purse { user } => {
+                let me = Party::User(user.clone());
+                let (slot, made) = {
+                    let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    let had = ledger.sites.get(&key).is_some_and(|b| b.users.contains_key(&user));
+                    (ledger.slot(&key, &me), !had)
+                };
+                let address = {
+                    let mut wallet = loaded.wallet.lock().await;
+                    let address = wallet.claim(slot);
+                    if made {
+                        // A new address is watched from now on, and kept.
+                        let _ = self.save_with(&loaded, &wallet);
+                    }
+                    address
+                };
+                let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                let book = &ledger.sites[&key];
+                Told::Purse(Purse {
+                    address,
+                    balance: book.balance(&me),
+                    arriving: ledger.arriving(&key, &me),
+                    unlocked: book.unlocked_by(&user, day),
+                    left_today: book.left_today(day),
+                })
+            }
+            Ask::SiteAddress => {
+                let slot = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).slot(&key, &Party::Site);
+                let address = loaded.wallet.lock().await.claim(slot);
+                Told::SiteAddress(Some(address))
+            }
+            Ask::Pay { from, to, amount } => {
+                let done = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).transfer(&key, &Party::User(from), &party(to), amount);
+                match done {
+                    Ok(()) => Told::Done,
+                    Err(why) => refused(why),
+                }
+            }
+            Ask::Unlock { user, to, key: what, price, days } => {
+                let days = (days > 0).then_some(u64::from(days));
+                let done = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).unlock(&key, &user, &party(to), &what, price, days, day);
+                match done {
+                    Ok(_) => Told::Done,
+                    Err(why) => refused(why),
+                }
+            }
+            Ask::Withdraw { user, address, amount } => {
+                let me = Party::User(user);
+                let (held, left) = {
+                    let ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    let book = ledger.sites.get(&key);
+                    (book.map_or(0, |b| b.balance(&me)), book.map_or(0, |b| b.left_today(day)))
+                };
+                if held == 0 {
+                    return Told::Refused("There is nothing to withdraw.".into());
+                }
+                let from = held.min(left);
+                let (site_key, me_take, me_back) = (key.clone(), me.clone(), me.clone());
+                let back_key = key.clone();
+                let sent = self
+                    .send_out(
+                        &loaded,
+                        &address,
+                        amount,
+                        from,
+                        move |ledger, total| ledger.withdraw(&site_key, &me_take, total - total.min(0), 0, day).map(|_| ()),
+                        move |ledger, total| {
+                            ledger.refund(&torus_wallet::ledger::Withdrawal { site: back_key, party: me_back, amount: total, fee: 0, day })
+                        },
+                    )
+                    .await;
+                match sent {
+                    Ok((amount, fee)) => Told::Withdrawn { amount, fee },
+                    Err(why) => Told::Refused(why),
+                }
+            }
+        };
+        if !matches!(answer, Told::Purse(_) | Told::SiteAddress(_) | Told::Refused(_)) {
+            if let Err(e) = self.save(&loaded).await {
+                return Told::Refused(format!("That was done but could not be saved: {e}"));
+            }
+        }
+        answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Against a private Monero network on this computer. Skipped unless
+    //! MONEROD names a `monerod` program.
+
+    use super::*;
+    use std::net::TcpListener;
+    use torus_core::money::PER_XMR;
+    use torus_host_api::node::{post, Node};
+
+    struct Network {
+        _process: tokio::process::Child,
+        port: u16,
+    }
+
+    async fn network() -> Option<Network> {
+        let program = std::env::var_os("MONEROD")?;
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let p2p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let folder = std::env::temp_dir().join(format!("torus-treasury-{port}"));
+        let process = tokio::process::Command::new(program)
+            .args(["--regtest", "--offline", "--fixed-difficulty", "1", "--non-interactive", "--no-igd", "--disable-rpc-ban", "--log-level", "0"])
+            .arg(format!("--data-dir={}", folder.display()))
+            .arg(format!("--rpc-bind-port={port}"))
+            .arg(format!("--p2p-bind-port={p2p}"))
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Some(Network { _process: process, port });
+            }
+        }
+        panic!("monerod did not start");
+    }
+
+    fn direct(port: u16) -> Fetcher {
+        let node = Node::parse(&format!("127.0.0.1:{port}")).unwrap();
+        Fetcher::new(move |route, body, limit| {
+            let node = node.clone();
+            async move {
+                let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| e.to_string())?;
+                post(stream, &node, &route, &body, limit).await
+            }
+        })
+    }
+
+    async fn mine(port: u16, address: &str, blocks: usize) {
+        let daemon = MoneroDaemon::new(direct(port)).await.unwrap();
+        let address = torus_wallet::monero_wallet::address::MoneroAddress::from_str_with_unchecked_network(address).unwrap();
+        daemon.generate_blocks(&address, blocks).await.unwrap();
+    }
+
+    async fn catch_up(treasury: &Treasury) {
+        while treasury.sync_step().await.unwrap() {}
+    }
+
+    fn purse(told: Told) -> Purse {
+        match told {
+            Told::Purse(purse) => purse,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sites_users_deposit_tip_and_withdraw() {
+        let Some(net) = network().await else { return };
+        let port = net.port;
+        let kept: Arc<Mutex<Option<StoredMoney>>> = Arc::default();
+        let into = kept.clone();
+        let keep: Keep = Arc::new(move |stored| {
+            *into.lock().unwrap() = Some(stored);
+            Ok(())
+        });
+        let reach: Reach = Arc::new(move |_, _| Box::pin(async move { Ok(direct(port)) }));
+        let make = || {
+            let mut treasury = Treasury::new(keep.clone(), reach.clone());
+            Arc::get_mut(&mut treasury).unwrap().max_fee = Some(u64::MAX);
+            treasury
+        };
+        let treasury = make();
+        treasury.create().await.unwrap();
+        assert!(kept.lock().unwrap().is_some(), "kept in the vault at once");
+        treasury.set_node(format!("127.0.0.1:{port}")).await.unwrap();
+        catch_up(&treasury).await;
+
+        // Coins arrive in the owner's own account.
+        let own = treasury.summary().await.unwrap().address;
+        mine(port, &own, 300).await;
+        catch_up(&treasury).await;
+        let summary = treasury.summary().await.unwrap();
+        assert!(summary.own > 100 * PER_XMR, "{summary:?}");
+        assert_eq!(summary.owed, summary.own);
+
+        // A user of site 1 gets an address and adds to it from the owner's account.
+        let ada = purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await);
+        assert_eq!(ada.balance, 0);
+        let again = purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await);
+        assert_eq!(again.address, ada.address, "always the same address");
+        let bob = purse(treasury.ask(1, Ask::Purse { user: "bob".into() }).await);
+        assert_ne!(bob.address, ada.address);
+        let (sent, fee) = treasury.send_own(ada.address.clone(), Some(3 * PER_XMR)).await.unwrap();
+        assert_eq!(sent, 3 * PER_XMR);
+        assert!(fee > 0);
+        mine(port, &own, 1).await;
+        catch_up(&treasury).await;
+        let arriving = purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await);
+        assert_eq!((arriving.balance, arriving.arriving), (0, 3 * PER_XMR), "seen, not yet confirmed");
+        mine(port, &own, 10).await;
+        catch_up(&treasury).await;
+        assert_eq!(purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await).balance, 3 * PER_XMR);
+
+        // A tip, and a payment to unlock something, move nothing on the chain.
+        assert_eq!(treasury.ask(1, Ask::Pay { from: "ada".into(), to: Payee::Account("bob".into()), amount: PER_XMR }).await, Told::Done);
+        let unlock = Ask::Unlock { user: "ada".into(), to: Payee::Site, key: "pass:site".into(), price: PER_XMR / 2, days: 30 };
+        assert_eq!(treasury.ask(1, unlock).await, Told::Done);
+        let ada_now = purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await);
+        assert_eq!(ada_now.balance, 3 * PER_XMR / 2);
+        assert_eq!(ada_now.unlocked, vec!["pass:site".to_owned()]);
+        assert!(matches!(
+            treasury.ask(1, Ask::Pay { from: "bob".into(), to: Payee::Site, amount: 5 * PER_XMR }).await,
+            Told::Refused(_)
+        ));
+        // Site 2's books are apart from site 1's.
+        assert_eq!(purse(treasury.ask(2, Ask::Purse { user: "ada".into() }).await).balance, 0);
+
+        // Bob withdraws everything he holds to an address outside the wallet.
+        let outside = Wallet::new(Keys::generate(), State::new(Chain::Mainnet, 0)).address(Slot::OWNER);
+        let told = treasury.ask(1, Ask::Withdraw { user: "bob".into(), address: outside.clone(), amount: None }).await;
+        let Told::Withdrawn { amount, fee } = told else { panic!("{told:?}") };
+        assert_eq!(amount + fee, PER_XMR);
+        assert_eq!(purse(treasury.ask(1, Ask::Purse { user: "bob".into() }).await).balance, 0);
+        // Nothing left: refused.
+        assert!(matches!(treasury.ask(1, Ask::Withdraw { user: "bob".into(), address: outside.clone(), amount: None }).await, Told::Refused(_)));
+        // A bad address takes nothing.
+        let bad = treasury.ask(1, Ask::Withdraw { user: "ada".into(), address: "nonsense".into(), amount: Some(PER_XMR / 10) }).await;
+        assert!(matches!(bad, Told::Refused(_)), "{bad:?}");
+        assert_eq!(purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await).balance, 3 * PER_XMR / 2);
+        mine(port, &own, 1).await;
+        catch_up(&treasury).await;
+
+        // The site's earnings move to the owner's own account.
+        treasury.collect(1, None).await.unwrap();
+        let summary = treasury.summary().await.unwrap();
+        assert_eq!(summary.sites.iter().find(|s| s.site == 1).unwrap().earned, 0);
+        assert!(summary.owed <= summary.spendable + summary.arriving, "never owes more than it holds: {summary:?}");
+
+        // Locked and unlocked again, everything is as it was.
+        let before = (summary.own, purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await));
+        treasury.unload();
+        assert!(treasury.summary().await.is_none());
+        let stored = kept.lock().unwrap().clone();
+        let reopened = make();
+        reopened.load(stored.as_ref()).unwrap();
+        let after = (reopened.summary().await.unwrap().own, purse(reopened.ask(1, Ask::Purse { user: "ada".into() }).await));
+        assert_eq!(after, before);
+        let keys = reopened.restore_keys().await.unwrap();
+        assert_eq!(keys.address, own);
+        assert_eq!(keys.spend_key.len(), 64);
+    }
+}

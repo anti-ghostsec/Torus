@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 torus-host = { path = "../../crates/host" }
+tokio = { workspace = true, features = ["process"] }
 
 [dependencies]
 torus-core.workspace = true
@@ -26,6 +27,8 @@ torus-vault.workspace = true
 serde_json.workspace = true
 zeroize = "1"
 torus-seal.workspace = true
+torus-wallet = { path = "../../crates/wallet" }
+hex = "0.4"
 getrandom = { version = "0.2", features = ["std"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

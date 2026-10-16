@@ -8,6 +8,8 @@ use crate::model::{
     Align, Audience, Block, Collection, Field, FieldKind, Layout, Page, Record, Scope, Site, Theme, ID_TOKEN, USERS,
     USER_NAME,
 };
+use crate::money::{self, format_xmr, parse_xmr, Payee, Purse, BLOCK_FIELD, RECORD_FIELD, WALLET_PATH};
+use std::cell::RefCell;
 
 /// Where every page loads its one stylesheet from.
 pub const STYLE_PATH: &str = "/style.css";
@@ -155,6 +157,11 @@ pub struct Visit {
     /// page, so that a small frame beside the form can show how far the
     /// upload has got. Empty where progress is not shown.
     pub upload: String,
+    /// What the signed-in visitor holds in Monero on this site, where the
+    /// site has a wallet and its blocks are on the page.
+    pub purse: Option<Purse>,
+    /// The site's own Monero address, where it has a wallet.
+    pub site_address: Option<String>,
 }
 
 /// One page as the editor shows it: the published markup and stylesheet,
@@ -248,6 +255,9 @@ pub fn render_page(site: &Site, page: &Page, record: Option<&Record>, data: &dyn
         size: visit.size,
         upload: &visit.upload,
         tagged: false,
+        purse: visit.purse.as_ref(),
+        site_address: visit.site_address.as_deref(),
+        trail: RefCell::default(),
     };
     view.body(&mut html, page, record);
     html.push_str("</body>\n</html>\n");
@@ -263,7 +273,20 @@ pub fn render_canvas(site: &Site, slug: &str) -> Option<Canvas> {
     let here = page.path();
     let made_up = page.template.as_deref().and_then(|name| site.collection(name)).map(sample);
     let mut html = String::new();
-    let view = View { site, data: &NoData, here: &here, viewer: None, page: 0, search: "", size: None, upload: "", tagged: true };
+    let view = View {
+        site,
+        data: &NoData,
+        here: &here,
+        viewer: None,
+        page: 0,
+        search: "",
+        size: None,
+        upload: "",
+        tagged: true,
+        purse: None,
+        site_address: None,
+        trail: RefCell::default(),
+    };
     view.body(&mut html, page, made_up.as_ref());
     Some(Canvas { css: style(&site.theme, ".page"), html })
 }
@@ -314,6 +337,11 @@ struct View<'a> {
     upload: &'a str,
     /// Whether to tag blocks and lists for the editor.
     tagged: bool,
+    purse: Option<&'a Purse>,
+    site_address: Option<&'a str>,
+    /// Where on the page the block being rendered is (see `money::locate`),
+    /// so that its forms can say which block sent them.
+    trail: RefCell<Vec<usize>>,
 }
 
 impl View<'_> {
@@ -341,6 +369,26 @@ impl View<'_> {
     /// path of the list being rendered when tagging for the editor.
     fn blocks(&self, html: &mut String, blocks: &[Block], shown: Option<Shown<'_>>, list_path: Option<&str>) {
         for (index, block) in blocks.iter().enumerate() {
+            self.trail.borrow_mut().push(index);
+            self.block(html, index, block, shown, list_path);
+            self.trail.borrow_mut().pop();
+        }
+    }
+
+    /// Renders the blocks of child list `child` of the block being rendered.
+    fn inside(&self, child: usize, html: &mut String, blocks: &[Block], shown: Option<Shown<'_>>, list_path: Option<&str>) {
+        self.trail.borrow_mut().push(child);
+        self.blocks(html, blocks, shown, list_path);
+        self.trail.borrow_mut().pop();
+    }
+
+    /// Where the block being rendered is on the page.
+    fn address(&self) -> String {
+        self.trail.borrow().iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".")
+    }
+
+    fn block(&self, html: &mut String, index: usize, block: &Block, shown: Option<Shown<'_>>, list_path: Option<&str>) {
+        {
             let path = list_path.map(|list| if list.is_empty() { index.to_string() } else { format!("{list}.{index}") });
             if let Some(path) = &path {
                 let _ = writeln!(html, "<div data-b=\"{path}\">");
@@ -368,7 +416,7 @@ impl View<'_> {
                             }
                             None => html.push_str("<div>\n"),
                         }
-                        self.blocks(html, column, shown, column_path.as_deref());
+                        self.inside(column_index, html, column, shown, column_path.as_deref());
                         html.push_str("</div>\n");
                     }
                     html.push_str("</div>\n");
@@ -408,7 +456,7 @@ impl View<'_> {
                             let made_up = listed.map(sample);
                             let item = listed.zip(made_up.as_ref()).map(|(collection, record)| Shown { collection, record });
                             let _ = writeln!(html, "<article data-list=\"{child}\">");
-                            self.blocks(html, blocks, item, Some(child));
+                            self.inside(0, html, blocks, item, Some(child));
                             html.push_str("</article>\n");
                         }
                         (None, Some(listed)) => {
@@ -469,7 +517,7 @@ impl View<'_> {
                             }
                             for record in &records {
                                 html.push_str("<article>\n");
-                                self.blocks(html, blocks, Some(Shown { collection: listed, record }), None);
+                                self.inside(0, html, blocks, Some(Shown { collection: listed, record }), None);
                                 html.push_str("</article>\n");
                             }
                             if *paged && (first > 0 || more) {
@@ -497,20 +545,151 @@ impl View<'_> {
                 Block::Gate { audience, blocks } => match &child {
                     Some(child) => {
                         let _ = writeln!(html, "<div class=\"gate\" data-list=\"{child}\">");
-                        self.blocks(html, blocks, shown, Some(child));
+                        self.inside(0, html, blocks, shown, Some(child));
                         html.push_str("</div>\n");
                     }
                     None => {
                         if (*audience == Audience::Members) == self.viewer.is_some() {
-                            self.blocks(html, blocks, shown, None);
+                            self.inside(0, html, blocks, shown, None);
                         }
                     }
                 },
+                Block::Wallet { label } => self.wallet(html, label),
+                Block::Donate { label } => self.donate(html, label),
+                Block::Tip { amount, label } => self.tip(html, amount, label, shown),
+                Block::Paid { price, label, days, blocks } => self.paid(html, price, label, *days, blocks, shown, child.as_deref()),
             }
             if path.is_some() {
                 html.push_str("</div>\n");
             }
         }
+    }
+
+    /// Opens a form for one of the Monero blocks: it says which block sent
+    /// it, and with which record, so the host can look up the amount itself.
+    fn open_wallet_form(&self, html: &mut String, action: &str, shown: Option<Shown<'_>>) {
+        self.open_form(html, &format!("{WALLET_PATH}{action}"), false);
+        let _ = writeln!(html, "<input type=\"hidden\" name=\"{BLOCK_FIELD}\" value=\"{}\">", escape(&self.address()));
+        if let Some(shown) = shown {
+            let _ = writeln!(
+                html,
+                "<input type=\"hidden\" name=\"{RECORD_FIELD}\" value=\"{}/{}\">",
+                escape(&shown.collection.name),
+                escape(&shown.record.id)
+            );
+        }
+    }
+
+    /// An address to pay, as text, as a picture for a phone, and as a link
+    /// that opens a wallet app.
+    fn address_shown(&self, html: &mut String, address: &str) {
+        let uri = money::payment_uri(address, None);
+        let _ = writeln!(html, "<div class=\"pay\">{}", money::qr_svg(&uri));
+        let _ = writeln!(html, "<p class=\"address\"><code>{}</code></p>", escape(address));
+        let _ = writeln!(html, "<p><a class=\"button\" href=\"{}\">Open in a wallet app</a></p>\n</div>", escape(&uri));
+    }
+
+    fn wallet(&self, html: &mut String, label: &str) {
+        if self.tagged {
+            let sample = Purse { address: "8 your own address".into(), balance: money::PER_XMR / 4, ..Purse::default() };
+            return self.wallet_of(html, label, &sample);
+        }
+        match (self.viewer, self.purse) {
+            (None, _) => html.push_str("<p class=\"empty\">Sign in to see your wallet.</p>\n"),
+            (Some(_), None) => html.push_str("<p class=\"empty\">The wallet cannot be reached right now.</p>\n"),
+            (Some(_), Some(purse)) => self.wallet_of(html, label, purse),
+        }
+    }
+
+    fn wallet_of(&self, html: &mut String, label: &str, purse: &Purse) {
+        let _ = writeln!(html, "<section class=\"wallet\">\n<h2>{}</h2>", escape(label));
+        let _ = writeln!(html, "<p class=\"balance\">{}</p>", format_xmr(purse.balance));
+        if purse.arriving > 0 {
+            let _ = writeln!(
+                html,
+                "<p class=\"arriving\">{} on its way: it counts once the network has confirmed it, about 20 minutes after it was sent.</p>",
+                format_xmr(purse.arriving)
+            );
+        }
+        html.push_str("<h3>Add to it</h3>\n<p>Send Monero to your own address below, from any wallet. Nobody else is given this address.</p>\n");
+        self.address_shown(html, &purse.address);
+        html.push_str("<h3>Withdraw</h3>\n");
+        self.open_wallet_form(html, "withdraw", None);
+        let _ = writeln!(
+            html,
+            "<p><label>To this Monero address<input type=\"text\" name=\"address\" required maxlength=\"110\" autocomplete=\"off\" spellcheck=\"false\"></label></p>\n\
+             <p><label>Amount in XMR, or nothing for all of it<input type=\"text\" name=\"amount\" inputmode=\"decimal\" maxlength=\"24\" autocomplete=\"off\"></label></p>\n\
+             <p class=\"hint\">The network's fee is taken from what you hold. Up to {} can be withdrawn from this site today.</p>",
+            format_xmr(purse.left_today)
+        );
+        self.close_form(html, "Withdraw");
+        let _ = writeln!(html, "<p><a href=\"{}\">Refresh</a></p>\n</section>", escape(self.here));
+    }
+
+    fn donate(&self, html: &mut String, label: &str) {
+        let address = match (self.tagged, self.site_address) {
+            (true, _) => "8 the site's own address",
+            (false, Some(address)) => address,
+            (false, None) => return,
+        };
+        let _ = writeln!(html, "<section class=\"donate\">\n<h2>{}</h2>", escape(label));
+        self.address_shown(html, address);
+        if let Some(purse) = self.purse.filter(|p| p.balance > 0) {
+            self.open_wallet_form(html, "give", None);
+            let _ = writeln!(
+                html,
+                "<p><label>Or give from what you hold ({}), in XMR<input type=\"text\" name=\"amount\" required inputmode=\"decimal\" maxlength=\"24\" autocomplete=\"off\"></label></p>",
+                format_xmr(purse.balance)
+            );
+            self.close_form(html, "Give");
+        }
+        html.push_str("</section>\n");
+    }
+
+    /// Whether the signed-in visitor is who a payment here would go to.
+    fn is_payee(&self, payee: &Payee) -> bool {
+        matches!((payee, self.viewer), (Payee::Account(id), Some(viewer)) if *id == viewer.id)
+    }
+
+    fn tip(&self, html: &mut String, amount: &str, label: &str, shown: Option<Shown<'_>>) {
+        let Some(amount) = parse_xmr(amount) else { return };
+        let payee = money::payee(shown.map(|s| s.collection.name.as_str()), shown.map(|s| s.record));
+        if !self.tagged && (self.viewer.is_none() || self.is_payee(&payee)) {
+            return;
+        }
+        self.open_wallet_form(html, "tip", shown);
+        let _ = writeln!(html, "<p><button class=\"button tip\" type=\"submit\">{} ({})</button></p>\n</form>", escape(label), format_xmr(amount));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paid(&self, html: &mut String, price: &str, label: &str, days: u16, blocks: &[Block], shown: Option<Shown<'_>>, child: Option<&str>) {
+        let Some(price) = parse_xmr(price) else { return };
+        let terms = if days == 0 { format_xmr(price) } else { format!("{} for {days} days", format_xmr(price)) };
+        if let Some(child) = child {
+            let _ = writeln!(html, "<div class=\"paid\" data-list=\"{child}\">\n<p class=\"price\">{} · {}</p>", escape(label), escape(&terms));
+            self.inside(0, html, blocks, shown, Some(child));
+            html.push_str("</div>\n");
+            return;
+        }
+        let collection = shown.map(|s| s.collection.name.as_str());
+        let payee = money::payee(collection, shown.map(|s| s.record));
+        let key = money::unlock_key(days, &payee, collection, shown.map(|s| s.record), self.here);
+        let open = self.is_payee(&payee) || self.purse.is_some_and(|p| p.unlocked.contains(&key));
+        if open {
+            self.inside(0, html, blocks, shown, None);
+            return;
+        }
+        let _ = writeln!(html, "<div class=\"paid locked\">\n<p>{}</p>\n<p class=\"price\">{}</p>", escape(label), escape(&terms));
+        match (self.viewer, self.purse) {
+            (None, _) => html.push_str("<p class=\"empty\">Sign in to unlock this.</p>\n"),
+            (Some(_), None) => html.push_str("<p class=\"empty\">Payments cannot be made right now.</p>\n"),
+            (Some(_), Some(purse)) => {
+                self.open_wallet_form(html, "unlock", shown);
+                let _ = writeln!(html, "<p class=\"hint\">Paid from what you hold: {}.</p>", format_xmr(purse.balance));
+                self.close_form(html, &format!("Pay {}", format_xmr(price)));
+            }
+        }
+        html.push_str("</div>\n");
     }
 
     /// A link to another page of the lists on this page, keeping the search.
@@ -1203,7 +1382,14 @@ fn style(theme: &Theme, root: &str) -> String {
          .formatted code{{font-family:ui-monospace,monospace;font-size:.9em}}\n\
          .formatted p,.formatted li{{overflow-wrap:anywhere}}\n\
          blockquote{{margin:1rem 0;padding:.1rem 1rem;border-left:.25rem solid {muted}}}\n\
-         .empty{{opacity:.7}}\n",
+         .empty{{opacity:.7}}\n\
+         .wallet,.donate,.paid{{margin:1rem 0;padding:.5rem 1rem 1rem;border:1px solid {muted};border-radius:.4rem}}\n\
+         .balance{{margin:.25rem 0;font-size:1.6rem;font-weight:700}}\n\
+         .arriving,.hint,.price{{font-size:.9rem}}\n\
+         .address code{{display:block;padding:.5rem;border:1px solid {muted};border-radius:.4rem;font:13px/1.5 ui-monospace,monospace;overflow-wrap:anywhere;user-select:all}}\n\
+         svg.qr{{display:block;max-width:100%;height:auto;border-radius:.4rem}}\n\
+         .paid.locked{{text-align:center}}\n\
+         .paid.locked svg{{margin:0 auto}}\n",
         accent = accent(theme),
     )
 }

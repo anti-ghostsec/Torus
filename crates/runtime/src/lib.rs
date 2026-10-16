@@ -42,6 +42,7 @@ use torus_core::{
 use torus_core::{render_progress, PROGRESS_PATH, UPLOAD_PARAM, WAITED_PARAM};
 use torus_core::{Visit, PAGE_PARAM, REMOVE_PATH, SEALED_FIELD, SEARCH_MAX, SEARCH_PARAM};
 
+mod bank;
 mod blobs;
 mod faststart;
 mod media;
@@ -52,6 +53,7 @@ mod store;
 
 use blobs::{Staged, Target};
 use store::{Budget, Refused};
+pub use bank::Bank;
 pub use media::{Converter, Job};
 pub use store::{Storage, Store};
 
@@ -138,6 +140,8 @@ struct Inner {
     /// computer: a web page elsewhere cannot then reach it by pointing a
     /// name of its own at this computer (DNS rebinding).
     only_host: OnceLock<String>,
+    /// The editor's wallet, where the site may use one.
+    bank: OnceLock<Arc<dyn Bank>>,
 }
 
 /// The live site. Publishing swaps all its pages at once, so a visitor never
@@ -161,12 +165,23 @@ impl Live {
             uploads: Semaphore::new(MAX_UPLOADS),
             decodes: Semaphore::new(MAX_DECODES),
             only_host: OnceLock::new(),
+            bank: OnceLock::new(),
         }))
     }
 
     /// Answers only requests made to `host` (such as `127.0.0.1:8080`).
     pub fn only_for_host(&self, host: String) {
         let _ = self.0.only_host.set(host);
+    }
+
+    /// From now on, the Monero blocks ask `bank` for what visitors hold
+    /// and have it make their payments.
+    pub fn bank_with(&self, bank: Arc<dyn Bank>) {
+        let _ = self.0.bank.set(bank);
+    }
+
+    fn bank(&self) -> Option<Arc<dyn Bank>> {
+        self.0.bank.get().cloned()
     }
 
     pub fn publish(&self, site: Site) {
@@ -350,8 +365,17 @@ async fn route(
             (_, Some(name)) => progress(live, name, req.uri().query(), head),
             _ if path.starts_with(torus_core::PUZZLE_PATH) => puzzle_picture(live, &path, head),
             _ if path.starts_with(torus_core::FEED_PATH) => feed(live, &site, &path, req.headers().get(hyper::header::HOST), head),
-            _ => page(live, &site, &path, &visit(viewer, req.uri().query()), head),
+            _ => {
+                let mut visit = visit(viewer, req.uri().query());
+                if let Some((shown, _)) = bank::find_page(site, &path) {
+                    (visit.purse, visit.site_address) = bank::look_up(live, shown, visit.viewer.as_ref()).await;
+                }
+                page(live, &site, &path, &visit, head)
+            }
         },
+        Method::POST if site.accounts && path.starts_with(torus_core::money::WALLET_PATH) => {
+            bank::post(live, &site, viewer, &path[torus_core::money::WALLET_PATH.len()..], req).await
+        }
         Method::POST if site.accounts && path.starts_with(REMOVE_PATH) => {
             remove(live, &site, viewer, &path, req).await
         }
@@ -394,6 +418,8 @@ fn visit(viewer: Option<Viewer>, query: Option<&str>) -> Visit {
         search: clean(get(SEARCH_PARAM), FieldKind::Text).chars().take(SEARCH_MAX).collect(),
         size: get(torus_core::SIZE_PARAM).parse().ok(),
         upload: blobs::random_id().unwrap_or_default(),
+        purse: None,
+        site_address: None,
     }
 }
 

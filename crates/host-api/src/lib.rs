@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 use torus_core::{Record, Site};
 use zeroize::Zeroizing;
 
+pub mod node;
+
 #[cfg(windows)]
 mod confine;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -34,6 +36,8 @@ const MAX_FRAME: u32 = 256 * 1024 * 1024;
 /// Connecting to Tor for the first time downloads the network directory.
 const START_TIMEOUT: Duration = Duration::from_secs(300);
 const GONE: &str = "the host process stopped unexpectedly";
+/// A Monero node over Tor can be slow, and some answers are large.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Where a host process serves its site.
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,6 +52,20 @@ pub enum Target {
     /// folder, so nothing the host puts there can mislead it.
     Onion {
         identity: Vec<u8>,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+        #[serde(default)]
+        kept: Option<PathBuf>,
+        #[serde(default)]
+        kept_key: Vec<u8>,
+    },
+    /// No site: only a way through Tor to one Monero node, at `node` (a
+    /// host and port), for the wallet the editor keeps. The host is given
+    /// no key: it passes the wallet's questions to the node and the node's
+    /// answers back, and only learns what the node itself learns. Tor's
+    /// bookkeeping is kept as for an onion.
+    Relay {
+        node: String,
         state_dir: PathBuf,
         cache_dir: PathBuf,
         #[serde(default)]
@@ -85,15 +103,30 @@ pub enum Command {
     Moderators,
     /// Make an account a moderator, or an ordinary account again.
     Moderator { id: String, on: bool },
+    /// For a relay: sends `body` to the node at `route` and returns what it
+    /// answers, refusing an answer larger than `limit`.
+    Fetch {
+        route: String,
+        #[serde(with = "hex::serde")]
+        body: Vec<u8>,
+        limit: usize,
+    },
+    /// The wallet's answer to the host's `Bank` question with this number.
+    Banked { seq: u64, told: torus_core::money::Told },
     /// A question that has an answer, numbered so that a late answer to an
     /// earlier question is never taken for the answer to this one.
     Ask { seq: u64, question: Box<Command> },
     Stop,
 }
 
-/// Host to editor. Information only: nothing here asks the editor to act.
+/// Host to editor. Information only, with one exception: `Bank`, by which
+/// a site's visitors use the wallet. The editor checks every such request
+/// against its own books, so a host can ask for nothing its visitors could
+/// not, and a site's withdrawals are limited by the day.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Event {
+    /// Asks the wallet something on a visitor's behalf; answered with `Banked`.
+    Bank { seq: u64, ask: torus_core::money::Ask },
     /// The site is being served at `address`.
     Ready { address: String },
     Status(Status),
@@ -107,6 +140,8 @@ pub enum Event {
     Moderating { ids: Vec<String> },
     /// The site could not be started. The host exits after sending this.
     Failed { message: String },
+    /// The answer to `Fetch`.
+    Fetched { body: Result<HexBytes, String> },
     /// The answer to the `Ask` with the same number.
     Answer { seq: u64, answer: Box<Event> },
 }
@@ -118,6 +153,11 @@ pub struct Status {
     /// The site has stopped and will not recover without being started again.
     pub broken: bool,
 }
+
+/// Bytes carried as hex: a list of numbers in JSON would be four times larger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HexBytes(#[serde(with = "hex::serde")] pub Vec<u8>);
 
 /// Writes one message: a 4-byte little-endian length, then JSON.
 pub async fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
@@ -454,15 +494,26 @@ pub struct Sandbox<'a> {
 /// process and takes the site offline.
 pub struct Host {
     address: String,
-    stdin: tokio::sync::Mutex<Input>,
+    stdin: Arc<tokio::sync::Mutex<Input>>,
     status: Arc<Mutex<Status>>,
     /// Where the answer to the question being asked is delivered, and its number.
     asked: Arc<Mutex<Option<(u64, oneshot::Sender<Event>)>>>,
     /// The number the next question gets.
     next_seq: std::sync::atomic::AtomicU64,
+    /// Answers the host's questions to the wallet, once set.
+    banker: Arc<Mutex<Option<Banker>>>,
+    /// Held while a question is out.
+    asking: tokio::sync::Mutex<()>,
     reader: JoinHandle<()>,
     _keeper: Keeper,
 }
+
+/// Answers a site's questions to the wallet.
+pub type Banker = Arc<
+    dyn Fn(torus_core::money::Ask) -> std::pin::Pin<Box<dyn std::future::Future<Output = torus_core::money::Told> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl Host {
     /// Starts `program` and waits until it is serving `site`.
@@ -512,6 +563,12 @@ impl Host {
         let status = Arc::new(Mutex::new(Status::default()));
         let asked = Arc::new(Mutex::new(None::<(u64, oneshot::Sender<Event>)>));
         let (shared, waiting) = (status.clone(), asked.clone());
+        let banker: Arc<Mutex<Option<Banker>>> = Arc::default();
+        let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (bank, answers) = (banker.clone(), stdin.clone());
+        // Questions to the wallet are few at a time: a site's forms are
+        // rate-limited, and pages ask once per view.
+        let open_questions = Arc::new(tokio::sync::Semaphore::new(16));
         let reader = tokio::spawn(async move {
             while let Ok(Some(event)) = read_frame::<_, Event>(&mut stdout).await {
                 match event {
@@ -525,25 +582,35 @@ impl Host {
                             let _ = waiter.send(*answer);
                         }
                     }
+                    Event::Bank { seq, ask } => {
+                        let banker = bank.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let Ok(permit) = open_questions.clone().try_acquire_owned() else { continue };
+                        let answers = answers.clone();
+                        tokio::spawn(async move {
+                            let told = match banker {
+                                Some(banker) => banker(ask).await,
+                                None => torus_core::money::Told::Refused("This site has no wallet.".into()),
+                            };
+                            let _ = write_frame(&mut *answers.lock().await, &Command::Banked { seq, told }).await;
+                            drop(permit);
+                        });
+                    }
                     _ => {}
                 }
             }
             // The pipe closed: the process is gone.
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = Status { reachable: false, broken: true };
         });
-        Ok(Self {
-            address,
-            stdin: tokio::sync::Mutex::new(stdin),
-            status,
-            asked,
-            next_seq: Default::default(),
-            reader,
-            _keeper: keeper,
-        })
+        Ok(Self { address, stdin, status, asked, next_seq: Default::default(), banker, asking: Default::default(), reader, _keeper: keeper })
     }
 
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// From now on, the site's questions to the wallet are put to `banker`.
+    pub fn answer_bank_with(&self, banker: Banker) {
+        *self.banker.lock().unwrap_or_else(|e| e.into_inner()) = Some(banker);
     }
 
     pub fn status(&self) -> Status {
@@ -606,16 +673,30 @@ impl Host {
         }
     }
 
+    /// For a relay: one request to the node, and its answer.
+    pub async fn fetch(&self, route: &str, body: Vec<u8>, limit: usize) -> Result<Vec<u8>, String> {
+        let command = Command::Fetch { route: route.to_owned(), body, limit };
+        match self.ask_within(command, FETCH_TIMEOUT).await? {
+            Event::Fetched { body } => body.map(|b| b.0),
+            _ => Err(GONE.to_owned()),
+        }
+    }
+
     /// Sends a command that has an answer and waits for it.
     async fn ask(&self, command: Command) -> Result<Event, String> {
-        // Holding the pipe for the whole exchange keeps questions from overlapping.
-        let mut stdin = self.stdin.lock().await;
+        self.ask_within(command, Duration::from_secs(20)).await
+    }
+
+    async fn ask_within(&self, command: Command, within: Duration) -> Result<Event, String> {
+        // One question at a time; the pipe itself is held only to write, so
+        // the wallet's answers to the host still get through meanwhile.
+        let _turn = self.asking.lock().await;
         let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (answer, wait) = oneshot::channel();
         *self.asked.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, answer));
         let question = Command::Ask { seq, question: Box::new(command) };
-        write_frame(&mut *stdin, &question).await.map_err(|_| GONE.to_owned())?;
-        let answered = tokio::time::timeout(Duration::from_secs(20), wait).await;
+        write_frame(&mut *self.stdin.lock().await, &question).await.map_err(|_| GONE.to_owned())?;
+        let answered = tokio::time::timeout(within, wait).await;
         // Whatever happened, this question is no longer waited for.
         let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
         if asked.as_ref().is_some_and(|(wanted, _)| *wanted == seq) {
