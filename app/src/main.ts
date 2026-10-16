@@ -1126,7 +1126,8 @@ function renderSettings() {
 
 type WalletSummary = {
   address: string;
-  node: string | null;
+  node: string;
+  chosen: boolean;
   own: number;
   spendable: number;
   arriving: number;
@@ -1172,33 +1173,16 @@ function walletBox() {
     }
     if (!box.isConnected) return;
     body.replaceChildren();
-    if (!summary) {
-      const make = el("button", "", "Make a wallet");
-      make.addEventListener("click", async () => {
-        try {
-          await invoke("wallet_create");
-          void show();
-        } catch (error) {
-          showFailure(error);
-        }
-      });
-      body.append(
-        plain(
-          "One wallet for all your sites, kept in the vault. Each site's signed-in visitors get their own address in it: what they send is theirs to tip, pay for content and withdraw, with one click on the site. Tips and payments between them never touch the chain.",
-        ),
-        plain("This is new: use small amounts until you have seen it work for you."),
-        make,
-      );
-      return;
-    }
+    // Every vault has one, made with it; only while locked is there none.
+    if (!summary) return;
     // The node.
-    const node = input("an onion address and port, such as …onion:18089");
-    node.value = summary.node ?? "";
+    const node = input("chosen for you: leave empty");
+    node.value = summary.chosen ? summary.node : "";
     const setNode = el("button", "", "Use this node");
     setNode.addEventListener("click", async () => {
       try {
         await invoke("wallet_node", { node: node.value });
-        note = "Reaching the node through Tor. The first time, that takes a few minutes.";
+        note = node.value.trim() ? "Reaching that node through Tor." : "Back to a node chosen for you.";
         showStatus();
         void show();
       } catch (error) {
@@ -1206,15 +1190,21 @@ function walletBox() {
       }
     });
     const state = summary.trouble
-      ? `Cannot reach the node: ${summary.trouble}`
-      : !summary.node
-        ? "Choose a Monero node for the wallet to read the chain from. It is reached only through Tor; one you run yourself is best, since a node sees which blocks are asked for and which payments are sent."
-        : summary.tip === null
-          ? "Reaching the node through Tor…"
-          : summary.height < summary.tip
-            ? `Reading the chain: block ${summary.height} of ${summary.tip}.`
-            : `Up to date at block ${summary.tip}.`;
-    body.append(field("Monero node", node), setNode, plain(state));
+      ? `The node did not answer (${summary.trouble}). Trying ${summary.chosen ? "it" : "another"} again shortly.`
+      : summary.tip === null
+        ? "Nothing to do yet: the wallet goes online once a site's visitors use it."
+        : summary.height < summary.tip
+          ? `Reading the chain: block ${summary.height} of ${summary.tip}.`
+          : `Up to date at block ${summary.tip}.`;
+    body.append(
+      plain(
+        "Every site's Monero blocks use this wallet by themselves: each visitor gets an address of their own, and whatever a site earns is yours at once.",
+      ),
+      plain(state),
+      plain(`Node: ${summary.node}${summary.chosen ? "" : ", chosen for you from Monero nodes that are reached only through Tor. A node of your own is more private still."}`),
+      field("Your own node (optional)", node),
+      setNode,
+    );
 
     // The owner's own account.
     body.append(
@@ -1250,16 +1240,6 @@ function walletBox() {
     if (!mine) {
       body.append(plain("Nothing yet: the site's books open when a visitor first uses a Monero block."));
     } else {
-      const collect = el("button", "", "Move earnings to yours");
-      collect.disabled = mine.earned === 0;
-      collect.addEventListener("click", async () => {
-        try {
-          await invoke("wallet_collect", { id: current.id, amount: null });
-          void show();
-        } catch (error) {
-          showFailure(error);
-        }
-      });
       const limit = input("XMR per day");
       limit.value = xmr(mine.daily_limit).replace(" XMR", "");
       const setLimit = el("button", "", "Set limit");
@@ -1273,8 +1253,9 @@ function walletBox() {
         }
       });
       body.append(
-        plain(`Earned: ${xmr(mine.earned)}. ${mine.users} visitors hold ${xmr(mine.held_by_users)} in all.`),
-        collect,
+        plain(
+          `Earned in all: ${xmr(mine.earned)}, already yours. ${mine.users} visitors hold ${xmr(mine.held_by_users)}, kept apart from yours; an account deleted with some still in it leaves it to you.`,
+        ),
         field("Withdrawals by this site's visitors, together, per day", limit),
         setLimit,
         plain(

@@ -83,6 +83,8 @@ pub enum Ask {
     Unlock { user: String, to: Payee, key: String, price: Piconero, days: u16 },
     /// Sends `amount` (everything, when `None`) out of the wallet to `address`.
     Withdraw { user: String, address: String, amount: Option<Piconero> },
+    /// An account was deleted: what it held goes to the site's owner.
+    Closed { user: String },
 }
 
 /// The wallet's answer.

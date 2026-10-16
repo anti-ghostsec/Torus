@@ -26,6 +26,47 @@ const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Blocks read in one go while catching up, between which others may use the wallet.
 const STEP: usize = 200;
 
+/// Monero nodes reached only as onion services, run by people in the
+/// Monero community, as listed on monero.fail. The wallet picks one at
+/// random and keeps to it, moving to another only when it stops answering:
+/// each node it uses learns a little about which blocks it asks for, so
+/// the fewer the better. Nothing about who uses them reaches them: they
+/// are reached over Tor, and never learn where this computer is.
+const NODES: &[&str] = &[
+    "plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:18089",
+    "plowsofe6cleftfmk2raiw5h2x66atrik3nja4bfd3zrfa2hdlgworad.onion:18089",
+    "plowsof3t5hogddwabaeiyrno25efmzfxyro2vligremt7sxpsclfaid.onion:18089",
+    "moneroexnovtlp4datcwbgjznnulgm7q34wcl6r4gcvccruhkceb2xyd.onion:18089",
+    "moneronkvv2hu2anvcc5b4qd5y7strnc2ob6khqsrtikmhocyvjpdjyd.onion:18089",
+    "monerof5eqykw3hfrjmb66v7r4ft4hlilfzjw5q4huwolttutjuc5dyd.onion:18089",
+    "monero3x5yrb7tsalxx64tr2qhfw54xy3eudhswvpaskfvsdk2tzb3id.onion:18089",
+    "libertytmtitynvmnto2k42liys5fenb3wabaozmmmksyrc7jvgmjiqd.onion:18089",
+    "xmrnode5i43mrkmkhe2l5h2brbsnxjd5bzh6sgqi5zncywgqwxpwmvyd.onion:18089",
+    "hashvaultsvg2rinvxz7kos77hdfm6zrd5yco3tx2yh2linsmusfwyad.onion:18081",
+    "rucknium757bokwv3ss35ftgc3gzb7hgbvvglbg3hisp7tsj2fkd2nyd.onion:18081",
+    "xmrxmrxmrjau5dcdxzqrqicpai57njom6h5sd4qjitekkemfk6weppyd.onion:18081",
+    "privacysrafqxgrtgpjbib66yb7ro2eevjiysbo7rplsqgwl6pax5vyd.onion:18089",
+    "monerozck7ebftzypitkdbkndlzib5qr4ca73fm6jjuoh7wikiynihyd.onion:18089",
+    "xmrowl7agi2g2qvlivwiv7d3wu6sjjxejjmoeecb2bh6ya4txkidd3id.onion:18089",
+    "sanlorenzo6i7f27e4wumys2q7wfikgowisxg6pnc2vet7k3wqvyfoqd.onion:18089",
+    "xmrrpcmyrz3imrldcwiqt4vm5asq2vefgzybamxdigx37p3ctfcjnsad.onion:18089",
+    "monsterxzzefbr6jq3n2tu4xvlumnunlhbrhqny6naxpn6le3upke2yd.onion:18089",
+    "anonxmrr5oiy7opr36l3mdsvmciwuxyxcybp6v3d4owaouwc6gsdj2qd.onion:18089",
+    "supportxmrcnzyyl4gtmtvql446f4pdqfcrykwaltwsg3trj3ekn3fad.onion:18089",
+];
+
+/// A node from the list, at random.
+fn random_pick() -> usize {
+    let mut byte = [0u8; 4];
+    let _ = getrandom::getrandom(&mut byte);
+    u32::from_le_bytes(byte) as usize % NODES.len()
+}
+
+/// Another node from the list than `now`, at random.
+fn another_pick(now: usize) -> usize {
+    (now + 1 + random_pick() % (NODES.len() - 1)) % NODES.len()
+}
+
 /// What the vault keeps of the wallet.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredMoney {
@@ -33,9 +74,12 @@ pub struct StoredMoney {
     spend: String,
     state: State,
     ledger: Ledger,
-    /// The node: `host:port`, an onion address or a name.
+    /// A node the owner chose: `host:port`, an onion address or a name.
+    /// Without one, the wallet uses `NODES[pick]`.
     #[serde(default)]
     node: Option<String>,
+    #[serde(default = "random_pick")]
+    pick: usize,
     /// The key Tor's bookkeeping for the relay is kept encrypted with, in hex.
     tor_key: String,
 }
@@ -50,7 +94,9 @@ impl Drop for StoredMoney {
 #[derive(Debug, Serialize)]
 pub struct Summary {
     pub address: String,
-    pub node: Option<String>,
+    /// The node in use, and whether the owner chose it.
+    pub node: String,
+    pub chosen: bool,
     /// The owner's own account, apart from every site.
     pub own: Piconero,
     /// What the wallet can spend now, and what is on its way.
@@ -102,6 +148,10 @@ struct Loaded {
     spend_hex: Zeroizing<String>,
     ledger: Mutex<Ledger>,
     node: Mutex<Option<String>>,
+    pick: Mutex<usize>,
+    /// Whether the chain needs reading: once any site has used the wallet,
+    /// or it holds anything. Until then nothing reaches the network.
+    wanted: std::sync::atomic::AtomicBool,
     tor_key: Zeroizing<Vec<u8>>,
     /// The node, once reached.
     daemon: tokio::sync::Mutex<Option<MoneroDaemon<Fetcher>>>,
@@ -111,7 +161,7 @@ struct Loaded {
 
 pub struct Treasury {
     loaded: Mutex<Option<Arc<Loaded>>>,
-    syncing: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    syncing: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     keep: Keep,
     reach: Reach,
     /// The highest fee per unit of weight a node may ask; see `Wallet`.
@@ -167,6 +217,11 @@ impl Treasury {
         let spend = Zeroizing::new(hex::decode(&stored.spend).map_err(|_| "The wallet's key is damaged.")?);
         let keys = Keys::from_bytes(&spend).map_err(|e| e.to_string())?;
         let tor_key = Zeroizing::new(hex::decode(&stored.tor_key).map_err(|_| "The wallet's relay key is damaged.")?);
+        let mut ledger = stored.ledger.clone();
+        // Books kept before earnings were passed on by themselves.
+        ledger.sweep_all();
+        // A wallet nothing has used yet stays off the network.
+        let wanted = !ledger.sites.is_empty() || ledger.owed() > 0 || !stored.state.is_unborn();
         let mut wallet = Wallet::new(keys, stored.state.clone());
         if let Some(max) = self.max_fee {
             wallet.max_fee_per_weight = max;
@@ -177,8 +232,10 @@ impl Treasury {
             saved_state: Mutex::new(wallet.state.clone()),
             spend_hex: wallet.spend_key_hex(),
             wallet: tokio::sync::Mutex::new(wallet),
-            ledger: Mutex::new(stored.ledger.clone()),
+            ledger: Mutex::new(ledger),
             node: Mutex::new(stored.node.clone()),
+            pick: Mutex::new(stored.pick % NODES.len()),
+            wanted: std::sync::atomic::AtomicBool::new(wanted),
             tor_key,
             daemon: tokio::sync::Mutex::new(None),
             tip: Mutex::new(None),
@@ -197,10 +254,11 @@ impl Treasury {
         *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// Makes a new wallet. There is one per compartment of the vault.
-    pub async fn create(self: &Arc<Self>) -> Result<(), String> {
+    /// Makes a new wallet, unless there is one. There is one per
+    /// compartment of the vault, made as the vault is first opened.
+    pub fn ensure(self: &Arc<Self>) -> Result<(), String> {
         if self.loaded().is_some() {
-            return Err("There is a wallet already.".into());
+            return Ok(());
         }
         let mut tor_key = Zeroizing::new(vec![0u8; 32]);
         getrandom::getrandom(&mut tor_key).map_err(|e| e.to_string())?;
@@ -210,6 +268,7 @@ impl Treasury {
             state: State::unborn(Chain::Mainnet),
             ledger: Ledger::default(),
             node: None,
+            pick: random_pick(),
             tor_key: hex::encode(&tor_key[..]),
         };
         (self.keep)(stored.clone())?;
@@ -227,6 +286,7 @@ impl Treasury {
             state: saving.clone(),
             ledger: loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             node: loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            pick: *loaded.pick.lock().unwrap_or_else(|e| e.into_inner()),
             tor_key: hex::encode(&loaded.tor_key[..]),
         };
         (self.keep)(stored)
@@ -247,6 +307,7 @@ impl Treasury {
             state: wallet.state.clone(),
             ledger: loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             node: loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            pick: *loaded.pick.lock().unwrap_or_else(|e| e.into_inner()),
             tor_key: hex::encode(&loaded.tor_key[..]),
         };
         (self.keep)(stored)
@@ -255,10 +316,15 @@ impl Treasury {
     pub async fn set_node(self: &Arc<Self>, node: String) -> Result<(), String> {
         let loaded = self.require()?;
         let node = node.trim().to_owned();
-        if torus_host_api::node::Node::parse(&node).is_none() {
+        // Nothing: back to one chosen from the list.
+        let node = if node.is_empty() {
+            None
+        } else if torus_host_api::node::Node::parse(&node).is_none() {
             return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
-        }
-        *loaded.node.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+        } else {
+            Some(node)
+        };
+        *loaded.node.lock().unwrap_or_else(|e| e.into_inner()) = node;
         *loaded.daemon.lock().await = None;
         *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.save(&loaded).await?;
@@ -272,15 +338,29 @@ impl Treasury {
             task.abort();
         }
         let treasury = Arc::downgrade(self);
-        *syncing = Some(tokio::spawn(async move {
+        // Tauri's runtime: the vault may be opened from a thread that has none.
+        *syncing = Some(tauri::async_runtime::spawn(async move {
             loop {
                 let Some(treasury) = treasury.upgrade() else { return };
+                let wanted = treasury.loaded().is_some_and(|l| l.wanted.load(std::sync::atomic::Ordering::Relaxed));
+                if !wanted {
+                    drop(treasury);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
                 let pause = match treasury.sync_step().await {
                     Ok(true) => Duration::ZERO,
                     Ok(false) => SYNC_EVERY,
                     Err(trouble) => {
                         if let Some(loaded) = treasury.loaded() {
                             *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = Some(trouble);
+                            // A node from the list that fails is left for another.
+                            if loaded.node.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                                let mut pick = loaded.pick.lock().unwrap_or_else(|e| e.into_inner());
+                                *pick = another_pick(*pick);
+                                drop(pick);
+                                let _ = treasury.save_books(&loaded);
+                            }
                         }
                         RETRY_AFTER
                     }
@@ -291,13 +371,21 @@ impl Treasury {
         }));
     }
 
+    /// The node in use: the owner's choice, or one from the list.
+    fn node_of(loaded: &Loaded) -> String {
+        match loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(node) => node,
+            None => NODES[*loaded.pick.lock().unwrap_or_else(|e| e.into_inner()) % NODES.len()].to_owned(),
+        }
+    }
+
     /// The node, reached through the relay, started on first use.
     async fn daemon(&self, loaded: &Loaded) -> Result<MoneroDaemon<Fetcher>, String> {
         let mut daemon = loaded.daemon.lock().await;
         if let Some(daemon) = daemon.as_ref() {
             return Ok(daemon.clone());
         }
-        let node = loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("No Monero node is set.")?;
+        let node = Self::node_of(loaded);
         let fetcher = (self.reach)(node, loaded.tor_key.clone()).await?;
         let reached = MoneroDaemon::new(fetcher).await.map_err(|e| format!("The node did not answer as a Monero node does: {e:?}"))?;
         *daemon = Some(reached.clone());
@@ -307,9 +395,6 @@ impl Treasury {
     /// Reads the chain some way further. `Ok(true)` if there is more to read.
     pub(crate) async fn sync_step(&self) -> Result<bool, String> {
         let Some(loaded) = self.loaded() else { return Ok(false) };
-        if loaded.node.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-            return Ok(false);
-        }
         let daemon = match self.daemon(&loaded).await {
             Ok(daemon) => daemon,
             Err(e) => {
@@ -371,19 +456,21 @@ impl Treasury {
                 Some(SiteMoney {
                     site: site.parse().ok()?,
                     address: loaded.addresses.address(Slot { account: book.account, address: 0 }),
-                    earned: book.earned,
+                    earned: book.earned_total,
                     users: book.users.len(),
                     held_by_users: book.users.values().map(|p| p.balance).sum(),
                     daily_limit: book.daily_limit,
                 })
             })
             .collect();
-        let node = loaded.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let chosen = loaded.node.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let node = Self::node_of(&loaded);
         let tip = *loaded.tip.lock().unwrap_or_else(|e| e.into_inner());
         let trouble = loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some(Summary {
             address: loaded.addresses.address(Slot::OWNER),
             node,
+            chosen,
             own: ledger.own,
             spendable,
             arriving,
@@ -413,16 +500,14 @@ impl Treasury {
         self.save(&loaded).await
     }
 
-    /// Moves what a site has earned into the owner's own account.
-    pub async fn collect(&self, site: u32, amount: Option<Piconero>) -> Result<(), String> {
-        let loaded = self.require()?;
-        {
-            let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
-            let key = site.to_string();
-            let all = ledger.sites.get(&key).map_or(0, |b| b.earned);
-            ledger.collect(&key, amount.unwrap_or(all)).map_err(|e| e.to_string())?;
+    /// An account on a site was deleted: what it held becomes the owner's.
+    pub fn close_account(&self, site: u32, user: &str) -> Result<Piconero, String> {
+        let Some(loaded) = self.loaded() else { return Ok(0) };
+        let held = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner()).close_account(&site.to_string(), user);
+        if held > 0 {
+            self.save_books(&loaded)?;
         }
-        self.save(&loaded).await
+        Ok(held)
     }
 
     /// A site is deleted: what it held becomes the owner's own.
@@ -500,9 +585,17 @@ impl Treasury {
     /// Answers a site's question, on behalf of one of its visitors.
     pub async fn ask(&self, site: u32, ask: Ask) -> Told {
         let Some(loaded) = self.loaded() else { return Told::Refused("This site has no wallet.".into()) };
+        // A site uses the wallet: from now on it keeps up with the chain.
+        loaded.wanted.store(true, std::sync::atomic::Ordering::Relaxed);
         let key = site.to_string();
         let day = today();
         let answer = match ask {
+            Ask::Closed { user } => {
+                return match self.close_account(site, &user) {
+                    Ok(_) => Told::Done,
+                    Err(e) => Told::Refused(e),
+                };
+            }
             Ask::Purse { user } => {
                 let me = Party::User(user.clone());
                 let (slot, made) = {
@@ -671,7 +764,7 @@ mod tests {
             treasury
         };
         let treasury = make();
-        treasury.create().await.unwrap();
+        treasury.ensure().unwrap();
         assert!(kept.lock().unwrap().is_some(), "kept in the vault at once");
         treasury.set_node(format!("127.0.0.1:{port}")).await.unwrap();
         catch_up(&treasury).await;
@@ -731,10 +824,15 @@ mod tests {
         mine(port, &own, 1).await;
         catch_up(&treasury).await;
 
-        // The site's earnings move to the owner's own account.
-        treasury.collect(1, None).await.unwrap();
+        // What the site earned is already the owner's: the half paid for the pass.
         let summary = treasury.summary().await.unwrap();
-        assert_eq!(summary.sites.iter().find(|s| s.site == 1).unwrap().earned, 0);
+        assert_eq!(summary.sites.iter().find(|s| s.site == 1).unwrap().earned, PER_XMR / 2);
+        // Ada deletes her account: what she held becomes the owner's.
+        let owners = summary.own;
+        assert_eq!(treasury.ask(1, Ask::Closed { user: "ada".into() }).await, Told::Done);
+        assert_eq!(treasury.summary().await.unwrap().own, owners + 3 * PER_XMR / 2);
+        assert_eq!(purse(treasury.ask(1, Ask::Purse { user: "ada".into() }).await).balance, 0);
+        let summary = treasury.summary().await.unwrap();
         assert!(summary.owed <= summary.spendable + summary.arriving, "never owes more than it holds: {summary:?}");
 
         // Locked and unlocked again, everything is as it was.

@@ -43,6 +43,10 @@ impl Bank for Books {
                 })
             }
             Ask::SiteAddress => Told::SiteAddress(Some("8thesite".into())),
+            Ask::Closed { user } => {
+                ledger.close_account(SITE, &user);
+                Told::Done
+            }
             Ask::Pay { from, to, amount } => match ledger.transfer(SITE, &Party::User(from), &party(to), amount) {
                 Ok(()) => Told::Done,
                 Err(refused) => Told::Refused(refused.to_string()),
@@ -81,6 +85,11 @@ impl Books {
     fn balance(&self, party: Party) -> u64 {
         self.0.lock().unwrap().sites[SITE].balance(&party)
     }
+
+    /// The owner's own: everything the site earned.
+    fn owners(&self) -> u64 {
+        self.0.lock().unwrap().own
+    }
 }
 
 fn site() -> torus_core::Site {
@@ -93,6 +102,7 @@ fn site() -> torus_core::Site {
     let post = page("post", &mut site);
     site.pages[post].blocks.insert(3, Block::Tip { amount: "0.01".into(), label: "Tip".into() });
     let profile = page("profile", &mut site);
+    site.pages[profile].blocks.push(Block::Remove { label: "Delete account".into() });
     site.pages[profile].blocks.push(Block::Paid {
         price: "0.5".into(),
         label: "Subscribers see more".into(),
@@ -188,7 +198,7 @@ async fn visitors_hold_tip_subscribe_and_withdraw() {
     let block = field_of(&home, "/_wallet/give", "_block");
     let fields = [("_token", ada_token.as_str()), ("_next", "/"), ("_block", block.as_str()), ("amount", "0.1")];
     assert_eq!(post(addr, "/_wallet/give", Some(&ada), &fields).await.status, 303);
-    assert_eq!(books.balance(Party::Site), PER_XMR / 10);
+    assert_eq!(books.owners(), PER_XMR / 10, "what the site earns is the owner's at once");
 
     // Withdrawing: a bad amount, a bad address, too much, then everything.
     let wallet = get(addr, "/account", Some(&ada)).await.text();
@@ -208,10 +218,22 @@ async fn visitors_hold_tip_subscribe_and_withdraw() {
     assert!(sent.contains(&format!("Sent: {} is on its way", torus_core::money::format_xmr(held - FEE))), "{sent}");
     assert_eq!(books.balance(Party::User(ada_id.clone())), 0);
 
+    // Bob deletes his account with Monero still in it: he is warned, and
+    // then what he held is the owner's.
+    let mine = get(addr, &profile, Some(&bob)).await.text();
+    assert!(mine.contains("Withdraw it first: once your account is deleted, it goes to the site."), "{mine}");
+    let held = books.balance(Party::User(bob_id.clone()));
+    assert!(held > 0);
+    let before = books.owners();
+    let fields = [("_token", bob_token.as_str()), ("_next", profile.as_str())];
+    assert_eq!(post(addr, &format!("/_remove/users/{bob_id}"), Some(&bob), &fields).await.status, 303);
+    assert_eq!(books.owners(), before + held);
+    assert_eq!(books.balance(Party::User(bob_id.clone())), 0);
+
     // A guest cannot use any of it.
     let fields = [("_next", "/account"), ("address", "8elsewhere"), ("amount", "")];
     assert_eq!(post(addr, "/_wallet/withdraw", None, &fields).await.status, 403);
-    let _ = (Slot::OWNER, bob);
+    let _ = Slot::OWNER;
 }
 
 #[tokio::test]

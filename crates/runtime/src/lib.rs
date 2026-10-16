@@ -1078,17 +1078,24 @@ async fn remove(live: &Live, site: &Site, viewer: Option<Viewer>, path: &str, re
     if !same(submission.text(TOKEN_FIELD), &viewer.token) {
         return plain(StatusCode::FORBIDDEN, "That form has expired. Go back, reload the page and try again.\n", false);
     }
-    let mut store = live.store();
     let own_account = collection == USERS && id == viewer.id;
-    let mine = own_account
-        || (viewer.moderator && collection != USERS)
-        || store.find(collection, id).is_some_and(|r| r.owner.as_deref() == Some(viewer.id.as_str()));
+    let removed = {
+        let mut store = live.store();
+        let mine = own_account
+            || (viewer.moderator && collection != USERS)
+            || store.find(collection, id).is_some_and(|r| r.owner.as_deref() == Some(viewer.id.as_str()));
+        mine && store.remove(site, collection, id)
+    };
     // The same answer for what is not theirs and for what does not exist.
-    if !mine || !store.remove(site, collection, id) {
+    if !removed {
         return plain(StatusCode::FORBIDDEN, "That is not yours to remove.\n", false);
     }
-    drop(store);
     if own_account {
+        // What the account held in Monero goes to the site's owner. The
+        // page warned them, and offered a withdrawal first.
+        if let Some(bank) = live.bank() {
+            bank.ask(torus_core::money::Ask::Closed { user: id.to_owned() }).await;
+        }
         return session_reply(site, "/", "", 0);
     }
     see_other(site, submission.text(NEXT_FIELD))
