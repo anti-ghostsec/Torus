@@ -44,6 +44,23 @@ async fn export_backup(backend: State<'_, Backend>, file: std::path::PathBuf) ->
 }
 
 #[tauri::command]
+async fn export_site(
+    backend: State<'_, Backend>,
+    id: u32,
+    file: std::path::PathBuf,
+    passphrase: String,
+    content: bool,
+    address: bool,
+) -> Result<(), Failure> {
+    backend.export_site(id, file, passphrase, content, address).await
+}
+
+#[tauri::command]
+async fn import_site(backend: State<'_, Backend>, file: std::path::PathBuf, passphrase: String) -> Result<Listed, Failure> {
+    backend.import_site(file, passphrase).await
+}
+
+#[tauri::command]
 fn import_backup(backend: State<'_, Backend>, file: std::path::PathBuf) -> Result<(), Failure> {
     backend.import_backup(file)
 }
@@ -215,6 +232,8 @@ pub fn run() {
             set_auto_lock_minutes,
             export_backup,
             import_backup,
+            export_site,
+            import_site,
             in_decoy,
             set_decoy,
             panic,

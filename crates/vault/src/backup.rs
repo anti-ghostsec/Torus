@@ -76,10 +76,18 @@ fn relative(root: &Path, path: &Path) -> String {
 
 /// Writes a backup of everything under `root` to `out`, as a stream.
 pub fn export(root: &Path, out: &mut impl Write) -> io::Result<()> {
+    export_only(root, out, &|_| true)
+}
+
+/// Like [`export`], carrying only the files whose relative path `keep` accepts.
+pub fn export_only(root: &Path, out: &mut impl Write, keep: &dyn Fn(&str) -> bool) -> io::Result<()> {
     out.write_all(MAGIC)?;
     let mut buffer = vec![0u8; CHUNK];
     for path in included(root)? {
         let rel = relative(root, &path);
+        if !keep(&rel) {
+            continue;
+        }
         let mut file = fs::File::open(&path)?;
         let length = file.metadata()?.len();
         out.write_all(&(rel.len() as u16).to_le_bytes())?;
@@ -123,6 +131,12 @@ pub fn import(root: &Path, input: &mut impl Read) -> io::Result<()> {
     if root.join("project.vault").exists() {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "there is already a vault here"));
     }
+    unpack(root, input)
+}
+
+/// Writes out an archive made by [`export`] or [`export_only`] into `root`,
+/// with the same checks on every path, whatever is already there.
+pub fn unpack(root: &Path, input: &mut impl Read) -> io::Result<()> {
     let mut magic = [0u8; 8];
     input.read_exact(&mut magic)?;
     if &magic != MAGIC {
