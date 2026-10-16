@@ -801,6 +801,8 @@ function renderSettings() {
   });
   siteHost.append(starter);
 
+  siteHost.append(addressMiner());
+
   // Deleting a site destroys its onion key, so it takes two deliberate clicks.
   const erase = el("button", "", "Delete site");
   erase.disabled = entries.length < 2;
@@ -810,6 +812,133 @@ function renderSettings() {
     erase.textContent = "Click again: erases the site and its address forever";
   });
   siteHost.append(erase);
+}
+
+// Choosing an address
+
+type MineStatus = {
+  site: number;
+  prefix: string;
+  tried: number;
+  per_second: number;
+  expected: number;
+  threads: number;
+  found: string | null;
+};
+
+// One poll for the whole window, however often the panel is redrawn.
+let minePoll: number | null = null;
+let mineView: ((status: MineStatus | null) => void) | null = null;
+
+function duration(seconds: number) {
+  if (!Number.isFinite(seconds)) return "a while";
+  if (seconds < 90) return `${Math.max(1, Math.round(seconds))} seconds`;
+  if (seconds < 90 * 60) return `${Math.round(seconds / 60)} minutes`;
+  if (seconds < 48 * 3600) return `${Math.round(seconds / 3600)} hours`;
+  if (seconds < 60 * 86400) return `${Math.round(seconds / 86400)} days`;
+  return `${Math.round(seconds / (365 * 86400))} years`;
+}
+
+function pollMining() {
+  if (minePoll !== null) return;
+  minePoll = window.setInterval(async () => {
+    const status = await invoke<MineStatus | null>("mine_status");
+    mineView?.(status);
+    if (!status || status.found) {
+      window.clearInterval(minePoll!);
+      minePoll = null;
+    }
+  }, 1000);
+}
+
+// An address that begins with chosen letters, found by trying keys until
+// one matches. Each extra letter takes 32 times as long.
+function addressMiner() {
+  const box = el("div", "miner");
+  const wanted = el("input");
+  wanted.placeholder = "e.g. torus";
+  wanted.maxLength = 12;
+  wanted.spellcheck = false;
+  const estimate = el("p", "hint");
+  const progress = el("p", "hint");
+  const start = el("button", "", "Find this address");
+  const use = el("button", "", "Use this address");
+  use.hidden = true;
+  const guess = (letters: number, perSecond: number) => duration(Math.pow(32, letters) / perSecond);
+  // A first guess before any search has run: a little over a million keys a second per processor.
+  const typical = 1_500_000 * Math.max(1, (navigator.hardwareConcurrency || 2) - 1);
+  const explain = () => {
+    const text = wanted.value.trim().toLowerCase();
+    if (!text) return void (estimate.textContent = "Letters a to z and digits 2 to 7. Each letter makes it about 32 times longer to find.");
+    if (/[^a-z2-7]/.test(text)) return void (estimate.textContent = "Only a to z and 2 to 7 can appear in an onion address (no 0, 1, 8 or 9).");
+    estimate.textContent = `On this device, "${text}" takes about ${guess(text.length, typical)} to find, on average. It could be sooner or later.`;
+  };
+  wanted.addEventListener("input", explain);
+  explain();
+
+  mineView = (status) => {
+    const mine = status && status.site === current.id ? status : null;
+    if (!mine) {
+      start.textContent = "Find this address";
+      progress.textContent = status ? "Another site's address is being searched for." : "";
+      use.hidden = true;
+      return;
+    }
+    if (mine.found) {
+      start.textContent = "Search again";
+      progress.textContent = `Found: ${mine.found}`;
+      use.hidden = false;
+      return;
+    }
+    start.textContent = "Stop";
+    const chance = 1 - Math.exp(-mine.tried / mine.expected);
+    const left = Math.max(0, mine.expected - mine.tried) / Math.max(1, mine.per_second);
+    progress.textContent =
+      `Searching for "${mine.prefix}" on ${mine.threads} processors: ${(mine.per_second / 1e6).toFixed(1)} million keys a second, ` +
+      `${(mine.tried / 1e6).toFixed(0)} million tried. ${Math.round(chance * 100)}% of searches this long have found it; about ${duration(left)} to go on average. ` +
+      "It keeps going while the app is open.";
+  };
+
+  start.addEventListener("click", async () => {
+    try {
+      if (start.textContent === "Stop") {
+        await invoke("mine_stop");
+        mineView?.(null);
+        return;
+      }
+      const status = await invoke<MineStatus>("mine_start", { id: current.id, prefix: wanted.value });
+      mineView?.(status);
+      pollMining();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+
+  use.addEventListener("click", async () => {
+    // Replacing an address loses the old one for good: two clicks.
+    if (current.address && !use.dataset.armed) {
+      use.dataset.armed = "1";
+      use.textContent = `Click again: ${current.address} stops working forever`;
+      return;
+    }
+    try {
+      current.address = await invoke<string>("mine_use", { id: current.id, replace: Boolean(current.address) });
+      use.hidden = true;
+      delete use.dataset.armed;
+      use.textContent = "Use this address";
+      progress.textContent = `This site's address is now ${current.address}. Publish it to Tor to put it online there.`;
+      showStatus();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+
+  box.append(field("Choose the address's first letters", wanted), estimate, start, use, progress);
+  void invoke<MineStatus | null>("mine_status").then((status) => {
+    mineView?.(status);
+    if (status && !status.found) pollMining();
+  });
+  return box;
 }
 
 // Collections

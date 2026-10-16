@@ -83,7 +83,9 @@ async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(S
     match target {
         Target::Loopback => {
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
-            let address = format!("http://{}", listener.local_addr().map_err(|e| e.to_string())?);
+            let bound = listener.local_addr().map_err(|e| e.to_string())?;
+            live.only_for_host(bound.to_string());
+            let address = format!("http://{bound}");
             Ok((Serving::Loopback(Task(tokio::spawn(serve(listener, live)))), address))
         }
         Target::Onion { identity, state_dir, cache_dir, kept: file, kept_key } => {

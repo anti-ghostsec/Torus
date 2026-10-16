@@ -1,6 +1,6 @@
 mod backend;
 
-use backend::{Backend, Failure, Listed, OnionStatus, View};
+use backend::{Backend, Failure, Listed, MineStatus, OnionStatus, View};
 use tauri::{Manager, State};
 use torus_core::Site;
 
@@ -94,6 +94,26 @@ fn onion_status(backend: State<'_, Backend>) -> Vec<OnionStatus> {
 }
 
 #[tauri::command]
+fn mine_start(backend: State<'_, Backend>, id: u32, prefix: String) -> Result<MineStatus, Failure> {
+    backend.mine_start(id, &prefix)
+}
+
+#[tauri::command]
+fn mine_status(backend: State<'_, Backend>) -> Option<MineStatus> {
+    backend.mine_status()
+}
+
+#[tauri::command]
+fn mine_stop(backend: State<'_, Backend>) {
+    backend.mine_stop();
+}
+
+#[tauri::command]
+async fn mine_use(backend: State<'_, Backend>, id: u32, replace: bool) -> Result<String, Failure> {
+    backend.mine_use(id, replace).await
+}
+
+#[tauri::command]
 async fn stop(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
     backend.stop(id).await;
     Ok(())
@@ -165,6 +185,10 @@ pub fn run() {
             moderators,
             set_moderator,
             onion_status,
+            mine_start,
+            mine_status,
+            mine_stop,
+            mine_use,
             stop
         ])
         .build(tauri::generate_context!())

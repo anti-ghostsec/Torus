@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use torus_core::{check, lint, render_canvas, Canvas, Finding, Site};
@@ -187,6 +189,37 @@ impl Hosted {
 /// The shortest passphrase a vault may be made with.
 const MIN_PASSPHRASE: usize = 10;
 
+/// A search for an onion address that begins with chosen letters.
+struct Mining {
+    site: u32,
+    prefix: torus_onion_key::Prefix,
+    stop: Arc<AtomicBool>,
+    tried: Arc<AtomicU64>,
+    found: Arc<Mutex<Option<Identity>>>,
+    started: Instant,
+    threads: usize,
+}
+
+impl Drop for Mining {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// How a search for an address is going, for the window.
+#[derive(Debug, Serialize)]
+pub struct MineStatus {
+    pub site: u32,
+    pub prefix: String,
+    pub tried: u64,
+    pub per_second: f64,
+    /// How many keys it takes on average to find a match.
+    pub expected: f64,
+    pub threads: usize,
+    /// The address found, once one has been.
+    pub found: Option<String>,
+}
+
 type Slot = Arc<tokio::sync::Mutex<Option<Hosted>>>;
 
 pub struct Backend {
@@ -203,6 +236,8 @@ pub struct Backend {
     /// One slot per site, each locked on its own: starting one site, which
     /// can take minutes, holds up nothing done with another.
     hosted: Mutex<HashMap<u32, Slot>>,
+    /// The search for a chosen address, if one is under way or done.
+    mining: Mutex<Option<Mining>>,
 }
 
 /// Ends a host that runs inside this program when the site is taken offline.
@@ -268,6 +303,7 @@ impl Backend {
             session: Mutex::new(None),
             local: Default::default(),
             hosted: Default::default(),
+            mining: Mutex::new(None),
         };
         backend.erase_leftovers();
         backend
@@ -347,7 +383,11 @@ impl Backend {
 
     pub fn unlock(&self, passphrase: String) -> Result<Vec<Listed>, Failure> {
         let passphrase = Zeroizing::new(passphrase);
-        let (vault, bytes) = Vault::open(&self.vault_path()?, &passphrase).map_err(Failure::new)?;
+        let (mut vault, bytes) = Vault::open(&self.vault_path()?, &passphrase).map_err(Failure::new)?;
+        // A vault made with weaker settings than today's is made again with them.
+        if vault.weaker_than_default() {
+            vault = Vault::create(&self.vault_path()?, &passphrase, &bytes).map_err(Failure::new)?;
+        }
         let mut payload: Payload = serde_json::from_slice(&bytes).map_err(Failure::new)?;
         if let Some(site) = payload.site.take() {
             payload.sites.push(Stored {
@@ -517,7 +557,8 @@ impl Backend {
         if let Some(host) = hosted.as_ref().and_then(|h| h.host.as_ref()).filter(|host| !host.status().broken) {
             host.publish(site.clone()).await.map_err(Failure::new)?;
             self.save(id, site)?;
-            return Ok(host.address().to_owned());
+            let identity = self.with_session(|session| Ok(session.entry(id)?.identity.clone()))?;
+            return identity.map(|key| torus_onion_key::address(&key)).ok_or_else(|| Failure::new("The site has no address."));
         }
         if let Some(old) = hosted.take() {
             old.retire().await;
@@ -559,7 +600,13 @@ impl Backend {
             }
             online.files_confined = false;
         }
-        let address = host.address().to_owned();
+        // The address shown is the one the key stands for, never what the
+        // host says: a host that claims another is not trusted with the site.
+        let address = torus_onion_key::address(&identity);
+        if host.address() != address {
+            online.retire().await;
+            return Err(Failure::new("The host process reported a different address than the site's key. The site was not published."));
+        }
         *hosted = Some(online);
         Ok(address)
     }
@@ -652,9 +699,97 @@ impl Backend {
         }
     }
 
+    /// Starts searching for an address that begins with `wanted`, for site
+    /// `id`, on every processor but one. Replaces any search under way.
+    pub fn mine_start(&self, id: u32, wanted: &str) -> Result<MineStatus, Failure> {
+        let prefix = torus_onion_key::Prefix::new(wanted).map_err(Failure::new)?;
+        self.with_session(|session| session.entry(id).map(|_| ()))?;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).max(1);
+        let mining = Mining {
+            site: id,
+            prefix,
+            stop: Arc::default(),
+            tried: Arc::default(),
+            found: Arc::default(),
+            started: Instant::now(),
+            threads,
+        };
+        for _ in 0..threads {
+            let (prefix, stop, tried, found) =
+                (mining.prefix.clone(), mining.stop.clone(), mining.tried.clone(), mining.found.clone());
+            std::thread::spawn(move || {
+                if let Some(identity) = torus_onion_key::mine(&prefix, &stop, &tried) {
+                    let mut slot = found.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(identity);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+        *self.mining.lock().unwrap_or_else(|e| e.into_inner()) = Some(mining);
+        self.mine_status().ok_or_else(|| Failure::new("The search could not start."))
+    }
+
+    /// How the search is going, if there is one.
+    pub fn mine_status(&self) -> Option<MineStatus> {
+        let mining = self.mining.lock().unwrap_or_else(|e| e.into_inner());
+        let mining = mining.as_ref()?;
+        let tried = mining.tried.load(Ordering::Relaxed);
+        let seconds = mining.started.elapsed().as_secs_f64().max(0.001);
+        let found = mining.found.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(torus_onion_key::address);
+        Some(MineStatus {
+            site: mining.site,
+            prefix: mining.prefix.as_str().to_owned(),
+            tried,
+            per_second: tried as f64 / seconds,
+            expected: mining.prefix.expected_tries(),
+            threads: mining.threads,
+            found,
+        })
+    }
+
+    /// Stops the search, and forgets any address it found but was not used.
+    pub fn mine_stop(&self) {
+        *self.mining.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Makes the address the search found the site's own. A site that has
+    /// an address already loses it for good, so `replace` must say that is
+    /// meant; a site that is online must be taken offline first.
+    pub async fn mine_use(&self, id: u32, replace: bool) -> Result<String, Failure> {
+        let online = match self.existing_slot(id) {
+            Some(slot) => slot.lock().await.is_some(),
+            None => false,
+        };
+        if online {
+            return Err(Failure::new("Take the site offline first: it is online at its current address."));
+        }
+        let identity = {
+            let mining = self.mining.lock().unwrap_or_else(|e| e.into_inner());
+            let mining = mining.as_ref().filter(|m| m.site == id).ok_or_else(|| Failure::new("No address has been found for this site."))?;
+            let found = mining.found.lock().unwrap_or_else(|e| e.into_inner());
+            found.clone().ok_or_else(|| Failure::new("No address has been found yet."))?
+        };
+        let address = torus_onion_key::address(&identity);
+        self.with_session(|session| {
+            let entry = session.entry(id)?;
+            if entry.identity.is_some() && !replace {
+                return Err(Failure::new("This site already has an address. Confirm that it should be replaced."));
+            }
+            entry.identity = Some(identity);
+            session.persist()
+        })?;
+        // Tor's bookkeeping belonged to the old address.
+        let _ = std::fs::remove_file(self.kept_tor_path(id)?);
+        self.mine_stop();
+        Ok(address)
+    }
+
     /// Takes every site offline and packs their Tor bookkeeping away. Called
     /// when the app closes.
     pub async fn shutdown(&self) {
+        self.mine_stop();
         *self.local.lock().await = None;
         let ids: Vec<u32> = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
         for id in ids {
@@ -700,7 +835,8 @@ mod tests {
 
     async fn fetch(address: &str) -> std::io::Result<String> {
         let mut stream = tokio::net::TcpStream::connect(address.trim_start_matches("http://")).await?;
-        stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await?;
+        let name = address.trim_start_matches("http://");
+    stream.write_all(format!("GET / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
         let mut out = String::new();
         stream.read_to_string(&mut out).await?;
         Ok(out)
@@ -757,6 +893,41 @@ mod tests {
         backend.lock();
         backend.unlock("correct horse battery".into()).unwrap();
         assert!(backend.add_site(site("Delta", "four")).unwrap() > third, "the count was lost on unlocking");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A chosen address is searched for, and becomes the site's only when
+    /// asked, and an existing address is replaced only when that is confirmed.
+    #[tokio::test]
+    async fn a_mined_address_becomes_the_sites_own() {
+        let (backend, dir) = backend("mine");
+        backend.create_vault("correct horse battery".into(), site("Alpha", "one")).unwrap();
+        assert!(backend.mine_start(1, "ab1").is_err(), "1 cannot appear in an address");
+        backend.mine_start(1, "ab").unwrap();
+        let mut found = None;
+        for _ in 0..200 {
+            found = backend.mine_status().and_then(|status| status.found);
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let found = found.expect("a two-letter address is found in moments");
+        assert!(found.starts_with("ab"));
+        assert_eq!(backend.mine_use(1, false).await.unwrap(), found);
+        let listed = backend.unlock("correct horse battery".into()).unwrap();
+        assert_eq!(listed[0].address.as_deref(), Some(found.as_str()), "the vault keeps the chosen address");
+
+        // A second search may not silently replace it.
+        backend.mine_start(1, "cd").unwrap();
+        for _ in 0..200 {
+            if backend.mine_status().and_then(|status| status.found).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(backend.mine_use(1, false).await.is_err(), "the address was replaced without asking");
+        assert!(backend.mine_use(1, true).await.unwrap().starts_with("cd"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

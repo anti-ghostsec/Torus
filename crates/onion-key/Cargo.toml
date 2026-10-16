@@ -8,7 +8,12 @@ license.workspace = true
 [dependencies]
 ed25519-dalek = { version = "2", features = ["hazmat"] }
 curve25519-dalek = "4"
+
 sha3 = "0.10"
 data-encoding = "2"
 getrandom = { version = "0.2", features = ["std"] }
 zeroize = "1"
+
+# The fast vanity search (src/fast.rs) uses its verified field arithmetic.
+[target.'cfg(target_pointer_width = "64")'.dependencies]
+fiat-crypto = { version = "0.2", default-features = false }

@@ -132,6 +132,10 @@ struct Inner {
     connections: Arc<Semaphore>,
     uploads: Semaphore,
     decodes: Semaphore,
+    /// The one `Host` a request may name, when the site is served on this
+    /// computer: a web page elsewhere cannot then reach it by pointing a
+    /// name of its own at this computer (DNS rebinding).
+    only_host: OnceLock<String>,
 }
 
 /// The live site. Publishing swaps all its pages at once, so a visitor never
@@ -154,7 +158,13 @@ impl Live {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             uploads: Semaphore::new(MAX_UPLOADS),
             decodes: Semaphore::new(MAX_DECODES),
+            only_host: OnceLock::new(),
         }))
+    }
+
+    /// Answers only requests made to `host` (such as `127.0.0.1:8080`).
+    pub fn only_for_host(&self, host: String) {
+        let _ = self.0.only_host.set(host);
     }
 
     pub fn publish(&self, site: Site) {
@@ -279,6 +289,12 @@ async fn respond(live: &Live, req: Request<Incoming>) -> Reply {
     // asked to fetch other hosts, and this is not a proxy.
     if req.uri().authority().is_some() {
         return not_found(false);
+    }
+    if let Some(only) = live.0.only_host.get() {
+        let named = req.headers().get(hyper::header::HOST).and_then(|v| v.to_str().ok());
+        if named != Some(only.as_str()) {
+            return plain(StatusCode::MISDIRECTED_REQUEST, "This site is not served under that name.\n", false);
+        }
     }
     let path = req.uri().path().to_owned();
     let site = live.site();
