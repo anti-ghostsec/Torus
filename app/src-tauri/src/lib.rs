@@ -169,6 +169,36 @@ async fn mine_use(backend: State<'_, Backend>, id: u32, replace: bool) -> Result
 }
 
 #[tauri::command]
+fn mine_save(backend: State<'_, Backend>) -> Result<String, Failure> {
+    backend.mine_save()
+}
+
+#[tauri::command]
+fn saved_addresses(backend: State<'_, Backend>) -> Result<Vec<String>, Failure> {
+    backend.saved_addresses()
+}
+
+#[tauri::command]
+async fn use_saved(backend: State<'_, Backend>, id: u32, address: String, replace: bool) -> Result<String, Failure> {
+    backend.use_saved(id, address, replace).await
+}
+
+#[tauri::command]
+fn forget_saved(backend: State<'_, Backend>, address: String) -> Result<(), Failure> {
+    backend.forget_saved(address)
+}
+
+#[tauri::command]
+async fn export_key(backend: State<'_, Backend>, address: String, file: std::path::PathBuf, passphrase: String) -> Result<(), Failure> {
+    backend.export_key(address, file, passphrase).await
+}
+
+#[tauri::command]
+async fn import_key(backend: State<'_, Backend>, file: std::path::PathBuf, passphrase: String) -> Result<String, Failure> {
+    backend.import_key(file, passphrase).await
+}
+
+#[tauri::command]
 async fn stop(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
     backend.stop(id).await;
     Ok(())
@@ -254,6 +284,12 @@ pub fn run() {
             mine_status,
             mine_stop,
             mine_use,
+            mine_save,
+            saved_addresses,
+            use_saved,
+            forget_saved,
+            export_key,
+            import_key,
             stop
         ])
         .build(tauri::generate_context!())
