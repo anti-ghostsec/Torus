@@ -15,6 +15,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
+pub mod backup;
 pub mod folder;
 mod locked;
 

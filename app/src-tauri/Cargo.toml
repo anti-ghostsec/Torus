@@ -28,5 +28,6 @@ zeroize = "1"
 torus-seal.workspace = true
 getrandom = { version = "0.2", features = ["std"] }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 serde.workspace = true
 tokio.workspace = true

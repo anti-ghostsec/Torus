@@ -366,6 +366,35 @@ impl Backend {
         Ok(self.vault_path()?.exists())
     }
 
+    /// Writes a backup of the whole installation to `file`: the vault and
+    /// every site's data, all as they sit on disk, already encrypted. Every
+    /// site is taken offline first, so nothing is written while it is copied.
+    pub async fn export_backup(&self, file: PathBuf) -> Result<(), Failure> {
+        self.shutdown().await;
+        let data_dir = self.data_dir.clone();
+        // Streamed on a blocking thread: a backup can be many gigabytes.
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let out = std::fs::File::create(&file)?;
+            torus_vault::backup::export(&data_dir, &mut std::io::BufWriter::new(out))?;
+            Ok(())
+        })
+        .await
+        .map_err(Failure::new)?
+        .map_err(Failure::new)
+    }
+
+    /// Restores a backup into this installation. Refused unless there is no
+    /// vault here yet, so a restore never writes over existing sites.
+    pub fn import_backup(&self, file: PathBuf) -> Result<(), Failure> {
+        if self.vault_exists()? {
+            return Err(Failure::new("Lock or remove the vault here before restoring a backup over it."));
+        }
+        std::fs::create_dir_all(&self.data_dir).map_err(Failure::new)?;
+        let _ = torus_host_api::make_private(&self.data_dir);
+        let input = std::fs::File::open(&file).map_err(Failure::new)?;
+        torus_vault::backup::import(&self.data_dir, &mut std::io::BufReader::new(input)).map_err(Failure::new)
+    }
+
     /// Creates the vault with a first site. Never replaces an existing vault.
     pub fn create_vault(&self, passphrase: String, site: Site) -> Result<Vec<Listed>, Failure> {
         let passphrase = Zeroizing::new(passphrase);
