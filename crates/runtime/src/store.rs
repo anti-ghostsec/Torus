@@ -492,11 +492,12 @@ impl Store {
 
     // Accounts
 
-    /// The account with this name, whatever its capitals, and its password hash.
-    pub(crate) fn account(&self, name: &str) -> Option<(String, String)> {
+    /// The account with this name, whatever its capitals: its id, password
+    /// hash, and whether it is still waiting for the owner's approval.
+    pub(crate) fn account(&self, name: &str) -> Option<(String, String, bool)> {
         let users = self.state.records.get(USERS)?;
         let user = users.iter().find(|u| u.fields.get(USER_NAME).is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
-        Some((user.id.clone(), self.state.passwords.get(&user.id)?.clone()))
+        Some((user.id.clone(), self.state.passwords.get(&user.id)?.clone(), user.held))
     }
 
     pub(crate) fn create_account(&mut self, site: &Site, record: Record, password_hash: String) -> Result<String, Refused> {
