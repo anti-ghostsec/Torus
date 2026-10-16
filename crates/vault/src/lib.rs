@@ -147,6 +147,39 @@ impl Vault {
     }
 }
 
+/// Seals `contents` under a passphrase, in the vault's own format, without
+/// a file: for exports, which carry their own passphrase.
+pub fn seal(passphrase: &str, contents: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut header = [0u8; HEADER_LEN];
+    header[..8].copy_from_slice(MAGIC);
+    random(&mut header[8..8 + SALT_LEN])?;
+    header[24..28].copy_from_slice(&DEFAULT_COST.memory_kib.to_le_bytes());
+    header[28..32].copy_from_slice(&DEFAULT_COST.passes.to_le_bytes());
+    header[32..36].copy_from_slice(&DEFAULT_COST.lanes.to_le_bytes());
+    let key = derive(passphrase, &header)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    random(&mut nonce)?;
+    let body = XChaCha20Poly1305::new(key.as_ref().into())
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: contents, aad: &header })
+        .map_err(|_| Error::Format)?;
+    Ok([&header[..], &nonce, &body].concat())
+}
+
+/// Opens what [`seal`] made.
+pub fn unseal(sealed: &[u8], passphrase: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if sealed.len() < HEADER_LEN + NONCE_LEN || &sealed[..8] != MAGIC {
+        return Err(Error::Format);
+    }
+    let mut header = [0u8; HEADER_LEN];
+    header.copy_from_slice(&sealed[..HEADER_LEN]);
+    let key = derive(passphrase, &header)?;
+    let (nonce, body) = sealed[HEADER_LEN..].split_at(NONCE_LEN);
+    XChaCha20Poly1305::new(key.as_ref().into())
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: body, aad: &header })
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Locked)
+}
+
 fn derive(passphrase: &str, header: &[u8; HEADER_LEN]) -> Result<Zeroizing<[u8; 32]>, Error> {
     let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
     let (memory_kib, passes, lanes) = (word(24), word(28), word(32));

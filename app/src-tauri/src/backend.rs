@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -42,6 +43,23 @@ struct Payload {
     #[serde(default, skip_serializing)]
     identity: Option<Vec<u8>>,
 }
+
+/// The sealed part of a site file: the site, and only the secrets the owner
+/// chose to carry with it.
+#[derive(Serialize, Deserialize)]
+struct Exported {
+    site: Site,
+    identity: Option<Vec<u8>>,
+    records_key: Option<Vec<u8>>,
+    seal_secret: Option<Vec<u8>>,
+    /// Whether the site's encrypted folder follows the sealed part.
+    content: bool,
+}
+
+/// Site file: `magic | sealed part's length | sealed part | archive, if any`.
+const SITE_MAGIC: &[u8; 8] = b"TORUSST1";
+/// The sealed part is a site's design and a few keys, padded: never huge.
+const MAX_SITE_HEADER: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
@@ -428,6 +446,132 @@ impl Backend {
         .await
         .map_err(Failure::new)?
         .map_err(Failure::new)
+    }
+
+    /// Writes one site to `file`, sealed under a passphrase of its own, so it
+    /// can be moved to another installation or kept apart. The design always
+    /// goes; what visitors added, and the onion address, only if asked. With
+    /// its content the site is taken offline first, so nothing changes while
+    /// it is copied.
+    pub async fn export_site(
+        &self,
+        id: u32,
+        file: PathBuf,
+        passphrase: String,
+        content: bool,
+        address: bool,
+    ) -> Result<(), Failure> {
+        let passphrase = Zeroizing::new(passphrase);
+        if passphrase.chars().count() < MIN_PASSPHRASE {
+            return Err(Failure::new(format!("Use a passphrase of at least {MIN_PASSPHRASE} characters.")));
+        }
+        if content {
+            self.stop(id).await;
+        }
+        let exported = self.with_session(|session| {
+            let entry = session.entry(id)?;
+            Ok(Exported {
+                site: entry.site.clone(),
+                identity: if address { entry.identity.as_ref().map(|key| key.to_vec()) } else { None },
+                records_key: if content { entry.records_key.as_ref().map(|key| key.to_vec()) } else { None },
+                seal_secret: if content { entry.seal_secret.as_ref().map(|key| key.to_vec()) } else { None },
+                content: content && entry.records_key.is_some(),
+            })
+        })?;
+        let dir = self.site_dir(id)?;
+        tokio::task::spawn_blocking(move || -> Result<(), Failure> {
+            let mut header = Zeroizing::new(serde_json::to_vec(&exported).map_err(Failure::new)?);
+            torus_vault::pad_json(&mut header);
+            let sealed = torus_vault::seal(&passphrase, &header).map_err(Failure::new)?;
+            let written = (|| -> std::io::Result<()> {
+                let mut out = std::io::BufWriter::new(std::fs::File::create(&file)?);
+                out.write_all(SITE_MAGIC)?;
+                out.write_all(&(sealed.len() as u32).to_le_bytes())?;
+                out.write_all(&sealed)?;
+                if exported.content {
+                    // Already encrypted with the site's own key, which is in the
+                    // sealed part. Tor's bookkeeping stays: it is rebuilt.
+                    torus_vault::backup::export_only(&dir, &mut out, &|rel| rel != "tor-state.bin")?;
+                }
+                out.flush()
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&file);
+            }
+            written.map_err(Failure::new)
+        })
+        .await
+        .map_err(Failure::new)?
+    }
+
+    /// Adds a site exported with [`Backend::export_site`] as a new site here.
+    pub async fn import_site(&self, file: PathBuf, passphrase: String) -> Result<Listed, Failure> {
+        let passphrase = Zeroizing::new(passphrase);
+        self.with_session(|_| Ok(()))?;
+        let mut input = std::io::BufReader::new(std::fs::File::open(&file).map_err(Failure::new)?);
+        let (exported, input) = tokio::task::spawn_blocking(move || -> Result<_, Failure> {
+            let not_one = || Failure::new("This is not a Torus site file.");
+            let mut magic = [0u8; 8];
+            input.read_exact(&mut magic).map_err(|_| not_one())?;
+            let mut len = [0u8; 4];
+            input.read_exact(&mut len).map_err(|_| not_one())?;
+            let len = u32::from_le_bytes(len) as usize;
+            if &magic != SITE_MAGIC || len > MAX_SITE_HEADER {
+                return Err(not_one());
+            }
+            let mut sealed = vec![0u8; len];
+            input.read_exact(&mut sealed).map_err(|_| not_one())?;
+            let opened = torus_vault::unseal(&sealed, &passphrase).map_err(|e| match e {
+                torus_vault::Error::Locked => Failure::new("Wrong passphrase for this site file, or the file is damaged."),
+                _ => not_one(),
+            })?;
+            let exported: Exported = serde_json::from_slice(&opened).map_err(|_| not_one())?;
+            Ok((exported, input))
+        })
+        .await
+        .map_err(Failure::new)??;
+        let identity = exported.identity.map(identity_from).transpose()?;
+        let id = self.with_session(|session| {
+            // One address, one site: two copies online would fight over it.
+            if let Some(identity) = &identity {
+                if session.sites.iter().any(|e| e.identity.as_ref().is_some_and(|k| **k == **identity)) {
+                    return Err(Failure::new("A site here already has this address. Delete it first, or import without the address."));
+                }
+            }
+            Ok(session.add(exported.site.clone()))
+        })?;
+        let dir = self.site_dir(id)?;
+        let unpacked = if exported.content {
+            let dir = dir.clone();
+            let mut input = input;
+            tokio::task::spawn_blocking(move || {
+                let _ = folder::erase(&dir);
+                torus_vault::backup::unpack(&dir, &mut input)
+            })
+            .await
+            .map_err(Failure::new)?
+            .map_err(|e| Failure::new(format!("The site's content could not be read: {e}")))
+        } else {
+            Ok(())
+        };
+        let added = unpacked.and_then(|()| {
+            self.with_session(|session| {
+                let entry = session.entry(id)?;
+                entry.identity = identity;
+                entry.records_key = exported.records_key.map(Zeroizing::new);
+                entry.seal_secret = exported.seal_secret.map(Zeroizing::new);
+                session.persist()?;
+                Ok(session.listed().into_iter().find(|l| l.id == id).expect("just added"))
+            })
+        });
+        if added.is_err() {
+            let _ = self.with_session(|session| {
+                session.sites.retain(|e| e.id != id);
+                Ok(())
+            });
+            let _ = folder::erase(&dir);
+        }
+        added
     }
 
     /// Restores a backup into this installation. Refused unless there is no
@@ -1070,6 +1214,54 @@ mod tests {
         backend.unlock("correct horse battery".into()).unwrap();
         assert!(backend.add_site(site("Delta", "four")).unwrap() > third, "the count was lost on unlocking");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A site moves to another installation in a file of its own: with its
+    /// content and address when asked, without them otherwise, and never
+    /// twice with the same address.
+    #[tokio::test]
+    async fn a_site_is_exported_and_imported_with_what_was_chosen() {
+        let (from, from_dir) = backend("export-from");
+        from.create_vault("the first passphrase".into(), site("Shop", "goods")).unwrap();
+        let id = from.add_site(site("Moving", "with me")).unwrap();
+        let (identity, _, _) = from.secrets_for(id, site("Moving", "with me")).unwrap();
+        let address = torus_onion_key::address(&identity);
+        std::fs::create_dir_all(from.site_dir(id).unwrap().join("records.bin.files")).unwrap();
+        std::fs::write(from.site_dir(id).unwrap().join("records.bin"), b"SEALED RECORDS").unwrap();
+        std::fs::write(from.site_dir(id).unwrap().join("records.bin.files/abc"), b"SEALED FILE").unwrap();
+        std::fs::write(from.site_dir(id).unwrap().join("tor-state.bin"), b"TOR").unwrap();
+
+        let whole = from_dir.join("whole.torussite");
+        let design = from_dir.join("design.torussite");
+        assert!(from.export_site(id, whole.clone(), "short".into(), true, true).await.is_err(), "a weak passphrase is refused");
+        from.export_site(id, whole.clone(), "the export passphrase".into(), true, true).await.unwrap();
+        from.export_site(id, design.clone(), "the export passphrase".into(), false, false).await.unwrap();
+        let bytes = std::fs::read(&whole).unwrap();
+        assert!(!bytes.windows(6).any(|w| w == b"Moving"), "the design is sealed");
+
+        let (to, to_dir) = backend("export-to");
+        to.create_vault("another passphrase here".into(), site("Home", "mine")).unwrap();
+        assert!(to.import_site(whole.clone(), "not the passphrase".into()).await.is_err());
+        let moved = to.import_site(whole.clone(), "the export passphrase".into()).await.unwrap();
+        assert_eq!(moved.site.title, "Moving");
+        assert_eq!(moved.address.as_deref(), Some(address.as_str()), "the address came along");
+        let dir = to.site_dir(moved.id).unwrap();
+        assert_eq!(std::fs::read(dir.join("records.bin")).unwrap(), b"SEALED RECORDS");
+        assert_eq!(std::fs::read(dir.join("records.bin.files/abc")).unwrap(), b"SEALED FILE");
+        assert!(!dir.join("tor-state.bin").exists(), "Tor's bookkeeping is rebuilt, not carried");
+        let (_, records_key, _) = to.secrets_for(moved.id, moved.site.clone()).unwrap();
+        let (_, original_key, _) = from.secrets_for(id, site("Moving", "with me")).unwrap();
+        assert_eq!(&*records_key, &*original_key, "the content can still be read");
+
+        // The same address cannot be brought in twice.
+        assert!(to.import_site(whole, "the export passphrase".into()).await.is_err());
+        // The design alone: a new site with no address and nothing added.
+        let copy = to.import_site(design, "the export passphrase".into()).await.unwrap();
+        assert_eq!((copy.site.title.as_str(), copy.address), ("Moving", None));
+        assert!(!to.site_dir(copy.id).unwrap().join("records.bin").exists());
+        assert_eq!(to.unlock("another passphrase here".into()).unwrap().len(), 3, "both imports were kept");
+        let _ = std::fs::remove_dir_all(from_dir);
+        let _ = std::fs::remove_dir_all(to_dir);
     }
 
     /// A decoy passphrase opens a separate, empty installation; the real
