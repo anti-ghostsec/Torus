@@ -29,6 +29,16 @@ fn lock(backend: State<'_, Backend>) {
 }
 
 #[tauri::command]
+async fn export_backup(backend: State<'_, Backend>, file: std::path::PathBuf) -> Result<(), Failure> {
+    backend.export_backup(file).await
+}
+
+#[tauri::command]
+fn import_backup(backend: State<'_, Backend>, file: std::path::PathBuf) -> Result<(), Failure> {
+    backend.import_backup(file)
+}
+
+#[tauri::command]
 fn auto_lock_minutes(backend: State<'_, Backend>) -> u32 {
     backend.auto_lock_minutes()
 }
@@ -165,6 +175,7 @@ fn data_root(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error:
 pub fn run() {
     torus_host_api::no_crash_dumps();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = data_root(app)?;
             let backend = Backend::new(root.clone(), root.join("sites"), torus_host_api::host_program()?);
@@ -192,6 +203,8 @@ pub fn run() {
             lock,
             auto_lock_minutes,
             set_auto_lock_minutes,
+            export_backup,
+            import_backup,
             panic,
             save,
             add_site,

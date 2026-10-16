@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 // Mirrors the model in crates/core. `id` is editor-only; the compiler ignores it.
 type Align = "left" | "center" | "right";
@@ -825,6 +826,31 @@ function renderSettings() {
     el("p", "hint", "Applies to the whole app. Panic (the toolbar button, or Ctrl+Shift+Backspace) takes every site offline, locks, and closes at once."),
   );
 
+  // A backup of the whole installation: the vault and every site's data, all
+  // already encrypted. Exporting takes every site offline first.
+  const backup = el("button", "", "Back up everything to a file");
+  backup.addEventListener("click", async () => {
+    const stamp = new Date().toISOString().slice(0, 10);
+    const file = await saveDialog({ defaultPath: `torus-backup-${stamp}.torusbak`, filters: [{ name: "Torus backup", extensions: ["torusbak"] }] });
+    if (!file) return;
+    backup.disabled = true;
+    backup.textContent = "Backing up… (sites are offline)";
+    try {
+      await invoke("export_backup", { file });
+      note = "Backup saved. Keep it somewhere safe: it opens only with this vault's passphrase.";
+      showStatus();
+    } catch (error) {
+      showFailure(error);
+    } finally {
+      backup.disabled = false;
+      backup.textContent = "Back up everything to a file";
+    }
+  });
+  siteHost.append(
+    field("Backup", backup),
+    el("p", "hint", "One file with the vault and every site's data, all encrypted. It opens only with this vault's passphrase. Restore it on a fresh install from the Unlock screen."),
+  );
+
   // Replaces every page and collection, so it also takes two clicks.
   const kinds: [string, string][] = [["video", "Video site"], ["board", "Anonymous board"], ["microblog", "Microblog"]];
   const kind = el("select");
@@ -1388,6 +1414,24 @@ async function start() {
     : "Choose a passphrase. It encrypts your sites and their onion keys on this computer. It cannot be recovered if you forget it.";
   lock.hidden = false;
   first.focus();
+
+  // On a fresh install, offer to restore a backup instead of starting over.
+  const restore = $<HTMLButtonElement>("restore");
+  restore.hidden = exists;
+  restore.addEventListener("click", async () => {
+    const file = await openDialog({ filters: [{ name: "Torus backup", extensions: ["torusbak"] }] });
+    if (!file || Array.isArray(file)) return;
+    restore.disabled = true;
+    restore.textContent = "Restoring…";
+    try {
+      await invoke("import_backup", { file });
+      location.reload();
+    } catch (error) {
+      $("lock-error").textContent = (error as Failure).message;
+      restore.disabled = false;
+      restore.textContent = "Restore from a backup";
+    }
+  });
 
   lock.addEventListener("submit", async (event) => {
     event.preventDefault();
