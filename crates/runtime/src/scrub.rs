@@ -37,6 +37,17 @@ impl Scrubber {
         }
     }
 
+    /// Whether part of the file had to be passed through without being
+    /// cleaned: an index too large to hold, or a part of unknown length
+    /// after which anything may follow. Where no converter encodes the
+    /// video afresh, such a file must not be kept.
+    pub fn incomplete(&self) -> bool {
+        match self {
+            Scrubber::Mp4(mp4) => mp4.gave_up,
+            Scrubber::WebM(webm) => webm.gave_up,
+        }
+    }
+
     /// Appends whatever was still being held back when the file ended.
     pub fn finish(&mut self, out: &mut Vec<u8>) {
         let held = match self {
@@ -82,6 +93,7 @@ fn pass(input: &[u8], left: &mut u64, blank: bool, out: &mut Vec<u8>) -> usize {
 pub(crate) struct Mp4 {
     next: Next,
     held: Vec<u8>,
+    gave_up: bool,
 }
 
 /// Boxes that exist to carry descriptions: user data, metadata, and
@@ -133,6 +145,14 @@ impl Mp4 {
                     let kind: [u8; 4] = self.held[4..8].try_into().expect("4 bytes");
                     let size = if need == 16 { u64::from_be_bytes(self.held[8..16].try_into().expect("8 bytes")) } else { short };
                     let body = size.checked_sub(need as u64);
+                    // A size of 0 ("to the end") is normal for the pictures
+                    // at the very end; anything else passed through whole
+                    // that could describe the recording is not cleaned.
+                    let malformed = body.is_none() && short != 0;
+                    let unheld_index = &kind == b"moov" && !(need == 8 && size <= MAX_HELD);
+                    if malformed || unheld_index || (body.is_none() && (&kind == b"moov" || describes(&kind))) {
+                        self.gave_up = true;
+                    }
                     self.next = match body {
                         // Size 0 means "to the end of the file"; a size
                         // smaller than its own header is not a box at all.
@@ -209,6 +229,7 @@ const VOID: u8 = 0xEC;
 pub(crate) struct WebM {
     next: Next,
     held: Vec<u8>,
+    gave_up: bool,
 }
 
 /// An element's identifier, its body's size (`None` when declared unknown),
@@ -291,11 +312,15 @@ impl WebM {
                         Ok(Some(found)) => found,
                         Ok(None) => continue,
                         Err(()) => {
+                            self.gave_up = true;
                             out.append(&mut self.held);
                             self.next = Next::CopyRest;
                             continue;
                         }
                     };
+                    if id == INFO && !size.is_some_and(|body| header as u64 + body <= MAX_HELD) {
+                        self.gave_up = true;
+                    }
                     self.next = match (id, size) {
                         // The segment holds everything else: carry on inside it.
                         (SEGMENT, _) => {
@@ -315,8 +340,10 @@ impl WebM {
                             out.append(&mut self.held);
                             if body == 0 { Next::Header } else { Next::Copy(body) }
                         }
-                        // A part of unknown length runs to the end of the file.
+                        // A part of unknown length runs to the end of the
+                        // file, and whatever follows it is not looked at.
                         (_, None) => {
+                            self.gave_up = true;
                             out.append(&mut self.held);
                             Next::CopyRest
                         }
@@ -450,6 +477,28 @@ mod tests {
         let file = [mp4_box(b"ftyp", b"isom"), mp4_box(b"moov", &nested)].concat();
         let cleaned = run(Scrubber::new("video/mp4"), &file, 65_536);
         assert_eq!(cleaned.len(), file.len());
+    }
+
+    #[test]
+    fn what_cannot_be_cleaned_is_reported() {
+        let original = sample_mp4();
+        let mut whole = Scrubber::new("video/mp4");
+        whole.push(&original, &mut Vec::new());
+        assert!(!whole.incomplete(), "an ordinary file is cleaned completely");
+
+        // An index with a 64-bit size is not held, so it is not cleaned.
+        let mut big = vec![0, 0, 0, 1];
+        big.extend_from_slice(b"moov");
+        big.extend_from_slice(&24u64.to_be_bytes());
+        big.extend_from_slice(&[0; 8]);
+        let mut scrubber = Scrubber::new("video/mp4");
+        scrubber.push(&[mp4_box(b"ftyp", b"isom"), big].concat(), &mut Vec::new());
+        assert!(scrubber.incomplete());
+
+        // A WebM part of unknown length hides whatever comes after it.
+        let mut webm = Scrubber::new("video/webm");
+        webm.push(&[0x1F, 0x43, 0xB6, 0x75, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 1, 2, 3], &mut Vec::new());
+        assert!(webm.incomplete());
     }
 
     #[test]

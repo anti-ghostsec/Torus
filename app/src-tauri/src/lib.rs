@@ -132,6 +132,16 @@ pub fn run() {
             onion_status,
             stop
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Closing the app takes every site offline, packs Tor's
+            // bookkeeping away encrypted and forgets the vault's key: with
+            // the app closed, nothing can be read without the passphrase.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(backend) = app.try_state::<Backend>() {
+                    tauri::async_runtime::block_on(backend.shutdown());
+                }
+            }
+        });
 }

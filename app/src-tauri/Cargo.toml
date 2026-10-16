@@ -15,10 +15,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
-# Where programs cannot start others, the host runs inside the app.
-[target.'cfg(target_os = "android")'.dependencies]
-torus-host = { path = "../../crates/host" }
-
 [dev-dependencies]
 torus-host = { path = "../../crates/host" }
 

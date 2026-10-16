@@ -40,11 +40,15 @@ pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Reads lowercase or uppercase hexadecimal, and nothing else: no signs,
+/// spaces or prefixes, so each value has exactly one spelling.
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = text.as_bytes();
+    if bytes.len() % 2 != 0 {
         return None;
     }
-    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
+    bytes.chunks_exact(2).map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?)).collect()
 }
 
 fn random<const N: usize>() -> Option<Zeroizing<[u8; N]>> {
@@ -184,5 +188,14 @@ mod tests {
         weak[..32].fill(0);
         assert!(seal(&weak, b"x").is_none());
         assert!(public_key(&secret[..10]).is_none());
+    }
+
+    #[test]
+    fn hex_has_one_spelling() {
+        assert_eq!(from_hex("00ffA0").unwrap(), [0, 255, 160]);
+        for bad in ["+f", "-1", " f", "0x", "f", "zz", "é0"] {
+            assert!(from_hex(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(from_hex(&to_hex(&[1, 2, 254])).unwrap(), [1, 2, 254]);
     }
 }

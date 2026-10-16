@@ -50,7 +50,7 @@ mod webm;
 mod store;
 
 use blobs::{Staged, Target};
-use store::Refused;
+use store::{Budget, Refused};
 pub use media::{Converter, Job};
 pub use store::{Storage, Store};
 
@@ -177,6 +177,9 @@ impl Live {
     /// video, one video at a time, using `converter`. Videos that arrived
     /// before are caught up on first.
     pub fn convert_with(&self, converter: Arc<dyn Converter>) {
+        // From now on no video is served as it was uploaded: each is held
+        // back until the converter has encoded it afresh.
+        self.store().hold_videos = true;
         let live = self.clone();
         tokio::spawn(async move {
             loop {
@@ -204,6 +207,23 @@ impl Live {
     /// or an ordinary account again. Returns whether there is such an account.
     pub fn set_moderator(&self, id: &str, on: bool) -> bool {
         self.store().set_moderator(id, on)
+    }
+
+    /// Waits until every change made so far is safely on disk.
+    pub async fn settle(&self) {
+        let settled = self.store().settled();
+        if let Some(settled) = settled {
+            settled.await;
+        }
+    }
+
+    /// Adds a record with one field, `name`, as if a visitor had: for tests
+    /// that need many records without waiting out the per-minute limits.
+    #[doc(hidden)]
+    pub fn add_for_test(&self, collection: &str, name: &str) -> bool {
+        let site = self.site();
+        let record = Record { fields: [("name".to_owned(), name.to_owned())].into(), ..Record::default() };
+        self.store().add(&site, collection, record).is_ok()
     }
 
     fn site(&self) -> Arc<Site> {
@@ -281,6 +301,10 @@ async fn respond(live: &Live, req: Request<Incoming>) -> Reply {
     let posted = req.method() == Method::POST;
     let reply = route(live, &site, viewer, cookie, path, head, req).await;
     if posted {
+        // What the visitor is told was saved must be on disk first. The wait
+        // happens here, outside the store's lock and off the threads that
+        // read and write the disk.
+        live.settle().await;
         // Something may have been uploaded.
         live.0.work.notify_one();
     }
@@ -433,8 +457,22 @@ fn file(live: &Live, id: &str, range: Option<&HeaderValue>, head: bool) -> Reply
     let body: Body = if head {
         Full::new(Bytes::new()).boxed_unsync()
     } else {
-        let pieces = blobs::read(source, start, length).map(|piece| Ok::<_, Infallible>(Frame::data(piece)));
-        StreamBody::new(futures_util::stream::iter(pieces)).boxed_unsync()
+        // Reading and decrypting happen on a thread meant for blocking work,
+        // a few pieces ahead of the visitor, never on the threads that
+        // answer requests.
+        let (pieces, arriving) = tokio::sync::mpsc::channel::<Bytes>(4);
+        tokio::task::spawn_blocking(move || {
+            for piece in blobs::read(source, start, length) {
+                if pieces.blocking_send(piece).is_err() {
+                    break;
+                }
+            }
+        });
+        let stream = futures_util::stream::unfold(arriving, |mut arriving| async move {
+            let piece = arriving.recv().await?;
+            Some((Ok::<_, Infallible>(Frame::data(piece)), arriving))
+        });
+        StreamBody::new(stream).boxed_unsync()
     };
     let mut res = headers(Response::new(body), status, &info.content_type, length);
     res.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -516,8 +554,12 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
     // The original header, since a boundary's capitals matter.
     let original = req.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
     let boundary = multer::parse_boundary(&original).map_err(|_| bad("That submission could not be read.\n"))?;
-    let file_room: usize = fields.iter().filter(|f| f.kind.is_file()).map(|f| f.kind.max_len()).sum();
-    let limit = multer::SizeLimit::new().whole_stream((file_room + 2 * MAX_FORM_BYTES) as u64);
+    let file_room: u64 = fields
+        .iter()
+        .filter(|f| f.kind.is_file())
+        .map(|f| if f.kind == FieldKind::Video { site.limits.video_bytes() } else { f.kind.max_bytes() })
+        .sum();
+    let limit = multer::SizeLimit::new().whole_stream(file_room + 2 * MAX_FORM_BYTES as u64);
     // Counted as it arrives, so the frame under the form can say how far it has got.
     let tracked = Tracked::begin(live, &req);
     let counter = tracked.as_ref().map(|t| t.arriving.clone());
@@ -561,7 +603,7 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
         };
         let max = match field.kind {
             FieldKind::Video => site.limits.video_bytes(),
-            kind => kind.max_len() as u64,
+            kind => kind.max_bytes(),
         };
         let needed = announced.map_or(max, |announced| announced.min(max));
         match field.kind {
@@ -631,6 +673,11 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 cleaned.clear();
                 scrubber.finish(&mut cleaned);
                 writer.write(&cleaned).map_err(|_| too_large())?;
+                // Without a converter to encode it afresh, a video is kept
+                // only if all of it could be cleaned.
+                if scrubber.incomplete() && !live.store().hold_videos {
+                    return Err(bad("That video could not be cleaned of what the camera recorded about it, so it was not kept.\n"));
+                }
                 let staged = writer.finish().map_err(|_| unavailable())?;
                 // An MP4 whose index came last gets it moved to the front,
                 // so that playback can start before the whole file is fetched.
@@ -713,7 +760,7 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
     if collection.members_only && viewer.is_none() {
         return refuse_unread(req, plain(StatusCode::FORBIDDEN, "Sign in first.\n", false)).await;
     }
-    let allowed = live.store().allow();
+    let allowed = live.store().allow(Budget::Posts);
     if let Err(refused) = allowed {
         return refuse_unread(req, refusal(refused)).await;
     }
@@ -898,7 +945,7 @@ async fn sign_up(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
     if viewer.is_some() {
         return bad("You are already signed in.\n");
     }
-    if let Err(refused) = live.store().allow() {
+    if let Err(refused) = live.store().allow(Budget::SignUps) {
         return refusal(refused);
     }
     let mut submission = match read_submission(live, &users.fields, req).await {
@@ -942,7 +989,7 @@ async fn sign_in(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
     if viewer.is_some() {
         return bad("You are already signed in.\n");
     }
-    if let Err(refused) = live.store().allow() {
+    if let Err(refused) = live.store().allow(Budget::SignIns) {
         return refusal(refused);
     }
     let submission = match read_submission(live, &[], req).await {

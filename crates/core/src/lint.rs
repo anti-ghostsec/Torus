@@ -35,6 +35,12 @@ pub(crate) enum LinkTarget {
 
 pub(crate) fn classify_link(href: &str) -> LinkTarget {
     let href = href.trim();
+    // Browsers drop tabs and line breaks from addresses and read a
+    // backslash as a slash, so `/\\host` or a slash, a line break and
+    // `/host` lead to another site. Such characters are never needed.
+    if href.chars().any(|c| c == '\\' || c.is_control() || c.is_whitespace()) {
+        return LinkTarget::Forbidden;
+    }
     if href.starts_with('/') && !href.starts_with("//") {
         return LinkTarget::Internal;
     }
@@ -400,6 +406,10 @@ mod tests {
         assert_eq!(classify_link("javascript:alert(1)"), LinkTarget::Forbidden);
         assert_eq!(classify_link("http://abc.onion@example.com"), LinkTarget::Forbidden);
         assert_eq!(classify_link("mailto:me@example.com"), LinkTarget::Forbidden);
+        for sneaky in ["/\\example.com", "/\n/example.com", "/\t/example.com", "/ /example.com", "/\r/x"] {
+            assert_eq!(classify_link(sneaky), LinkTarget::Forbidden, "{sneaky:?}");
+        }
+        assert_eq!(classify_link("/videos/{id}"), LinkTarget::Internal);
     }
 
     #[test]

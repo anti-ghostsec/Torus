@@ -19,3 +19,6 @@ torus-onion-key.workspace = true
 tor-rtcompat = "0.47"
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

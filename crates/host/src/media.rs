@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,13 @@ use torus_host_api::{pipe_ends, CONVERTER_LINK, CONVERTER_PROGRAM, CONVERTER_ROL
 use torus_runtime::{Converter, Job};
 
 const PIECE: usize = 64 * 1024;
-/// A conversion still running after this long is stopped.
-const LONGEST: Duration = Duration::from_secs(3 * 60 * 60);
-const LONGEST_STILL: Duration = Duration::from_secs(120);
+/// A conversion that has produced nothing for this long is stuck and is
+/// stopped. A 10 GB video takes hours to encode, so the whole conversion is
+/// not limited by time, only by whether it is still making progress.
+const STALLED: Duration = Duration::from_secs(30 * 60);
+/// However slow the device, no conversion runs for longer than this.
+const LONGEST: Duration = Duration::from_secs(4 * 24 * 60 * 60);
+const LONGEST_STILL: Duration = Duration::from_secs(10 * 60);
 
 fn send(to: &mut impl Write, data: &[u8]) -> io::Result<()> {
     for piece in data.chunks(PIECE) {
@@ -119,15 +123,23 @@ fn arguments(kind: u8, pixels: u32) -> Option<Vec<String>> {
     // tracks, descriptions and chapters are never carried over.
     let video = |add: &mut dyn FnMut(&[&str]), scale: &str, quality: &str, sound: &str| {
         add(&["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]);
-        add(&["-vf", scale, "-c:v", "libvpx-vp9", "-crf", quality, "-b:v", "0", "-deadline", "good", "-cpu-used", "5"]);
-        add(&["-row-mt", "1", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-b:a", sound, "-ac", "2"]);
+        add(&["-vf", scale, "-c:v", "libvpx-vp9", "-crf", quality, "-b:v", "0", "-deadline", "good", "-cpu-used", "6"]);
+        add(&["-row-mt", "1", "-tile-columns", "2", "-threads", "0", "-pix_fmt", "yuv420p"]);
+        add(&["-c:a", "libopus", "-b:a", sound, "-ac", "2"]);
         add(&["-bitexact", "-f", "webm", "pipe:1"]);
     };
     match (kind, pixels) {
         (1, _) => add(&["-map", "0:v:0", "-vf", "thumbnail=90", "-frames:v", "1", "-an", "-sn", "-dn", "-map_metadata", "-1", "-f", "image2pipe", "-c:v", "png", "pipe:1"]),
         (2, 360) => video(&mut add, "scale='if(gt(iw,ih),-2,360)':'if(gt(iw,ih),360,-2)'", "36", "64k"),
         (2, 720) => video(&mut add, "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'", "34", "96k"),
-        (3, _) => video(&mut add, "scale=trunc(iw/2)*2:trunc(ih/2)*2", "33", "128k"),
+        // Every upload: the same size, up to 1080 pixels on the shorter
+        // side, which is all that is worth sending over Tor.
+        (3, _) => video(
+            &mut add,
+            "scale='if(gt(iw,ih),-2,trunc(min(iw,1080)/2)*2)':'if(gt(iw,ih),trunc(min(ih,1080)/2)*2,-2)'",
+            "33",
+            "128k",
+        ),
         _ => return None,
     }
     Some(all)
@@ -158,6 +170,9 @@ fn serve_one(from: &mut File, to: &mut File, program: &Path, kind: u8, pixels: u
     let child = Mutex::new(child);
     let finished = AtomicBool::new(false);
     let longest = if kind == 1 { LONGEST_STILL } else { LONGEST };
+    let started = Instant::now();
+    // When the converter last produced something, in seconds since it started.
+    let progressed = AtomicU64::new(0);
 
     let passed = std::thread::scope(|scope| -> io::Result<()> {
         // Feeds the video in.
@@ -174,9 +189,9 @@ fn serve_one(from: &mut File, to: &mut File, program: &Path, kind: u8, pixels: u
         });
         // Stops a conversion that will not end.
         scope.spawn(|| {
-            let started = Instant::now();
             while !finished.load(Ordering::Relaxed) {
-                if started.elapsed() > longest {
+                let quiet = started.elapsed().saturating_sub(Duration::from_secs(progressed.load(Ordering::Relaxed)));
+                if started.elapsed() > longest || quiet > STALLED {
                     let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
                     return;
                 }
@@ -190,6 +205,7 @@ fn serve_one(from: &mut File, to: &mut File, program: &Path, kind: u8, pixels: u
             match result.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
+                    progressed.store(started.elapsed().as_secs(), Ordering::Relaxed);
                     if passing.is_ok() {
                         passing = send(to, &buffer[..count]);
                     }

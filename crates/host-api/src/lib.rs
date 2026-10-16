@@ -24,6 +24,10 @@ use zeroize::Zeroizing;
 
 #[cfg(windows)]
 mod confine;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod unix_confine;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use unix_confine::{confine_from_surroundings, Isolation};
 
 /// Larger than any site; a frame beyond this is a bug or an attack.
 const MAX_FRAME: u32 = 256 * 1024 * 1024;
@@ -69,6 +73,9 @@ pub enum Command {
     Moderators,
     /// Make an account a moderator, or an ordinary account again.
     Moderator { id: String, on: bool },
+    /// A question that has an answer, numbered so that a late answer to an
+    /// earlier question is never taken for the answer to this one.
+    Ask { seq: u64, question: Box<Command> },
     Stop,
 }
 
@@ -88,6 +95,8 @@ pub enum Event {
     Moderating { ids: Vec<String> },
     /// The site could not be started. The host exits after sending this.
     Failed { message: String },
+    /// The answer to the `Ask` with the same number.
+    Answer { seq: u64, answer: Box<Event> },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,15 +165,26 @@ fn plain(program: &Path) -> Result<(Input, Output, Keeper), String> {
 }
 
 /// The container a site's converter runs in, named after the site's own.
+#[cfg(windows)]
 fn converter_container(container: &str) -> String {
     format!("{container}-media")
 }
 
+/// The most memory a confined host may use. Enough for its largest job,
+/// moving the index of a very long video, with room to spare.
 #[cfg(windows)]
-fn confined(program: &Path, container: &str, converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
+const HOST_MEMORY: usize = 4 << 30;
+/// The most memory the converter may use, decoding 4K video included.
+#[cfg(windows)]
+const CONVERTER_MEMORY: usize = 6 << 30;
+
+#[cfg(windows)]
+fn confined(program: &Path, sandbox: &Sandbox<'_>, converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
     use confine::Terms;
+    let container = sandbox.name;
     let failed = |e: io::Error| format!("could not start the sandbox: {e}");
-    let mut terms = Terms { network: true, processes: 1, tell: Vec::new(), give: Vec::new(), run: Vec::new() };
+    let mut terms =
+        Terms { network: true, processes: 1, memory: HOST_MEMORY, tell: Vec::new(), give: Vec::new(), run: Vec::new() };
     // The converter is the same program started in another role, in a
     // container that has no network, with the one program it may run.
     let link = converter.map(|_| confine::link()).transpose().map_err(failed)?;
@@ -174,6 +194,7 @@ fn confined(program: &Path, container: &str, converter: Option<&Path>) -> Result
         let its = Terms {
             network: false,
             processes: 2,
+            memory: CONVERTER_MEMORY,
             tell: vec![
                 (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
                 (CONVERTER_ROLE, format!("{},{}", reads.number(), writes.number()).into()),
@@ -194,8 +215,96 @@ fn confined(program: &Path, container: &str, converter: Option<&Path>) -> Result
     Ok((Box::new(tokio::fs::File::from_std(stdin)), Box::new(tokio::fs::File::from_std(stdout)), Box::new(keeper)))
 }
 
-#[cfg(not(windows))]
-fn confined(_program: &Path, _container: &str, _converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
+/// Where Linux and Android keep the files a dynamically linked program
+/// needs when it starts, and the few the kernel reports facts through.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SYSTEM_READS: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/system",
+    "/apex",
+    "/vendor",
+    "/proc/meminfo",
+    "/proc/cpuinfo",
+    "/sys/devices/system/cpu",
+    "/sys/fs/cgroup",
+];
+/// Where a confined process sends what it discards: the converter starts
+/// its decoder with nowhere else to write messages.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DISCARD: &str = "/dev/null";
+
+/// A pipe whose ends close themselves when this process starts another.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut ends = [0; 2];
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (std::os::fd::OwnedFd::from_raw_fd(ends[0]), std::os::fd::OwnedFd::from_raw_fd(ends[1])) })
+}
+
+/// Starts `program` confining itself: see `unix_confine`. Only `ends` are
+/// passed on, as descriptors 3, 4, ...
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_launch(
+    program: &Path,
+    told: Vec<(&'static str, std::ffi::OsString)>,
+    ends: Vec<std::os::fd::OwnedFd>,
+    piped: bool,
+) -> io::Result<Child> {
+    use std::os::fd::AsRawFd;
+    let mut launch = Launch::new(program);
+    let io = || if piped { Stdio::piped() } else { Stdio::null() };
+    launch.stdin(io()).stdout(io()).stderr(Stdio::null()).kill_on_drop(true).env_clear();
+    for (name, value) in told {
+        launch.env(name, value);
+    }
+    let raw: Vec<i32> = ends.iter().map(|end| end.as_raw_fd()).collect();
+    // SAFETY: `keep_only` makes async-signal-safe system calls only.
+    unsafe {
+        launch.pre_exec(move || unix_confine::keep_only(&raw));
+    }
+    let child = launch.spawn();
+    // Our copies of the child's ends close here.
+    drop(ends);
+    child
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn confined(program: &Path, sandbox: &Sandbox<'_>, converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
+    let failed = |e: io::Error| format!("could not start the sandbox: {e}");
+    let system: Vec<&Path> = SYSTEM_READS.iter().map(Path::new).collect();
+    let mut keeper: Vec<Keeper> = Vec::new();
+    let mut host_told = unix_confine::surroundings(&[sandbox.folder, Path::new(DISCARD)], &system, false);
+    let mut host_ends = Vec::new();
+    if let Some(converter) = converter {
+        // The converter is the same program started in another role, with
+        // no network and no files, and the one program it may run.
+        let (host_reads, converter_writes) = unix_pipe().map_err(failed)?;
+        let (converter_reads, host_writes) = unix_pipe().map_err(failed)?;
+        let mut programs = system.clone();
+        programs.push(converter);
+        let mut told = unix_confine::surroundings(&[Path::new(DISCARD)], &programs, true);
+        told.push((CONVERTER_PROGRAM, converter.as_os_str().to_owned()));
+        told.push((CONVERTER_ROLE, "3,4".into()));
+        let process = unix_launch(program, told, vec![converter_reads, converter_writes], false).map_err(failed)?;
+        keeper.push(Box::new(Mutex::new(process)));
+        host_told.push((CONVERTER_LINK, "3,4".into()));
+        host_ends = vec![host_reads, host_writes];
+    }
+    let mut process = unix_launch(program, host_told, host_ends, true).map_err(failed)?;
+    let stdin = process.stdin.take().expect("piped above");
+    let stdout = process.stdout.take().expect("piped above");
+    keeper.push(Box::new(Mutex::new(process)));
+    Ok((Box::new(stdin), Box::new(stdout), Box::new(keeper)))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+fn confined(_program: &Path, _sandbox: &Sandbox<'_>, _converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
     Err("the sandbox is not available on this system yet".to_owned())
 }
 
@@ -211,6 +320,7 @@ pub fn converter_alone(program: &Path, container: &str, converter: &Path) -> io:
     let terms = confine::Terms {
         network: false,
         processes: 2,
+        memory: CONVERTER_MEMORY,
         tell: vec![
             (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
             (CONVERTER_ROLE, format!("{},{}", reads.number(), writes.number()).into()),
@@ -226,6 +336,25 @@ pub fn converter_alone(program: &Path, container: &str, converter: &Path) -> io:
         (std::fs::File::from_raw_handle(ours_reads.into_raw_handle()), std::fs::File::from_raw_handle(ours_writes.into_raw_handle()))
     };
     Ok((files.0, files.1, Box::new(process)))
+}
+
+/// Starts a converter on its own, confined exactly as one beside a host
+/// is, and returns the pipes to it: the one to read and the one to write.
+/// For checking the confinement itself.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[doc(hidden)]
+pub fn converter_alone(program: &Path, _container: &str, converter: &Path) -> io::Result<(std::fs::File, std::fs::File, Keeper)> {
+    let (ours_reads, converter_writes) = unix_pipe()?;
+    let (converter_reads, ours_writes) = unix_pipe()?;
+    let mut programs: Vec<&Path> = SYSTEM_READS.iter().map(Path::new).collect();
+    programs.push(converter);
+    let mut told = unix_confine::surroundings(&[Path::new(DISCARD)], &programs, true);
+    told.push((CONVERTER_PROGRAM, converter.as_os_str().to_owned()));
+    told.push((CONVERTER_ROLE, "3,4".into()));
+    // Started outside any runtime by tests, so one is made for the launch.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let process = runtime.block_on(async { unix_launch(program, told, vec![converter_reads, converter_writes], false) })?;
+    Ok((std::fs::File::from(ours_reads), std::fs::File::from(ours_writes), Box::new((Mutex::new(process), Mutex::new(runtime)))))
 }
 
 /// Tells a host which pipe ends lead to its converter: two numbers.
@@ -256,11 +385,35 @@ pub fn pipe_ends(variable: &str) -> Option<(std::fs::File, std::fs::File)> {
         };
         Some((open(reads)?, open(writes)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        let named = std::env::var(variable).ok()?;
+        let (reads, writes) = named.split_once(',')?;
+        let open = |number: &str| {
+            let fd = number.parse::<i32>().ok().filter(|fd| *fd > 2)?;
+            // Whatever this process starts must not be handed the pipe as well.
+            unsafe {
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
+                    return None;
+                }
+                Some(std::fs::File::from_raw_fd(fd))
+            }
+        };
+        Some((open(reads)?, open(writes)?))
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = variable;
         None
     }
+}
+
+/// Where a confined host runs: the name of its sandbox, and the one folder
+/// it may keep files in.
+pub struct Sandbox<'a> {
+    pub name: &'a str,
+    pub folder: &'a Path,
 }
 
 /// A running host process, as the editor holds it. Dropping it ends the
@@ -269,8 +422,10 @@ pub struct Host {
     address: String,
     stdin: tokio::sync::Mutex<Input>,
     status: Arc<Mutex<Status>>,
-    /// Where the answer to the question being asked is delivered.
-    asked: Arc<Mutex<Option<oneshot::Sender<Event>>>>,
+    /// Where the answer to the question being asked is delivered, and its number.
+    asked: Arc<Mutex<Option<(u64, oneshot::Sender<Event>)>>>,
+    /// The number the next question gets.
+    next_seq: std::sync::atomic::AtomicU64,
     reader: JoinHandle<()>,
     _keeper: Keeper,
 }
@@ -278,22 +433,23 @@ pub struct Host {
 impl Host {
     /// Starts `program` and waits until it is serving `site`.
     ///
-    /// With `container` set, the process runs confined under that name; see
-    /// [`container_folder`] for the only place it can then keep files.
+    /// With `sandbox` set, the process runs confined, able to keep files in
+    /// the sandbox's folder only; see [`container_folder`] for that folder
+    /// on Windows.
     ///
     /// With `converter` set to a video converter's program, and only when
     /// confined, pictures and smaller copies are made from uploaded videos,
     /// by a second process that has neither network nor files.
     pub async fn start(
         program: &Path,
-        container: Option<&str>,
+        sandbox: Option<Sandbox<'_>>,
         converter: Option<&Path>,
         target: Target,
         site: Site,
         records: Option<Records>,
     ) -> Result<Self, String> {
-        let (stdin, stdout, keeper) = match container {
-            Some(container) => confined(program, container, converter)?,
+        let (stdin, stdout, keeper) = match sandbox {
+            Some(sandbox) => confined(program, &sandbox, converter)?,
             None => plain(program)?,
         };
         Self::over(stdin, stdout, keeper, target, site, records).await
@@ -321,24 +477,36 @@ impl Host {
         };
 
         let status = Arc::new(Mutex::new(Status::default()));
-        let asked = Arc::new(Mutex::new(None::<oneshot::Sender<Event>>));
+        let asked = Arc::new(Mutex::new(None::<(u64, oneshot::Sender<Event>)>));
         let (shared, waiting) = (status.clone(), asked.clone());
         let reader = tokio::spawn(async move {
             while let Ok(Some(event)) = read_frame::<_, Event>(&mut stdout).await {
                 match event {
                     Event::Status(now) => *shared.lock().unwrap_or_else(|e| e.into_inner()) = now,
-                    Event::Ready { .. } | Event::Failed { .. } => {}
-                    answer => {
-                        if let Some(waiter) = waiting.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                            let _ = waiter.send(answer);
+                    // Only a numbered answer to the question still being
+                    // waited for is delivered; anything else is late or stray.
+                    Event::Answer { seq, answer } => {
+                        let mut waiting = waiting.lock().unwrap_or_else(|e| e.into_inner());
+                        if waiting.as_ref().is_some_and(|(wanted, _)| *wanted == seq) {
+                            let (_, waiter) = waiting.take().expect("checked above");
+                            let _ = waiter.send(*answer);
                         }
                     }
+                    _ => {}
                 }
             }
             // The pipe closed: the process is gone.
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = Status { reachable: false, broken: true };
         });
-        Ok(Self { address, stdin: tokio::sync::Mutex::new(stdin), status, asked, reader, _keeper: keeper })
+        Ok(Self {
+            address,
+            stdin: tokio::sync::Mutex::new(stdin),
+            status,
+            asked,
+            next_seq: Default::default(),
+            reader,
+            _keeper: keeper,
+        })
     }
 
     pub fn address(&self) -> &str {
@@ -409,13 +577,18 @@ impl Host {
     async fn ask(&self, command: Command) -> Result<Event, String> {
         // Holding the pipe for the whole exchange keeps questions from overlapping.
         let mut stdin = self.stdin.lock().await;
+        let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (answer, wait) = oneshot::channel();
-        *self.asked.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-        write_frame(&mut *stdin, &command).await.map_err(|_| GONE.to_owned())?;
-        tokio::time::timeout(Duration::from_secs(20), wait)
-            .await
-            .map_err(|_| "the host process did not answer".to_owned())?
-            .map_err(|_| GONE.to_owned())
+        *self.asked.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, answer));
+        let question = Command::Ask { seq, question: Box::new(command) };
+        write_frame(&mut *stdin, &question).await.map_err(|_| GONE.to_owned())?;
+        let answered = tokio::time::timeout(Duration::from_secs(20), wait).await;
+        // Whatever happened, this question is no longer waited for.
+        let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        if asked.as_ref().is_some_and(|(wanted, _)| *wanted == seq) {
+            *asked = None;
+        }
+        answered.map_err(|_| "the host process did not answer".to_owned())?.map_err(|_| GONE.to_owned())
     }
 }
 
@@ -425,11 +598,32 @@ impl Drop for Host {
     }
 }
 
-/// Where the host program sits: beside the running program.
+/// Where the host program sits: beside the running program. On Android it
+/// is packaged as a native library, the one place Android lets an app keep
+/// programs it can start.
 pub fn host_program() -> io::Result<PathBuf> {
-    let mut path = std::env::current_exe()?;
-    path.set_file_name(if cfg!(windows) { "torus-host.exe" } else { "torus-host" });
-    Ok(path)
+    #[cfg(target_os = "android")]
+    {
+        Ok(native_library_dir()?.join("libtorus_host.so"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut path = std::env::current_exe()?;
+        path.set_file_name(if cfg!(windows) { "torus-host.exe" } else { "torus-host" });
+        Ok(path)
+    }
+}
+
+/// The folder Android unpacked this app's native libraries into: where the
+/// library holding this code was loaded from.
+#[cfg(target_os = "android")]
+pub fn native_library_dir() -> io::Result<PathBuf> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|path| path.ends_with("/libtorus_lib.so"))
+        .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the app's native library folder"))
 }
 
 /// Keeps this program's memory from being written out when it crashes.
@@ -465,9 +659,10 @@ pub fn no_crash_dumps() {
     }
 }
 
-/// Whether this system can confine host processes yet.
+/// Whether this system can confine host processes. Whether a confinement
+/// really holds is checked on every start, from outside.
 pub fn sandbox_available() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "linux", target_os = "android"))
 }
 
 /// The only folder a confined host may keep files in, created on first use.
@@ -476,11 +671,27 @@ pub fn container_folder(container: &str) -> io::Result<PathBuf> {
     confine::container_folder(container)
 }
 
-/// Removes a container and everything a host kept in it.
+/// Removes a container and everything a host kept in it, and takes back
+/// its permission to run `programs`.
 #[cfg(windows)]
-pub fn remove_container(container: &str) {
-    confine::remove_container(&converter_container(container));
-    confine::remove_container(container);
+pub fn remove_container(container: &str, programs: &[&Path]) {
+    confine::remove_container(&converter_container(container), programs);
+    confine::remove_container(container, programs);
+}
+
+/// The folders of every container whose name starts with `prefix`, for
+/// clearing out what a host left behind when it could not tidy up.
+#[cfg(windows)]
+pub fn container_folders(prefix: &str) -> Vec<PathBuf> {
+    let Some(packages) = std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Packages")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(packages) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+        .map(|entry| entry.path().join("AC"))
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -489,4 +700,4 @@ pub fn container_folder(_container: &str) -> io::Result<PathBuf> {
 }
 
 #[cfg(not(windows))]
-pub fn remove_container(_container: &str) {}
+pub fn remove_container(_container: &str, _programs: &[&Path]) {}

@@ -15,6 +15,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
+pub mod folder;
 mod locked;
 
 use locked::LockedKey;
@@ -26,8 +27,11 @@ const HEADER_LEN: usize = MAGIC.len() + SALT_LEN + 12;
 
 /// Argon2id cost: 64 MiB, 3 passes, 1 lane.
 const DEFAULT_COST: Cost = Cost { memory_kib: 64 * 1024, passes: 3, lanes: 1 };
-/// Refuse absurd costs from a corrupt or hostile file instead of exhausting memory.
+/// Refuse absurd costs from a corrupt or hostile file instead of exhausting
+/// memory or computing for days.
 const MAX_MEMORY_KIB: u32 = 1024 * 1024;
+const MAX_PASSES: u32 = 64;
+const MAX_LANES: u32 = 64;
 
 #[derive(Debug)]
 pub enum Error {
@@ -124,6 +128,11 @@ impl Vault {
         file.sync_all()?;
         drop(file);
         fs::rename(&temp, &self.path)?;
+        // The rename is only durable once the folder is written out.
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     }
 }
@@ -131,7 +140,7 @@ impl Vault {
 fn derive(passphrase: &str, header: &[u8; HEADER_LEN]) -> Result<Zeroizing<[u8; 32]>, Error> {
     let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
     let (memory_kib, passes, lanes) = (word(24), word(28), word(32));
-    if memory_kib > MAX_MEMORY_KIB {
+    if memory_kib > MAX_MEMORY_KIB || passes > MAX_PASSES || lanes > MAX_LANES {
         return Err(Error::Format);
     }
     let params = Params::new(memory_kib, passes, lanes, Some(32)).map_err(|_| Error::Format)?;
@@ -192,6 +201,12 @@ mod tests {
         bytes[28] ^= 1;
         fs::write(&path, &bytes).unwrap();
         assert!(Vault::open(&path, "right").is_err());
+
+        // Nor may a hostile header make opening take forever.
+        bytes[28] ^= 1;
+        bytes[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(Vault::open(&path, "right"), Err(Error::Format)));
 
         fs::write(&path, b"not a vault").unwrap();
         assert!(matches!(Vault::open(&path, "right"), Err(Error::Format)));

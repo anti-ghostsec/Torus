@@ -131,49 +131,34 @@ where
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
-            command = inbox.recv() => match command {
-                // The editor checks sites before sending them; a site that
-                // fails the same check here is simply not put up.
-                Some(Command::Publish { site }) => {
-                    if torus_core::check(&site).is_ok() {
-                        live.publish(site);
+            command = inbox.recv() => {
+                let event = match command {
+                    // The editor checks sites before sending them; a site that
+                    // fails the same check here is simply not put up.
+                    Some(Command::Publish { site }) => {
+                        if torus_core::check(&site).is_ok() {
+                            live.publish(site);
+                        }
+                        continue;
                     }
+                    Some(Command::Ask { seq, question }) => match answer(&live, *question) {
+                        Some(answer) => Event::Answer { seq, answer: Box::new(answer) },
+                        None => continue,
+                    },
+                    // Told to stop, or the editor closed the pipe or died.
+                    Some(Command::Stop) | None => return 0,
+                    Some(question) => match answer(&live, question) {
+                        Some(answer) => answer,
+                        None => return 0,
+                    },
+                };
+                // What the editor is told was done is on disk first, so a
+                // site stopped right after loses nothing.
+                live.settle().await;
+                if write_frame(&mut stdout, &event).await.is_err() {
+                    return 0;
                 }
-                Some(Command::Probe { path }) => {
-                    let readable = std::fs::File::open(path).is_ok();
-                    if write_frame(&mut stdout, &Event::Probed { readable }).await.is_err() {
-                        return 0;
-                    }
-                }
-                Some(Command::Records { collection }) => {
-                    let records = live.records(&collection);
-                    if write_frame(&mut stdout, &Event::Listed { records }).await.is_err() {
-                        return 0;
-                    }
-                }
-                Some(Command::Remove { collection, id }) => {
-                    let removed = live.remove(&collection, &id);
-                    if write_frame(&mut stdout, &Event::Removed { removed }).await.is_err() {
-                        return 0;
-                    }
-                }
-                Some(Command::Approve { collection, id }) => {
-                    let removed = live.approve(&collection, &id);
-                    if write_frame(&mut stdout, &Event::Removed { removed }).await.is_err() {
-                        return 0;
-                    }
-                }
-                Some(command @ (Command::Moderators | Command::Moderator { .. })) => {
-                    if let Command::Moderator { id, on } = &command {
-                        live.set_moderator(id, *on);
-                    }
-                    if write_frame(&mut stdout, &Event::Moderating { ids: live.moderators() }).await.is_err() {
-                        return 0;
-                    }
-                }
-                // Told to stop, or the editor closed the pipe or died.
-                _ => return 0,
-            },
+            }
             _ = tick.tick() => {
                 if write_frame(&mut stdout, &Event::Status(serving.status())).await.is_err() {
                     return 0;
@@ -181,5 +166,21 @@ where
             }
         }
     }
+}
+
+/// The answer to a question from the editor. `None` for what is not a question.
+fn answer(live: &Live, question: Command) -> Option<Event> {
+    Some(match question {
+        Command::Probe { path } => Event::Probed { readable: std::fs::File::open(path).is_ok() },
+        Command::Records { collection } => Event::Listed { records: live.records(&collection) },
+        Command::Remove { collection, id } => Event::Removed { removed: live.remove(&collection, &id) },
+        Command::Approve { collection, id } => Event::Removed { removed: live.approve(&collection, &id) },
+        Command::Moderators => Event::Moderating { ids: live.moderators() },
+        Command::Moderator { id, on } => {
+            live.set_moderator(&id, on);
+            Event::Moderating { ids: live.moderators() }
+        }
+        Command::Start { .. } | Command::Publish { .. } | Command::Ask { .. } | Command::Stop => return None,
+    })
 }
 
