@@ -47,6 +47,7 @@ mod faststart;
 mod media;
 mod scrub;
 mod webm;
+mod puzzle;
 mod store;
 
 use blobs::{Staged, Target};
@@ -176,6 +177,12 @@ impl Live {
     /// site's owner to look through.
     pub fn records(&self, collection: &str) -> Vec<Record> {
         self.store().records(collection)
+    }
+
+    /// The answer to an open puzzle. Only for tests: nothing serves it.
+    #[doc(hidden)]
+    pub fn puzzle_answer_for_tests(&self, id: &str) -> Option<String> {
+        self.store().puzzles.lock().unwrap_or_else(|e| e.into_inner()).peek(id)
     }
 
     /// Removes a record for good, with its files and whatever belongs to it.
@@ -341,6 +348,8 @@ async fn route(
         Method::GET | Method::HEAD => match (path.strip_prefix(FILE_PATH), path.strip_prefix(PROGRESS_PATH)) {
             (Some(id), _) => file(live, id, req.headers().get(RANGE), head),
             (_, Some(name)) => progress(live, name, req.uri().query(), head),
+            _ if path.starts_with(torus_core::PUZZLE_PATH) => puzzle_picture(live, &path, head),
+            _ if path.starts_with(torus_core::FEED_PATH) => feed(live, &site, &path, req.headers().get(hyper::header::HOST), head),
             _ => page(live, &site, &path, &visit(viewer, req.uri().query()), head),
         },
         Method::POST if site.accounts && path.starts_with(REMOVE_PATH) => {
@@ -409,7 +418,19 @@ fn page(live: &Live, site: &Site, path: &str, visit: &Visit, head: bool) -> Repl
     if path == STYLE_PATH {
         return build(StatusCode::OK, "text/css; charset=utf-8", stylesheet(site).into(), head);
     }
-    let store = live.store();
+    let mut store = live.store();
+    // A page with a view count counts this view: one more, and nothing else.
+    let counted = |page: &Page| !head && page_counts_views(page);
+    if site.pages.iter().any(|p| p.template.is_none() && p.path() == path && counted(p)) {
+        store.count_view(path);
+    } else if let Some((slug, id)) = path.strip_prefix('/').and_then(|rest| rest.split_once('/')) {
+        let page = site.pages.iter().find(|p| p.slug == slug && p.template.is_some()).filter(|p| counted(p));
+        if let Some(page) = page {
+            if store.find(page.template.as_deref().unwrap_or(""), id).is_some_and(|r| !r.held) {
+                store.count_view(path);
+            }
+        }
+    }
     // What waits for approval exists only for moderators: not in lists,
     // not in counts, and not at its own address.
     let store = store::Seen { store: &store, everything: visit.viewer.as_ref().is_some_and(|viewer| viewer.moderator) };
@@ -428,6 +449,115 @@ fn page(live: &Live, site: &Site, path: &str, visit: &Visit, head: bool) -> Repl
         }
         None => not_found(head),
     }
+}
+
+/// Whether a page shows a view count anywhere on it.
+fn page_counts_views(page: &Page) -> bool {
+    fn any(blocks: &[torus_core::Block]) -> bool {
+        blocks.iter().any(|b| matches!(b, torus_core::Block::Views { .. }) || b.children().iter().any(|inner| any(inner)))
+    }
+    any(&page.blocks)
+}
+
+/// The picture for a form's puzzle: `/_puzzle/<id>.png`.
+fn puzzle_picture(live: &Live, path: &str, head: bool) -> Reply {
+    let id = path.strip_prefix(torus_core::PUZZLE_PATH).and_then(|rest| rest.strip_suffix(".png")).unwrap_or("");
+    let picture = live.store().puzzles.lock().unwrap_or_else(|e| e.into_inner()).picture(id);
+    match picture {
+        Some(png) => build(StatusCode::OK, "image/png", png.into(), head),
+        None => not_found(head),
+    }
+}
+
+/// Whether a submission carries the right answer to its puzzle, where the
+/// thing it adds to asks for one. The puzzle is used up either way.
+fn puzzle_solved(live: &Live, submission: &Submission) -> bool {
+    let id = submission.text(torus_core::PUZZLE_FIELD);
+    let typed = submission.text(torus_core::PUZZLE_ANSWER_FIELD);
+    live.store().puzzles.lock().unwrap_or_else(|e| e.into_inner()).solve(id, typed)
+}
+
+fn wrong_puzzle() -> Reply {
+    bad("The letters typed did not match the picture. Go back, reload the page to get a new picture, and try again.\n")
+}
+
+/// How many of a collection's newest records a feed holds.
+const FEED_ITEMS: usize = 30;
+
+/// A feed of a collection's newest records, in RSS: `/_feed/<collection>`.
+/// Only for collections that some page offers a feed of. Records carry no
+/// time, so neither do the feed's items: readers show them in the order given.
+fn feed(live: &Live, site: &Site, path: &str, host: Option<&HeaderValue>, head: bool) -> Reply {
+    let name = path.strip_prefix(torus_core::FEED_PATH).unwrap_or("");
+    let offered = site.any_block(&|b| matches!(b, torus_core::Block::Feed { collection, .. } if collection == name));
+    let Some(collection) = site.collection(name).filter(|c| offered && !c.sealed && c.name != USERS) else {
+        return not_found(head);
+    };
+    // Absolute links, where the address the visitor used is a plain host name.
+    let base = host
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| h.len() <= 100 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':'))
+        .map(|h| format!("http://{}", h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let page = site.pages.iter().find(|p| p.template.as_deref() == Some(collection.name.as_str()));
+    let title_field = collection.fields.iter().find(|f| f.kind == FieldKind::Text);
+    let body_field = collection.fields.iter().find(|f| !f.kind.is_file() && f.kind != FieldKind::Text);
+    let mut newest: Vec<Record> = Vec::new();
+    live.store().visit(&collection.name, &mut |record| {
+        if !record.held {
+            newest.push(record.clone());
+        }
+    });
+    newest.sort_by(|a, b| b.seq.cmp(&a.seq));
+    newest.truncate(FEED_ITEMS);
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n<channel>\n<title>{} - {}</title>\n<link>{base}/</link>\n\
+         <description>The newest in {} on {}</description>\n",
+        xml_escape(&site.title),
+        xml_escape(&collection.name),
+        xml_escape(&collection.name),
+        xml_escape(&site.title),
+    );
+    for record in &newest {
+        let text = |field: Option<&torus_core::Field>| field.and_then(|f| record.fields.get(&f.name)).map(String::as_str).unwrap_or("");
+        let title = match text(title_field).trim() {
+            "" => format!("New in {}", collection.name),
+            title => title.to_owned(),
+        };
+        let mut body: String = text(body_field).chars().take(1000).collect();
+        if text(body_field).chars().count() > 1000 {
+            body.push('…');
+        }
+        xml.push_str("<item>\n");
+        xml.push_str(&format!("<title>{}</title>\n", xml_escape(&title)));
+        if let Some(page) = page {
+            xml.push_str(&format!("<link>{base}{}/{}</link>\n", page.path(), record.id));
+        }
+        xml.push_str(&format!("<guid isPermaLink=\"false\">{}</guid>\n", xml_escape(&record.id)));
+        if !body.is_empty() {
+            xml.push_str(&format!("<description>{}</description>\n", xml_escape(&body)));
+        }
+        xml.push_str("</item>\n");
+    }
+    xml.push_str("</channel>\n</rss>\n");
+    build(StatusCode::OK, "application/rss+xml; charset=utf-8", xml.into(), head)
+}
+
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            // Characters XML cannot hold at all.
+            c if c.is_control() && !matches!(c, '\n' | '\t') => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // Files
@@ -792,6 +922,9 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
             return plain(StatusCode::FORBIDDEN, "That form has expired. Go back, reload the page and try again.\n", false);
         }
     }
+    if site.moderation.puzzle_collections.contains(&collection.name) && !puzzle_solved(live, &submission) {
+        return wrong_puzzle();
+    }
     let fields = match record_fields(collection, &submission) {
         Ok(fields) => fields,
         Err(reply) => return reply,
@@ -989,6 +1122,9 @@ async fn sign_up(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
         Ok(submission) => submission,
         Err(reply) => return reply,
     };
+    if site.moderation.puzzle_sign_up && !puzzle_solved(live, &submission) {
+        return wrong_puzzle();
+    }
     let fields = match record_fields(users, &submission) {
         Ok(fields) => fields,
         Err(reply) => return reply,

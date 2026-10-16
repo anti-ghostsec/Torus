@@ -13,7 +13,7 @@ pub use compile::{
     check, render_canvas, APPROVE_PATH, render_page, render_progress, stylesheet, Canvas, Data, NoData, Viewer, Visit, FILE_PATH, FORM_PATH,
     NEXT_FIELD, PAGE_PARAM, PROGRESS_PATH, SIZE_PARAM, WAITED_PARAM, REMOVE_PATH, SEARCH_MAX, SEARCH_PARAM, UPLOAD_PARAM,
     PARENT_FIELD, PASSWORD_FIELD, PASSWORD_MAX, PASSWORD_MIN, SIGN_IN_PATH, SIGN_OUT_PATH, SIGN_UP_PATH, STYLE_PATH,
-    TOKEN_FIELD,
+    TOKEN_FIELD, FEED_PATH, PUZZLE_PATH, PUZZLE_FIELD, PUZZLE_ANSWER_FIELD, views_text,
 };
 pub use lint::{lint, Finding, Severity};
 pub use model::{

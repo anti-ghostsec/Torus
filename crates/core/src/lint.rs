@@ -316,6 +316,18 @@ fn lint_blocks(blocks: &[Block], scope: &Scope<'_>, add: &mut impl FnMut(Severit
                 }
             }
             Block::Gate { blocks, .. } => lint_blocks(blocks, scope, add),
+            Block::Feed { collection, .. } => match scope.site.collection(collection) {
+                None => add(Severity::Error, format!("A feed shows the collection \"{collection}\", which does not exist.")),
+                Some(_) if collection == USERS => add(Severity::Error, "Accounts cannot be put in a feed.".into()),
+                Some(c) if c.sealed => {
+                    add(Severity::Error, format!("\"{collection}\" is sealed: nothing in it can be shown, so it cannot have a feed."));
+                }
+                Some(c) if !c.fields.iter().any(|f| !f.kind.is_file()) => {
+                    add(Severity::Warning, format!("\"{collection}\" has no text fields, so its feed shows only that something was added."));
+                }
+                Some(_) => {}
+            },
+            Block::Views { .. } => {}
             Block::Form { collection, open, prefill, .. } => match scope.site.collection(collection) {
                 None => add(Severity::Error, format!("A form adds to the collection \"{collection}\", which does not exist.")),
                 Some(_) if collection == USERS => {
