@@ -28,6 +28,24 @@ fn lock(backend: State<'_, Backend>) {
     backend.lock();
 }
 
+#[tauri::command]
+fn auto_lock_minutes(backend: State<'_, Backend>) -> u32 {
+    backend.auto_lock_minutes()
+}
+
+#[tauri::command]
+fn set_auto_lock_minutes(backend: State<'_, Backend>, minutes: u32) -> Result<(), Failure> {
+    backend.set_auto_lock_minutes(minutes)
+}
+
+/// Takes every site offline, locks the vault, then closes the app.
+#[tauri::command]
+async fn panic(app: tauri::AppHandle, backend: State<'_, Backend>) -> Result<(), ()> {
+    backend.panic().await;
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command(async)]
 fn save(backend: State<'_, Backend>, id: u32, site: Site) -> Result<(), Failure> {
     backend.save(id, site)
@@ -172,6 +190,9 @@ pub fn run() {
             create_vault,
             unlock,
             lock,
+            auto_lock_minutes,
+            set_auto_lock_minutes,
+            panic,
             save,
             add_site,
             delete_site,

@@ -33,6 +33,9 @@ struct Payload {
     /// site's own.
     #[serde(default)]
     next_id: u32,
+    /// Lock the vault after this many idle minutes; 0 never does.
+    #[serde(default)]
+    auto_lock_minutes: u32,
     // Vaults written before multiple sites existed held exactly one.
     #[serde(default, skip_serializing)]
     site: Option<Site>,
@@ -79,6 +82,7 @@ struct Session {
     vault: Vault,
     sites: Vec<Entry>,
     next_id: u32,
+    auto_lock_minutes: u32,
 }
 
 impl Session {
@@ -95,7 +99,8 @@ impl Session {
                 tor_key: e.tor_key.as_ref().map(|key| key.to_vec()),
             })
             .collect();
-        let payload = Payload { sites, next_id: self.next_id, ..Payload::default() };
+        let payload =
+            Payload { sites, next_id: self.next_id, auto_lock_minutes: self.auto_lock_minutes, ..Payload::default() };
         let mut bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
         // The vault's size says only roughly how much is in it.
         torus_vault::pad_json(&mut bytes);
@@ -373,7 +378,7 @@ impl Backend {
             return Err(Failure::new("A vault already exists."));
         }
         let vault = Vault::create(&path, &passphrase, b"{}").map_err(Failure::new)?;
-        let mut session = Session { vault, sites: Vec::new(), next_id: 1 };
+        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0 };
         session.add(site);
         session.persist()?;
         let listed = session.listed();
@@ -412,7 +417,7 @@ impl Backend {
             });
         }
         let next_id = sites.iter().map(|e| e.id + 1).max().unwrap_or(1).max(payload.next_id);
-        let session = Session { vault, sites, next_id };
+        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes };
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
         Ok(listed)
@@ -784,6 +789,26 @@ impl Backend {
         let _ = std::fs::remove_file(self.kept_tor_path(id)?);
         self.mine_stop();
         Ok(address)
+    }
+
+    /// How many idle minutes before the vault locks itself; 0 never.
+    pub fn auto_lock_minutes(&self) -> u32 {
+        self.session.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.auto_lock_minutes)
+    }
+
+    /// Sets the idle time before the vault locks itself.
+    pub fn set_auto_lock_minutes(&self, minutes: u32) -> Result<(), Failure> {
+        self.with_session(|session| {
+            session.auto_lock_minutes = minutes;
+            session.persist()
+        })
+    }
+
+    /// Takes every site offline, packs their bookkeeping away, and forgets
+    /// the vault key: the panic action, before the window closes. Same work
+    /// as [`shutdown`], named for what the window calls it.
+    pub async fn panic(&self) {
+        self.shutdown().await;
     }
 
     /// Takes every site offline and packs their Tor bookkeeping away. Called
