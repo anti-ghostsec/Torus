@@ -133,14 +133,31 @@ impl Prefix {
 /// computing one from scratch, and the secret follows by adding one. The
 /// result is as random as any other key: its start was.
 pub fn mine(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
+    mine_any(std::slice::from_ref(prefix), stop, tried)
+}
+
+/// Like [`mine`], for an address beginning with any one of `prefixes`:
+/// whichever turns up first. Each extra prefix adds its own chance per key
+/// tried, so the wait is about that of one prefix divided by how many there
+/// are, if they are the same length. A shorter one dominates.
+pub fn mine_any(prefixes: &[Prefix], stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
+    if prefixes.is_empty() {
+        return None;
+    }
     #[cfg(target_pointer_width = "64")]
     {
-        mine_fast(prefix, stop, tried)
+        mine_fast(prefixes, stop, tried)
     }
     #[cfg(not(target_pointer_width = "64"))]
     {
-        mine_simple(prefix, stop, tried)
+        mine_simple(prefixes, stop, tried)
     }
+}
+
+/// How many keys must be tried, on average, before one begins with any of
+/// `prefixes`.
+pub fn expected_tries_any(prefixes: &[Prefix]) -> f64 {
+    1.0 / prefixes.iter().map(|p| 1.0 / p.expected_tries()).sum::<f64>()
 }
 
 /// How many keys one thread walks side by side.
@@ -150,7 +167,7 @@ const WALKERS: usize = 256;
 /// The search of [`mine`], with many keys per thread sharing one inversion
 /// per step: see the `fast` module. About ten times the speed.
 #[cfg(target_pointer_width = "64")]
-fn mine_fast(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
+fn mine_fast(prefixes: &[Prefix], stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
     let d = fast::curve_d();
     let base = fast::decompress(&curve25519_dalek::constants::ED25519_BASEPOINT_POINT.compress().to_bytes(), &d)?;
     let start = new_identity().ok()?;
@@ -171,13 +188,15 @@ fn mine_fast(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<Id
     loop {
         for walker in 0..WALKERS {
             // At most 12 letters: only the start of y matters, never the sign of x.
-            if prefix.matches(&walk.ys[walker].to_bytes()) {
+            let y = walk.ys[walker].to_bytes();
+            if prefixes.iter().any(|prefix| prefix.matches(&y)) {
                 let secret = Zeroizing::new(*secrets[walker] + Scalar::from(steps));
                 let mut identity = Zeroizing::new([0u8; 64]);
                 identity[..32].copy_from_slice(&secret.to_bytes());
                 identity[32..].copy_from_slice(&start[32..]);
                 // Checked by the ordinary key code: only a real match is returned.
-                if address(&identity).starts_with(prefix.as_str()) {
+                let found = address(&identity);
+                if prefixes.iter().any(|prefix| found.starts_with(prefix.as_str())) {
                     return Some(identity);
                 }
             }
@@ -193,7 +212,7 @@ fn mine_fast(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<Id
 
 /// The plain search: one key at a time.
 #[cfg_attr(target_pointer_width = "64", allow(dead_code))]
-fn mine_simple(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
+fn mine_simple(prefixes: &[Prefix], stop: &AtomicBool, tried: &AtomicU64) -> Option<Identity> {
     const BATCH: u64 = 4096;
     let start = new_identity().ok()?;
     let mut scalar_bytes = Zeroizing::new([0u8; 32]);
@@ -204,7 +223,8 @@ fn mine_simple(prefix: &Prefix, stop: &AtomicBool, tried: &AtomicU64) -> Option<
     let mut offset = 0u64;
     loop {
         for _ in 0..BATCH {
-            if prefix.matches(&point.compress().to_bytes()) {
+            let public = point.compress().to_bytes();
+            if prefixes.iter().any(|prefix| prefix.matches(&public)) {
                 tried.fetch_add(offset % BATCH, Ordering::Relaxed);
                 let secret = Zeroizing::new(*base + Scalar::from(offset));
                 let mut identity = Zeroizing::new([0u8; 64]);
@@ -271,7 +291,18 @@ mod tests {
         // And the slow search finds real matches too.
         let prefix = Prefix::new("a").unwrap();
         let (stop, tried) = (AtomicBool::new(false), AtomicU64::new(0));
-        assert!(address(&mine_simple(&prefix, &stop, &tried).unwrap()).starts_with('a'));
+        assert!(address(&mine_simple(std::slice::from_ref(&prefix), &stop, &tried).unwrap()).starts_with('a'));
+    }
+
+    #[test]
+    fn any_of_several_prefixes_is_found() {
+        let wanted: Vec<Prefix> = ["zz", "ab", "q7"].iter().map(|w| Prefix::new(w).unwrap()).collect();
+        let (stop, tried) = (AtomicBool::new(false), AtomicU64::new(0));
+        let found = address(&mine_any(&wanted, &stop, &tried).unwrap());
+        assert!(wanted.iter().any(|p| found.starts_with(p.as_str())), "{found}");
+        // Three prefixes of two letters: a third of the wait for one.
+        assert!((expected_tries_any(&wanted) - 1024.0 / 3.0).abs() < 1e-6);
+        assert!(mine_any(&[], &stop, &tried).is_none());
     }
 
     #[test]
