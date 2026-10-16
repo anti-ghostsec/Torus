@@ -105,11 +105,6 @@ async fn wallet(backend: State<'_, Backend>) -> Result<Option<money::Summary>, F
 }
 
 #[tauri::command]
-async fn wallet_create(backend: State<'_, Backend>) -> Result<(), Failure> {
-    backend.wallet_create().await
-}
-
-#[tauri::command]
 async fn wallet_node(backend: State<'_, Backend>, node: String) -> Result<(), Failure> {
     backend.wallet_node(node).await
 }
@@ -122,11 +117,6 @@ async fn wallet_keys(backend: State<'_, Backend>, passphrase: String) -> Result<
 #[tauri::command]
 async fn wallet_send(backend: State<'_, Backend>, address: String, amount: Option<String>) -> Result<(u64, u64), Failure> {
     backend.wallet_send(address, amount).await
-}
-
-#[tauri::command]
-async fn wallet_collect(backend: State<'_, Backend>, id: u32, amount: Option<String>) -> Result<(), Failure> {
-    backend.wallet_collect(id, amount).await
 }
 
 #[tauri::command]
@@ -332,11 +322,9 @@ pub fn run() {
             export_key,
             import_key,
             wallet,
-            wallet_create,
             wallet_node,
             wallet_keys,
             wallet_send,
-            wallet_collect,
             wallet_limit,
             wallet_held_by,
             stop

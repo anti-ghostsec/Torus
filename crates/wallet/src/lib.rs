@@ -39,6 +39,8 @@ pub const SPENDABLE_AFTER: usize = 10;
 /// this would also break every exchange, and it is when the coins can be
 /// spent anyway.
 pub const CONFIRMATIONS: usize = SPENDABLE_AFTER;
+/// How far back a new wallet starts reading: a day of blocks.
+const UNBORN_MARGIN: usize = 720;
 /// The ring size Monero requires.
 const RING: u8 = 16;
 /// Blocks fetched from the node in one request.
@@ -369,8 +371,9 @@ impl Wallet {
     {
         let tip = daemon.latest_block_number().await.map_err(node)?;
         if self.state.unborn {
-            // A few blocks back, in case the chain is reorganised meanwhile.
-            self.state.birth = tip.saturating_sub(SPENDABLE_AFTER);
+            // A day back: an address may have been handed out before the
+            // wallet first reached a node, and paid meanwhile.
+            self.state.birth = tip.saturating_sub(UNBORN_MARGIN);
             self.state.next = self.state.birth;
             self.state.unborn = false;
         }

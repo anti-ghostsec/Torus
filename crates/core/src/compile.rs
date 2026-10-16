@@ -761,6 +761,15 @@ impl View<'_> {
         if !mine && !self.tagged {
             return;
         }
+        // Their own account, deleted with Monero still in it.
+        let own_account = shown.collection.name == USERS && self.viewer.is_some_and(|v| v.id == shown.record.id);
+        if let Some(purse) = self.purse.filter(|p| own_account && p.balance > 0) {
+            let _ = writeln!(
+                html,
+                "<p class=\"hint\">You hold {} on this site. Withdraw it first: once your account is deleted, it goes to the site.</p>",
+                format_xmr(purse.balance)
+            );
+        }
         // On the record's own page there is nothing to come back to afterwards.
         let on_its_page = self.here.ends_with(&format!("/{}", shown.record.id));
         let _ = writeln!(

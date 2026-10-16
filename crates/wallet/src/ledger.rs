@@ -66,9 +66,13 @@ pub struct Purse {
 pub struct Book {
     /// The site's account in the wallet.
     pub account: u32,
-    /// What the site has earned: donations to its own address, and what
-    /// users paid it.
+    /// What the site has earned and not yet passed on to the owner's own
+    /// account: it is passed on at once, so this is 0 between changes.
     pub earned: Piconero,
+    /// Everything the site has earned, ever: donations to its own address,
+    /// and what users paid it. Only a figure for the owner to look at.
+    #[serde(default)]
+    pub earned_total: Piconero,
     pub users: BTreeMap<String, Purse>,
     next_address: u32,
     pub daily_limit: Piconero,
@@ -85,6 +89,7 @@ impl Book {
         Book {
             account,
             earned: 0,
+            earned_total: 0,
             users: BTreeMap::new(),
             // Address 0 of the account is the site's own.
             next_address: 1,
@@ -231,7 +236,10 @@ impl Ledger {
             }
             self.credited.insert(arrival.id.clone());
             match self.owner_of(arrival.slot).map(|(site, party)| (site.to_owned(), party)) {
-                Some((site, party)) => self.open(&site).give(&party, arrival.amount),
+                Some((site, party)) => {
+                    self.open(&site).give(&party, arrival.amount);
+                    self.sweep(&site);
+                }
                 // To the owner's own account, or an address no site holds any more.
                 None => self.own = self.own.saturating_add(arrival.amount),
             }
@@ -255,7 +263,38 @@ impl Ledger {
         let book = self.sites.get_mut(site).ok_or(Refused::NoSuchSite)?;
         book.take(from, amount)?;
         book.give(to, amount);
+        self.sweep(site);
         Ok(())
+    }
+
+    /// Passes what a site has earned on to the owner's own account. The
+    /// owner never has to collect it.
+    fn sweep(&mut self, site: &str) {
+        if let Some(book) = self.sites.get_mut(site) {
+            let earned = std::mem::take(&mut book.earned);
+            book.earned_total = book.earned_total.saturating_add(earned);
+            self.own = self.own.saturating_add(earned);
+        }
+    }
+
+    /// Passes on whatever every site holds of its own: for books kept
+    /// before earnings were passed on by themselves.
+    pub fn sweep_all(&mut self) {
+        let sites: Vec<String> = self.sites.keys().cloned().collect();
+        for site in sites {
+            self.sweep(&site);
+        }
+    }
+
+    /// An account was deleted: what it held becomes the site's, and so the
+    /// owner's, and what it had paid for is forgotten. Returns how much.
+    pub fn close_account(&mut self, site: &str, user: &str) -> Piconero {
+        let Some(book) = self.sites.get_mut(site) else { return 0 };
+        let held = book.users.get_mut(user).map(|p| std::mem::take(&mut p.balance)).unwrap_or(0);
+        book.unlocked.remove(user);
+        book.earned = book.earned.saturating_add(held);
+        self.sweep(site);
+        held
     }
 
     /// Pays `price` from `user` to `to` for `key`, unless it is already
@@ -312,14 +351,6 @@ impl Ledger {
                 book.withdrawn.1 = book.withdrawn.1.saturating_sub(total);
             }
         }
-    }
-
-    /// Moves what a site has earned into the owner's own account.
-    pub fn collect(&mut self, site: &str, amount: Piconero) -> Result<(), Refused> {
-        let book = self.sites.get_mut(site).ok_or(Refused::NoSuchSite)?;
-        book.take(&Party::Site, amount)?;
-        self.own = self.own.saturating_add(amount);
-        Ok(())
     }
 
     /// Takes from the owner's own account, to send out.
@@ -385,8 +416,8 @@ mod tests {
         // To the owner's own account, and to the site's own address.
         ledger.arrived(vec![arrival("c", Slot::OWNER, PER_XMR, 1), arrival("d", Slot { account: 2, address: 0 }, 2, 1)]);
         ledger.confirm(400, |_| true);
-        assert_eq!(ledger.own, PER_XMR);
-        assert_eq!(ledger.sites["shop"].earned, 2);
+        assert_eq!(ledger.own, PER_XMR + 2, "what a site earns is the owner's at once");
+        assert_eq!((ledger.sites["shop"].earned, ledger.sites["shop"].earned_total), (0, 2));
         assert_eq!(ledger.owed(), 6 * PER_XMR + 2);
     }
 
@@ -426,13 +457,15 @@ mod tests {
         assert!(ledger.withdraw("tube", &alice, 2 * PER_XMR, 0, 7).is_err());
         assert!(ledger.withdraw("tube", &alice, 2 * PER_XMR, 0, 8).is_ok());
 
-        ledger.collect("tube", PER_XMR).unwrap();
-        assert_eq!(ledger.own, PER_XMR);
+        assert_eq!(ledger.own, PER_XMR, "the pass was paid to the site, so to the owner");
+        assert_eq!(ledger.sites["tube"].earned_total, PER_XMR);
+        // A deleted account's coins go to the owner too.
+        assert_eq!(ledger.close_account("tube", "bob"), 2 * PER_XMR);
+        assert_eq!(ledger.own, 3 * PER_XMR);
+        assert_eq!(ledger.sites["tube"].balance(&bob), 0);
+        assert!(ledger.sites["tube"].unlocked_by("bob", 0).is_empty());
+        assert_eq!(ledger.close_account("tube", "bob"), 0, "only once");
         ledger.close("tube");
-        assert_eq!(ledger.own, PER_XMR + ledger_left(), "a deleted site's coins are the owner's");
-        fn ledger_left() -> Piconero {
-            // alice 1, bob 2
-            3 * PER_XMR
-        }
+        assert_eq!(ledger.own, 4 * PER_XMR, "a deleted site's coins are the owner's: alice's 1 as well");
     }
 }
