@@ -203,7 +203,7 @@ async fn submissions_are_kept_across_host_restarts() {
         fields: vec![Field { name: "name".into(), label: "Name".into(), kind: FieldKind::Text, required: true }],
     });
     guestbook.pages[0].blocks = vec![
-        Block::Form { collection: "notes".into(), submit_label: "Sign".into() },
+        Block::Form { collection: "notes".into(), submit_label: "Sign".into(), open: false, prefill: false },
         Block::List {
             collection: "notes".into(),
             newest_first: true,
@@ -260,7 +260,7 @@ async fn the_owner_can_list_and_remove_what_was_added() {
                 sealed: false,
         fields: vec![Field { name: "name".into(), label: "Name".into(), kind: FieldKind::Text, required: true }],
     });
-    guestbook.pages[0].blocks = vec![Block::Form { collection: "notes".into(), submit_label: "Sign".into() }];
+    guestbook.pages[0].blocks = vec![Block::Form { collection: "notes".into(), submit_label: "Sign".into(), open: false, prefill: false }];
     let host = Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook, None).await.unwrap();
     assert!(host.records("notes").await.unwrap().is_empty());
 
