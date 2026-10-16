@@ -26,7 +26,9 @@ pub(crate) fn needs(page: &Page) -> (bool, bool) {
     fn any(blocks: &[Block], test: &dyn Fn(&Block) -> bool) -> bool {
         blocks.iter().any(|b| test(b) || b.children().iter().any(|inner| any(inner, test)))
     }
-    let purse = any(&page.blocks, &|b| matches!(b, Block::Wallet { .. } | Block::Donate { .. } | Block::Paid { .. } | Block::Tip { .. }));
+    let purse = any(&page.blocks, &|b| {
+        matches!(b, Block::Wallet { .. } | Block::Donate { .. } | Block::Paid { .. } | Block::Tip { .. } | Block::Remove { .. })
+    });
     // Whether the site has a wallet at all shows in its address.
     let address = any(&page.blocks, &|b| matches!(b, Block::Donate { .. } | Block::Wallet { .. }));
     (purse, address)

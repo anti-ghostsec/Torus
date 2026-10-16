@@ -698,6 +698,10 @@ impl Backend {
         session.persist()?;
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+        // Every vault has its wallet from the start; it stays off the
+        // network until a site uses it.
+        self.treasury.unload();
+        self.treasury.ensure().map_err(Failure::new)?;
         Ok(listed)
     }
 
@@ -764,6 +768,7 @@ impl Backend {
         let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money };
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+        self.treasury.ensure().map_err(Failure::new)?;
         Ok(listed)
     }
 
@@ -1040,7 +1045,12 @@ impl Backend {
 
     /// Removes a record for good, with its files and whatever belongs to it.
     pub async fn remove_record(&self, id: u32, collection: String, record: String) -> Result<bool, Failure> {
-        self.with_host(id, "Publish the site to Tor first.", async |host| host.remove(&collection, &record).await).await
+        let removed = self.with_host(id, "Publish the site to Tor first.", async |host| host.remove(&collection, &record).await).await?;
+        // An account removed by the owner: what it held is the owner's.
+        if removed && collection == torus_core::USERS {
+            self.treasury.close_account(id, &record).map_err(Failure::new)?;
+        }
+        Ok(removed)
     }
 
     /// Lets everyone see a record that was waiting for approval.
@@ -1334,11 +1344,6 @@ impl Backend {
         Ok(self.treasury.summary().await)
     }
 
-    pub async fn wallet_create(&self) -> Result<(), Failure> {
-        self.with_session(|_| Ok(()))?;
-        self.treasury.create().await.map_err(Failure::new)
-    }
-
     pub async fn wallet_node(&self, node: String) -> Result<(), Failure> {
         self.treasury.set_node(node).await.map_err(Failure::new)
     }
@@ -1369,12 +1374,6 @@ impl Backend {
     pub async fn wallet_send(&self, address: String, amount: Option<String>) -> Result<(u64, u64), Failure> {
         let amount = Self::amount(amount)?;
         self.treasury.send_own(address, amount).await.map_err(Failure::new)
-    }
-
-    /// Moves what a site has earned into the owner's own account.
-    pub async fn wallet_collect(&self, id: u32, amount: Option<String>) -> Result<(), Failure> {
-        let amount = Self::amount(amount)?;
-        self.treasury.collect(id, amount).await.map_err(Failure::new)
     }
 
     pub async fn wallet_limit(&self, id: u32, amount: String) -> Result<(), Failure> {
