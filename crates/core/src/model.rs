@@ -207,6 +207,13 @@ pub enum FieldKind {
     Image,
     /// An uploaded video, stored as it arrives.
     Video,
+    /// Text shown exactly as typed, in a fixed-width font: for code, logs
+    /// and anything whose spacing matters.
+    Code,
+    /// Several lines with simple formatting: `#` headings, `-` lists, `>`
+    /// quotes, **bold**, *italic*, `code` and [links](/somewhere). Nothing
+    /// typed can add a script or a style, or load anything.
+    Formatted,
 }
 
 impl FieldKind {
@@ -220,6 +227,7 @@ impl FieldKind {
         match self {
             FieldKind::Text => 200,
             FieldKind::LongText => 10_000,
+            FieldKind::Code | FieldKind::Formatted => 50_000,
             // As many as fit a file's id.
             FieldKind::Image | FieldKind::Video => 64,
         }
@@ -229,7 +237,7 @@ impl FieldKind {
     /// bytes, as a `u64` because a video can be larger than 32 bits count.
     pub fn max_bytes(self) -> u64 {
         match self {
-            FieldKind::Text | FieldKind::LongText => self.max_len() as u64 * 4,
+            FieldKind::Text | FieldKind::LongText | FieldKind::Code | FieldKind::Formatted => self.max_len() as u64 * 4,
             FieldKind::Image => 8 * 1024 * 1024,
             FieldKind::Video => 10 * 1024 * 1024 * 1024,
         }
@@ -309,7 +317,17 @@ pub enum Block {
     Divider,
     Columns { columns: Vec<Vec<Block>> },
     /// Lets a visitor add a record to a collection.
-    Form { collection: String, submit_label: String },
+    Form {
+        collection: String,
+        submit_label: String,
+        /// Afterwards, go to the new record's own page instead of back.
+        #[serde(default)]
+        open: bool,
+        /// On a record's page, start the form filled in with the newest
+        /// record already added there: for editing by adding a new version.
+        #[serde(default)]
+        prefill: bool,
+    },
     /// Repeats `blocks` once for each record of a collection.
     List {
         collection: String,

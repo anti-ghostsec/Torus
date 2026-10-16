@@ -21,7 +21,7 @@ fn guestbook() -> Site {
                 title: "Home".into(),
                 template: None,
                 blocks: vec![
-                    Block::Form { collection: "notes".into(), submit_label: "Sign".into() },
+                    Block::Form { collection: "notes".into(), submit_label: "Sign".into(), open: false, prefill: false },
                     Block::List {
                         collection: "notes".into(),
                         newest_first: true,
@@ -137,7 +137,7 @@ async fn hostile_submissions_are_refused() {
     let json = "POST /_form/notes HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
     assert_eq!(status(&raw(addr, json.as_bytes()).await), "400");
     // More than the size limit.
-    assert_eq!(status(&post(addr, "/_form/notes", &format!("name=a&message={}", "b".repeat(70_000))).await), "413");
+    assert_eq!(status(&post(addr, "/_form/notes", &format!("name=a&message={}", "b".repeat(600_000))).await), "413");
 
     // Collections without a form, or that do not exist, cannot be written to
     // and are indistinguishable from each other.

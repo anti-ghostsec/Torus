@@ -347,7 +347,9 @@ impl View<'_> {
                     }
                     html.push_str("</div>\n");
                 }
-                Block::Form { collection, submit_label } => self.form(html, collection, submit_label, shown),
+                Block::Form { collection, submit_label, open, prefill } => {
+                    self.form(html, collection, submit_label, *open, *prefill, shown)
+                }
                 Block::Search { label } => {
                     let _ = writeln!(
                         html,
@@ -578,6 +580,11 @@ impl View<'_> {
                 level if !value.trim().is_empty() => heading(html, level, value, align),
                 _ => {}
             },
+            FieldKind::Code if !value.is_empty() => {
+                let _ = writeln!(html, "<pre class=\"code\"><code>{}</code></pre>", escape(&value.replace("\r\n", "\n")));
+            }
+            FieldKind::Formatted => formatted(html, value),
+            FieldKind::Code => {}
             // The editor has no file to show, so it marks the spot.
             FieldKind::Image | FieldKind::Video if self.tagged => {
                 let _ = writeln!(html, "<p class=\"media\">{}</p>", escape(&placeholder(&field.label)));
@@ -688,24 +695,43 @@ impl View<'_> {
 
     /// The opening of a form, with the fields every form carries.
     fn open_form(&self, html: &mut String, action: &str, files: bool) {
+        self.open_form_to(html, action, files, self.here);
+    }
+
+    /// A form that sends the visitor on to `next` once it is done. A `next`
+    /// ending in `/{id}` is completed with the id of the record just added.
+    fn open_form_to(&self, html: &mut String, action: &str, files: bool, next: &str) {
         let encoding = if files { " enctype=\"multipart/form-data\"" } else { "" };
         let _ = writeln!(html, "<form method=\"post\" action=\"{}\"{encoding}>", escape(action));
-        let _ = writeln!(html, "<input type=\"hidden\" name=\"{NEXT_FIELD}\" value=\"{}\">", escape(self.here));
+        let _ = writeln!(html, "<input type=\"hidden\" name=\"{NEXT_FIELD}\" value=\"{}\">", escape(next));
         if let Some(viewer) = self.viewer {
             let _ = writeln!(html, "<input type=\"hidden\" name=\"{TOKEN_FIELD}\" value=\"{}\">", escape(&viewer.token));
         }
     }
 
-    fn inputs(&self, html: &mut String, fields: &[Field]) {
+    fn inputs(&self, html: &mut String, fields: &[Field], filled: Option<&Record>) {
         for field in fields {
             let (name, max) = (escape(&field.name), field.kind.max_len());
+            let value = filled.and_then(|r| r.fields.get(&field.name)).map(|v| escape(v)).unwrap_or_default();
             let required = if field.required { " required" } else { "" };
             let _ = write!(html, "<p><label>{}<br>", escape(&field.label));
             let _ = match field.kind {
-                FieldKind::Text => write!(html, "<input type=\"text\" name=\"{name}\" maxlength=\"{max}\"{required}>"),
-                FieldKind::LongText => {
-                    write!(html, "<textarea name=\"{name}\" rows=\"5\" maxlength=\"{max}\"{required}></textarea>")
+                FieldKind::Text => {
+                    let value = if value.is_empty() { String::new() } else { format!(" value=\"{value}\"") };
+                    write!(html, "<input type=\"text\" name=\"{name}\" maxlength=\"{max}\"{value}{required}>")
                 }
+                FieldKind::LongText => {
+                    write!(html, "<textarea name=\"{name}\" rows=\"5\" maxlength=\"{max}\"{required}>{value}</textarea>")
+                }
+                FieldKind::Formatted => write!(
+                    html,
+                    "<textarea name=\"{name}\" rows=\"14\" maxlength=\"{max}\"{required}>{value}</textarea><br>\
+                     <small># Heading · - list item · &gt; quote · **bold** · *italic* · `code` · [words](/address)</small>"
+                ),
+                FieldKind::Code => write!(
+                    html,
+                    "<textarea class=\"code\" name=\"{name}\" rows=\"16\" maxlength=\"{max}\" spellcheck=\"false\" wrap=\"off\"{required}>{value}</textarea>"
+                ),
                 FieldKind::Image => {
                     write!(html, "<input type=\"file\" name=\"{name}\" accept=\"image/png,image/jpeg,image/webp,image/gif\"{required}>")
                 }
@@ -719,7 +745,7 @@ impl View<'_> {
         let _ = writeln!(html, "<p><button class=\"button\" type=\"submit\">{}</button></p>\n</form>", escape(submit_label));
     }
 
-    fn form(&self, html: &mut String, collection: &str, submit_label: &str, shown: Option<Shown<'_>>) {
+    fn form(&self, html: &mut String, collection: &str, submit_label: &str, open: bool, prefill: bool, shown: Option<Shown<'_>>) {
         let Some(collection) = self.site.collection(collection) else {
             html.push_str("<p class=\"empty\">This form has no collection to add to.</p>\n");
             return;
@@ -729,11 +755,33 @@ impl View<'_> {
             return;
         }
         let files = collection.has_files();
-        self.open_form(html, &self.upload_address(&format!("{FORM_PATH}{}", collection.name), files), files);
+        // Opening the new record needs a page that shows records of this collection.
+        let next = match self.site.pages.iter().find(|p| p.template.as_deref() == Some(collection.name.as_str())) {
+            Some(page) if open => format!("{}/{{id}}", page.path()),
+            _ => self.here.to_owned(),
+        };
+        self.open_form_to(html, &self.upload_address(&format!("{FORM_PATH}{}", collection.name), files), files, &next);
         if let (Some(_), Some(shown)) = (&collection.parent, shown) {
             let _ = writeln!(html, "<input type=\"hidden\" name=\"{PARENT_FIELD}\" value=\"{}\">", escape(&shown.record.id));
         }
-        self.inputs(html, &collection.fields);
+        // The newest record already added here, to start from. Never what
+        // waits for approval, and never a sealed collection's.
+        let filled = match (&collection.parent, shown) {
+            (Some(_), Some(shown)) if prefill && !collection.sealed && !self.tagged => {
+                let mut newest: Option<Record> = None;
+                self.data.visit(&collection.name, &mut |r| {
+                    if r.parent.as_deref() == Some(shown.record.id.as_str())
+                        && !r.held
+                        && newest.as_ref().is_none_or(|n| r.seq > n.seq)
+                    {
+                        newest = Some(r.clone());
+                    }
+                });
+                newest
+            }
+            _ => None,
+        };
+        self.inputs(html, &collection.fields, filled.as_ref());
         self.close_form(html, submit_label);
         self.progress(html, files);
     }
@@ -786,7 +834,7 @@ impl View<'_> {
         }
         let files = users.has_files();
         self.open_form(html, &self.upload_address(SIGN_UP_PATH, files), files);
-        self.inputs(html, &users.fields);
+        self.inputs(html, &users.fields, None);
         self.password(html, true);
         self.close_form(html, submit_label);
         self.progress(html, files);
@@ -798,7 +846,7 @@ impl View<'_> {
             return;
         }
         self.open_form(html, SIGN_IN_PATH, false);
-        self.inputs(html, std::slice::from_ref(name));
+        self.inputs(html, std::slice::from_ref(name), None);
         self.password(html, false);
         self.close_form(html, submit_label);
     }
@@ -828,6 +876,139 @@ fn paragraphs(html: &mut String, text: &str, align: Align) {
     for paragraph in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
         let _ = writeln!(html, "<p{}>{}</p>", class(align), escape(paragraph).replace('\n', "<br>"));
     }
+}
+
+/// Text with simple formatting, as described at [`FieldKind::Formatted`].
+/// Everything typed is escaped first: the markup can only ever produce the
+/// handful of plain elements below, and links only to ordinary addresses.
+fn formatted(html: &mut String, text: &str) {
+    let text = text.replace("\r\n", "\n");
+    html.push_str("<div class=\"formatted\">\n");
+    let mut lines = text.lines().peekable();
+    let mut paragraph: Vec<&str> = Vec::new();
+    let flush = |html: &mut String, paragraph: &mut Vec<&str>| {
+        if !paragraph.is_empty() {
+            let joined: Vec<String> = paragraph.iter().map(|l| inline(l.trim())).collect();
+            let _ = writeln!(html, "<p>{}</p>", joined.join("<br>"));
+            paragraph.clear();
+        }
+    };
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            flush(html, &mut paragraph);
+            let mut code = Vec::new();
+            for inner in lines.by_ref() {
+                if inner.trim_start().starts_with("```") {
+                    break;
+                }
+                code.push(inner);
+            }
+            let _ = writeln!(html, "<pre class=\"code\"><code>{}</code></pre>", escape(&code.join("\n")));
+        } else if let Some((level, rest)) = heading_line(trimmed) {
+            flush(html, &mut paragraph);
+            // The page's own title is the only first-level heading.
+            let _ = writeln!(html, "<h{0}>{1}</h{0}>", level + 1, inline(rest));
+        } else if list_item(trimmed).is_some() {
+            flush(html, &mut paragraph);
+            html.push_str("<ul>\n");
+            let mut item = list_item(trimmed);
+            while let Some(text) = item {
+                let _ = writeln!(html, "<li>{}</li>", inline(text));
+                item = lines.peek().and_then(|next| list_item(next.trim_start()));
+                if item.is_some() {
+                    lines.next();
+                }
+            }
+            html.push_str("</ul>\n");
+        } else if let Some(rest) = quote_line(trimmed) {
+            flush(html, &mut paragraph);
+            let mut quoted = vec![inline(rest)];
+            while let Some(rest) = lines.peek().and_then(|next| quote_line(next.trim_start())) {
+                quoted.push(inline(rest));
+                lines.next();
+            }
+            let _ = writeln!(html, "<blockquote><p>{}</p></blockquote>", quoted.join("<br>"));
+        } else if trimmed.is_empty() {
+            flush(html, &mut paragraph);
+        } else {
+            paragraph.push(line);
+        }
+    }
+    flush(html, &mut paragraph);
+    html.push_str("</div>\n");
+}
+
+fn heading_line(line: &str) -> Option<(usize, &str)> {
+    let level = line.chars().take_while(|&c| c == '#').count();
+    let rest = line[level..].strip_prefix(' ')?;
+    (1..=3).contains(&level).then_some((level, rest.trim()))
+}
+
+fn list_item(line: &str) -> Option<&str> {
+    line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))
+}
+
+fn quote_line(line: &str) -> Option<&str> {
+    line.strip_prefix("> ").or_else(|| (line == ">").then_some(""))
+}
+
+/// One line's **bold**, *italic*, `code` and [links](/somewhere), with
+/// everything else escaped. Marks that are not closed stay as typed.
+fn inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let after = &rest[c.len_utf8()..];
+        let taken = match c {
+            '`' => after.find('`').map(|end| {
+                let _ = write!(out, "<code>{}</code>", escape(&after[..end]));
+                1 + end + 1
+            }),
+            '*' if after.starts_with('*') => after[1..].find("**").filter(|&end| end > 0).map(|end| {
+                let _ = write!(out, "<strong>{}</strong>", inline(&after[1..1 + end]));
+                2 + end + 2
+            }),
+            '*' => after.find('*').filter(|&end| end > 0 && !after.starts_with(' ')).map(|end| {
+                let _ = write!(out, "<em>{}</em>", inline(&after[..end]));
+                1 + end + 1
+            }),
+            '[' => after.find("](").and_then(|middle| {
+                let label = &after[..middle];
+                let target_and_rest = &after[middle + 2..];
+                let end = target_and_rest.find(')')?;
+                let target = target_and_rest[..end].trim();
+                if label.is_empty() || label.contains('[') || !safe_target(target) {
+                    return None;
+                }
+                let outside = !target.starts_with('/') && !target.starts_with('#');
+                let rel = if outside { " rel=\"noreferrer noopener\"" } else { "" };
+                let _ = write!(out, "<a href=\"{}\"{rel}>{}</a>", escape(target), inline(label));
+                Some(1 + middle + 2 + end + 1)
+            }),
+            _ => None,
+        };
+        match taken {
+            Some(len) => rest = &rest[len..],
+            None => {
+                out.push_str(&escape(&rest[..c.len_utf8()]));
+                rest = after;
+            }
+        }
+    }
+    out
+}
+
+/// An address on this site, or an ordinary web address. Never a script or
+/// data address, and never one that could break out of the attribute.
+fn safe_target(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    let well_formed = !target.is_empty() && !target.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '\\'));
+    let place = (target.starts_with('/') && !target.starts_with("//"))
+        || target.starts_with('#')
+        || lower.starts_with("http://")
+        || lower.starts_with("https://");
+    well_formed && place
 }
 
 fn class(align: Align) -> &'static str {
@@ -913,6 +1094,11 @@ fn style(theme: &Theme, root: &str) -> String {
          .search input{{width:auto;min-width:60%}}\n\
          .pager a{{margin-right:1rem}}\n\
          .media{{padding:2rem 1rem;border:1px dashed {muted};border-radius:.4rem;text-align:center}}\n\
+         pre.code{{overflow:auto;padding:.75rem;border:1px solid {muted};border-radius:.4rem;font:14px/1.5 ui-monospace,monospace;white-space:pre;tab-size:4}}\n\
+         textarea.code{{font:14px/1.5 ui-monospace,monospace;white-space:pre;tab-size:4}}\n\
+         .formatted code{{font-family:ui-monospace,monospace;font-size:.9em}}\n\
+         .formatted p,.formatted li{{overflow-wrap:anywhere}}\n\
+         blockquote{{margin:1rem 0;padding:.1rem 1rem;border-left:.25rem solid {muted}}}\n\
          .empty{{opacity:.7}}\n",
         accent = accent(theme),
     )
@@ -966,7 +1152,7 @@ mod tests {
     fn guestbook() -> Site {
         let field = |name: &str, kind| Field { name: name.into(), label: name.to_uppercase(), kind, required: true };
         let mut site = site(vec![
-            Block::Form { collection: "notes".into(), submit_label: "Sign".into() },
+            Block::Form { collection: "notes".into(), submit_label: "Sign".into(), open: false, prefill: false },
             list(
                 "notes",
                 vec![

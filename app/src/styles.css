@@ -245,6 +245,10 @@ h2:first-child {
   user-select: text;
 }
 
+.lock-hint {
+  font-size: 12px;
+}
+
 .lock-error {
   min-height: 1.5em;
   color: var(--error) !important;

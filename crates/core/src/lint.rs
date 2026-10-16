@@ -316,12 +316,24 @@ fn lint_blocks(blocks: &[Block], scope: &Scope<'_>, add: &mut impl FnMut(Severit
                 }
             }
             Block::Gate { blocks, .. } => lint_blocks(blocks, scope, add),
-            Block::Form { collection, .. } => match scope.site.collection(collection) {
+            Block::Form { collection, open, prefill, .. } => match scope.site.collection(collection) {
                 None => add(Severity::Error, format!("A form adds to the collection \"{collection}\", which does not exist.")),
                 Some(_) if collection == USERS => {
                     add(Severity::Error, "Accounts are created with the Sign-up block, not a form.".into());
                 }
                 Some(target) => {
+                    if *open && !scope.site.pages.iter().any(|p| p.template.as_deref() == Some(collection.as_str())) {
+                        add(
+                            Severity::Warning,
+                            format!("This form opens what it added, but no template page shows \"{collection}\" records, so it stays here."),
+                        );
+                    }
+                    if *prefill && (target.parent.is_none() || target.sealed) {
+                        add(
+                            Severity::Warning,
+                            "Only a form for records that belong to another record, and are not sealed, can start filled in.".into(),
+                        );
+                    }
                     if let Some(parent) = &target.parent {
                         if here != Some(parent.as_str()) {
                             add(

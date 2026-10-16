@@ -200,7 +200,7 @@ async fn a_sealed_collection_cannot_be_read_by_the_site_itself() {
             slug: "index".into(),
             title: "Home".into(),
             template: None,
-            blocks: vec![Block::Form { collection: "tips".into(), submit_label: "Send".into() }],
+            blocks: vec![Block::Form { collection: "tips".into(), submit_label: "Send".into(), open: false, prefill: false }],
         }],
     };
     check(&site).unwrap();
@@ -265,7 +265,7 @@ async fn old_text_in_a_field_that_became_a_file_field_cannot_name_a_file_to_dele
             slug: "index".into(),
             title: "Home".into(),
             template: None,
-            blocks: vec![Block::Form { collection: "notes".into(), submit_label: "Send".into() }],
+            blocks: vec![Block::Form { collection: "notes".into(), submit_label: "Send".into(), open: false, prefill: false }],
         }],
     };
     let store = Store::open(Storage { file: dir.join("data.bin"), key: zeroize::Zeroizing::new([4; 32]) }).unwrap();

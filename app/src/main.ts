@@ -9,7 +9,7 @@ type Block = { id: string } & (
   | { type: "link"; label: string; href: string; align: Align }
   | { type: "divider" }
   | { type: "columns"; columns: Block[][] }
-  | { type: "form"; collection: string; submit_label: string }
+  | { type: "form"; collection: string; submit_label: string; open?: boolean; prefill?: boolean }
   | {
       type: "list";
       collection: string;
@@ -31,7 +31,12 @@ type Block = { id: string } & (
   | { type: "gate"; audience: "members" | "guests"; blocks: Block[] }
 );
 type BlockType = Block["type"];
-type Field = { name: string; label: string; kind: "text" | "long_text" | "image" | "video"; required: boolean };
+type Field = {
+  name: string;
+  label: string;
+  kind: "text" | "long_text" | "formatted" | "code" | "image" | "video";
+  required: boolean;
+};
 type Collection = {
   name: string;
   fields: Field[];
@@ -158,7 +163,7 @@ function create(type: BlockType): Block {
     case "columns":
       return { id, type, columns: [[], []] };
     case "form":
-      return { id, type, collection: someCollection(), submit_label: "Send" };
+      return { id, type, collection: someCollection(), submit_label: "Send", open: false, prefill: false };
     case "list":
       return {
         id,
@@ -542,6 +547,10 @@ function renderInspector() {
         field("Adds to", collectionChoice(block.collection, (v) => (block.collection = v))),
         field("Button label", textInput(block.submit_label, (v) => (block.submit_label = v))),
         el("p", "hint", "Its inputs are the collection's fields. Edit them under Collections."),
+        field("Then open what was added", flag(!!block.open, (v) => (block.open = v))),
+        el("p", "hint", "Afterwards the visitor goes to the new record's own page, if a template page shows that collection. Good for pastes and new articles."),
+        field("Start filled in", flag(!!block.prefill, (v) => (block.prefill = v))),
+        el("p", "hint", "On a record's page, the form starts with the newest record already added there, so saving makes a changed copy. This is how a wiki edits."),
       );
       break;
     case "list": {
@@ -851,6 +860,78 @@ function renderSettings() {
     el("p", "hint", "One file with the vault and every site's data, all encrypted. It opens only with this vault's passphrase. Restore it on a fresh install from the Unlock screen."),
   );
 
+  // One site at a time, to another installation or to keep apart, sealed
+  // under a passphrase chosen for the file.
+  const filePass = el("input") as HTMLInputElement;
+  filePass.type = "password";
+  filePass.autocomplete = "off";
+  filePass.placeholder = "at least 10 characters";
+  const withContent = flag(false, () => {});
+  const withAddress = flag(false, () => {});
+  const exportSite = el("button", "", "Export this site");
+  exportSite.addEventListener("click", async () => {
+    if (filePass.value.length < 10) return showFailure({ message: "Choose a passphrase of at least 10 characters for the file." } as Failure);
+    const name = slug(site.title) || "site";
+    const file = await saveDialog({ defaultPath: `${name}.torussite`, filters: [{ name: "Torus site", extensions: ["torussite"] }] });
+    if (!file) return;
+    flushSave();
+    exportSite.disabled = true;
+    try {
+      await invoke("export_site", {
+        id: openEntry().id,
+        file,
+        passphrase: filePass.value,
+        content: withContent.checked,
+        address: withAddress.checked,
+      });
+      filePass.value = "";
+      if (withContent.checked) localUrl = "";
+      note = withAddress.checked
+        ? "Site exported, with its address. Do not run it in two places at once: the two copies would fight over the address."
+        : "Site exported.";
+      showStatus();
+      await pollTor();
+    } catch (error) {
+      showFailure(error);
+    } finally {
+      exportSite.disabled = false;
+    }
+  });
+  const importSite = el("button", "", "Import a site from a file");
+  importSite.addEventListener("click", async () => {
+    const file = await openDialog({ filters: [{ name: "Torus site", extensions: ["torussite"] }] });
+    if (!file || Array.isArray(file)) return;
+    if (!filePass.value) return showFailure({ message: "Type the file's passphrase first, then import." } as Failure);
+    importSite.disabled = true;
+    importSite.textContent = "Importing…";
+    try {
+      const entry = await invoke<Entry>("import_site", { file, passphrase: filePass.value });
+      filePass.value = "";
+      entry.site.pages.forEach((p) => withIds(p.blocks));
+      entries.push(entry);
+      open(entry);
+      note = "Site imported as a new site.";
+      showStatus();
+    } catch (error) {
+      showFailure(error);
+    } finally {
+      importSite.disabled = false;
+      importSite.textContent = "Import a site from a file";
+    }
+  });
+  siteHost.append(
+    field("Site file passphrase", filePass),
+    field("Include what visitors added", withContent),
+    field("Include the onion address", withAddress),
+    exportSite,
+    importSite,
+    el(
+      "p",
+      "hint",
+      "Exports just this site to a .torussite file, sealed with the passphrase above. Its design always goes; what visitors added (accounts, posts, files) and its .onion address only if ticked. Including what visitors added takes the site offline while it is copied. Importing adds the file's site here as a new site.",
+    ),
+  );
+
   // Decoy passphrase: a second passphrase that opens a separate, empty
   // installation. Only offered from the real compartment.
   void invoke<boolean>("in_decoy").then((decoy) => {
@@ -885,7 +966,13 @@ function renderSettings() {
   });
 
   // Replaces every page and collection, so it also takes two clicks.
-  const kinds: [string, string][] = [["video", "Video site"], ["board", "Anonymous board"], ["microblog", "Microblog"]];
+  const kinds: [string, string][] = [
+    ["video", "Video site"],
+    ["board", "Anonymous board"],
+    ["microblog", "Microblog"],
+    ["wiki", "Wiki"],
+    ["pastebin", "Pastebin"],
+  ];
   const kind = el("select");
   for (const [value, label] of kinds) kind.append(new Option(label, value));
   siteHost.append(field("Ready-made site", kind));
@@ -1122,7 +1209,14 @@ function renderCollections() {
       const row = el("div", "field-row");
       const label = textInput(item.label, (v) => (item.label = v));
       label.title = "What visitors see next to this input";
-      const kinds: [Field["kind"], string][] = [["text", "Short"], ["long_text", "Long"], ["image", "Picture"], ["video", "Video"]];
+      const kinds: [Field["kind"], string][] = [
+        ["text", "Short"],
+        ["long_text", "Long"],
+        ["formatted", "Formatted"],
+        ["code", "Code"],
+        ["image", "Picture"],
+        ["video", "Video"],
+      ];
       const kind = choice<Field["kind"]>(kinds, item.kind, (v) => (item.kind = v));
       // The name of an account is what it signs in with, so it stays as it is.
       const fixed = collection.name === USERS && item.name === USER_NAME;
@@ -1177,7 +1271,7 @@ function renderCollections() {
         for (const record of [...records].reverse()) {
           const row = el("div", "record");
           const words = collection.fields
-            .filter((f) => f.kind === "text" || f.kind === "long_text")
+            .filter((f) => f.kind !== "image" && f.kind !== "video")
             .map((f) => record.fields[f.name])
             .filter(Boolean)
             .join(" · ");
@@ -1276,6 +1370,9 @@ function renderSites() {
   picker.replaceChildren(...entries.map((entry) => new Option(entry.site.title || "Untitled site", String(entry.id))));
   picker.value = String(current.id);
 }
+
+// The site being edited, for code where `current` names something else.
+const openEntry = () => current;
 
 function open(entry: Entry) {
   flushSave();
@@ -1440,8 +1537,10 @@ async function start() {
   const lock = $<HTMLFormElement>("lock");
   const first = $<HTMLInputElement>("passphrase");
   const again = $<HTMLInputElement>("passphrase-again");
+  const decoy = $<HTMLInputElement>("decoy-passphrase");
   const exists = await invoke<boolean>("vault_exists");
   again.hidden = exists;
+  decoy.hidden = $("decoy-hint").hidden = exists;
   $("lock-text").textContent = exists
     ? "Enter your passphrase to open your sites."
     : "Choose a passphrase. It encrypts your sites and their onion keys on this computer. It cannot be recovered if you forget it.";
@@ -1471,15 +1570,19 @@ async function start() {
     const fail = (message: string) => ($("lock-error").textContent = message);
     if (!exists && first.value.length < 10) return fail("Use at least 10 characters.");
     if (!exists && first.value !== again.value) return fail("The two passphrases do not match.");
+    if (!exists && decoy.value && decoy.value.length < 10) return fail("Use at least 10 characters for the decoy passphrase too.");
+    if (!exists && decoy.value && decoy.value === first.value) return fail("The decoy passphrase must differ from your real one.");
     fail("");
     try {
       entries = exists
         ? await invoke<Entry[]>("unlock", { passphrase: first.value })
         : await invoke<Entry[]>("create_vault", { passphrase: first.value, site });
+      // The vault exists and is open now; a decoy can only be set from here.
+      if (!exists && decoy.value) await invoke("set_decoy", { passphrase: decoy.value });
     } catch (error) {
       return fail((error as Failure).message);
     } finally {
-      first.value = again.value = "";
+      first.value = again.value = decoy.value = "";
     }
     for (const entry of entries) entry.site.pages.forEach((p) => withIds(p.blocks));
     lock.hidden = true;

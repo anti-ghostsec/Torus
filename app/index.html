@@ -14,6 +14,11 @@
       <p id="lock-text"></p>
       <input id="passphrase" type="password" placeholder="Passphrase" autocomplete="off" />
       <input id="passphrase-again" type="password" placeholder="Repeat passphrase" autocomplete="off" hidden />
+      <input id="decoy-passphrase" type="password" placeholder="Decoy passphrase (optional)" autocomplete="off" hidden />
+      <p id="decoy-hint" class="lock-hint" hidden>
+        A decoy passphrase opens a separate, empty set of sites instead of your real ones, for when you are made to unlock.
+        Nobody can tell from the files whether you set one. You can also set or change it later in Settings.
+      </p>
       <button class="primary">Unlock</button>
       <button id="restore" type="button" hidden>Restore from a backup</button>
       <p id="lock-error" class="lock-error"></p>
