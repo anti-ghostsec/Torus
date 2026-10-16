@@ -24,19 +24,86 @@ const CONTEXT: &[u8] = b"torus-folder-v1";
 /// Tor's bookkeeping is small; anything larger is not what this is for.
 const MAX_TOTAL: u64 = 256 * 1024 * 1024;
 
+/// What a path is, without following it if it is a link of any kind.
+enum Kind {
+    Folder,
+    File,
+    /// A link, junction or anything else: never followed, never read.
+    Other,
+}
+
+fn kind(path: &Path) -> io::Result<Kind> {
+    let found = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions and other reparse points can lead anywhere.
+        if found.file_attributes() & 0x400 != 0 {
+            return Ok(Kind::Other);
+        }
+    }
+    Ok(if found.file_type().is_dir() {
+        Kind::Folder
+    } else if found.file_type().is_file() {
+        Kind::File
+    } else {
+        Kind::Other
+    })
+}
+
+/// Opens a plain file for reading or writing, refusing a link put in its
+/// place, and a file that is also reachable under another name (a hard
+/// link to something elsewhere).
+fn open_plain(path: &Path, write: bool) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(!write).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open a link itself, never its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let found = file.metadata()?;
+    let refuse = || io::Error::new(io::ErrorKind::InvalidData, "not a plain file of this folder");
+    if !found.is_file() {
+        return Err(refuse());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if found.nlink() != 1 {
+            return Err(refuse());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if found.file_attributes() & 0x400 != 0 {
+            return Err(refuse());
+        }
+    }
+    Ok(file)
+}
+
 fn collect(root: &Path, at: &Path, out: &mut Vec<u8>) -> io::Result<()> {
+    use std::io::Read;
     for entry in fs::read_dir(at)? {
-        let entry = entry?;
-        let path = entry.path();
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            collect(root, &path, out)?;
-            continue;
+        let path = entry?.path();
+        match kind(&path)? {
+            Kind::Folder => {
+                collect(root, &path, out)?;
+                continue;
+            }
+            Kind::Other => continue,
+            Kind::File => {}
         }
-        if !kind.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
+        let name = path.file_name().unwrap_or_default();
         // Lock files say a program is running; they mean nothing later.
         if name.to_string_lossy().ends_with(".lock") || name == "lock" {
             continue;
@@ -44,7 +111,9 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<u8>) -> io::Result<()> {
         let relative = path.strip_prefix(root).map_err(io::Error::other)?;
         let relative: Vec<String> = relative.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
         let relative = relative.join("/");
-        let contents = Zeroizing::new(fs::read(&path)?);
+        let mut contents = Zeroizing::new(Vec::new());
+        let Ok(mut file) = open_plain(&path, false) else { continue };
+        file.read_to_end(&mut contents)?;
         if out.len() as u64 + contents.len() as u64 > MAX_TOTAL {
             return Err(io::Error::other("the folder is too large to keep"));
         }
@@ -63,6 +132,9 @@ pub fn pack(folder: &Path, key: &[u8; 32], file: &Path) -> io::Result<()> {
     if folder.exists() {
         collect(folder, folder, &mut plain)?;
     }
+    // A run of zeros past the last entry pads the size; unpacking stops at it.
+    let padded = plain.len().div_ceil(64 * 1024).max(1) * 64 * 1024;
+    plain.resize(padded, 0);
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
     let sealed = XChaCha20Poly1305::new(key.into())
@@ -75,6 +147,7 @@ pub fn pack(folder: &Path, key: &[u8; 32], file: &Path) -> io::Result<()> {
     out.write_all(&nonce)?;
     out.write_all(&sealed)?;
     out.sync_all()?;
+    crate::hide_times(&out);
     drop(out);
     fs::rename(&temp, file)?;
     Ok(())
@@ -101,7 +174,8 @@ pub fn unpack(file: &Path, key: &[u8; 32], folder: &Path) -> io::Result<()> {
             .map_err(|_| damaged())?,
     );
     let mut rest: &[u8] = &plain;
-    while !rest.is_empty() {
+    // Entries end where the padding (an entry with an empty name) begins.
+    while rest.len() >= 2 && rest[..2] != [0, 0] {
         let take = |rest: &mut &[u8], count: usize| -> io::Result<Vec<u8>> {
             if rest.len() < count {
                 return Err(damaged());
@@ -135,13 +209,14 @@ pub fn unpack(file: &Path, key: &[u8; 32], folder: &Path) -> io::Result<()> {
 pub fn erase(folder: &Path) -> io::Result<()> {
     fn overwrite(at: &Path) -> io::Result<()> {
         for entry in fs::read_dir(at)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                overwrite(&entry.path())?;
-            } else if kind.is_file() {
-                let size = entry.metadata()?.len();
-                if let Ok(mut file) = fs::OpenOptions::new().write(true).open(entry.path()) {
+            let path = entry?.path();
+            match kind(&path)? {
+                Kind::Folder => overwrite(&path)?,
+                // A link is removed, never followed: what it leads to is left alone.
+                Kind::Other => {}
+                Kind::File => {
+                    let Ok(mut file) = open_plain(&path, true) else { continue };
+                    let size = file.metadata()?.len();
                     let zeros = vec![0u8; 64 * 1024];
                     let mut left = size;
                     while left > 0 {
@@ -157,12 +232,15 @@ pub fn erase(folder: &Path) -> io::Result<()> {
         }
         Ok(())
     }
-    match fs::metadata(folder) {
+    match kind(folder) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
+        // The folder itself replaced by a link: only the link goes.
+        Ok(Kind::Other) => return fs::remove_file(folder),
         Ok(_) => {}
     }
     let _ = overwrite(folder);
+    // Removes links themselves, never what they lead to.
     fs::remove_dir_all(folder)
 }
 
@@ -192,6 +270,24 @@ mod tests {
         assert_eq!(fs::read(folder.join("hss/site/iptpub")).unwrap(), b"SECRET-INTRO-POINTS");
         assert!(!folder.join("state.lock").exists(), "lock files are not kept");
         assert!(unpack(&file, &[8u8; 32], &base.join("other")).is_err(), "another key opened it");
+
+        // Links put into the folder are neither followed when packing nor
+        // written through when erasing.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside.txt");
+            fs::write(&outside, b"SECRET-ELSEWHERE").unwrap();
+            std::os::unix::fs::symlink(&outside, folder.join("link")).unwrap();
+            fs::hard_link(&outside, folder.join("hard")).unwrap();
+            std::os::unix::fs::symlink(&base, folder.join("dirlink")).unwrap();
+            pack(&folder, &key, &file).unwrap();
+            unpack(&file, &key, &base.join("check")).unwrap();
+            assert!(!base.join("check/link").exists() && !base.join("check/hard").exists());
+            assert!(!base.join("check/dirlink").exists());
+            erase(&folder).unwrap();
+            assert_eq!(fs::read(&outside).unwrap(), b"SECRET-ELSEWHERE", "erasing wrote through a link");
+            assert!(base.exists());
+        }
 
         // Nothing kept yet: an empty folder.
         unpack(&base.join("missing.bin"), &key, &base.join("fresh")).unwrap();

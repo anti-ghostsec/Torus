@@ -202,6 +202,11 @@ async fn records_survive_a_restart_and_are_unreadable_on_disk() {
     for plain in [b"Remembered".as_slice(), b"recognisable", b"notes", b"message"] {
         assert!(!on_disk.windows(plain.len()).any(|w| w == plain), "the store holds readable text");
     }
+    // Neither its size nor its times say much: padded to 64 KiB (plus the
+    // nonce and tag), and dated like every other file the app writes.
+    assert_eq!(on_disk.len(), 24 + 64 * 1024 + 16);
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    assert_eq!(modified, std::time::UNIX_EPOCH + Duration::from_secs(946_684_800), "the file's time tells when it was written");
 
     // The wrong key opens nothing; the right one brings the record back.
     assert!(Store::open(storage(8)).is_err());
