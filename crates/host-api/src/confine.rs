@@ -255,6 +255,10 @@ pub(crate) struct Terms<'a> {
     pub processes: u32,
     /// The most memory each of them may commit, in bytes.
     pub memory: usize,
+    /// Whether the process is ended the moment the editor is. A host is
+    /// not: it stops by itself once its input closes, after packing its
+    /// Tor bookkeeping away.
+    pub die_with_editor: bool,
     /// Added to the few things the process is told about its surroundings.
     /// Names must sort after `TMP`.
     pub tell: Vec<(&'a str, OsString)>,
@@ -455,8 +459,10 @@ pub(crate) fn spawn(program: &Path, container: &str, folder: &Path, terms: Terms
         std::mem::forget((our_stdin, our_stdout));
 
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        if terms.die_with_editor {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
         limits.BasicLimitInformation.ActiveProcessLimit = terms.processes;
         limits.ProcessMemoryLimit = terms.memory;
         SetInformationJobObject(

@@ -126,6 +126,7 @@ impl Vault {
         file.write_all(&nonce)?;
         file.write_all(&body)?;
         file.sync_all()?;
+        hide_times(&file);
         drop(file);
         fs::rename(&temp, &self.path)?;
         // The rename is only durable once the folder is written out.
@@ -149,6 +150,28 @@ fn derive(passphrase: &str, header: &[u8; HEADER_LEN]) -> Result<Zeroizing<[u8; 
         .hash_password_into(passphrase.as_bytes(), &header[8..8 + SALT_LEN], key.as_mut())
         .map_err(|_| Error::Format)?;
     Ok(key)
+}
+
+/// Gives a file the same times as every other file this app writes, so that
+/// the disk says nothing about when anything was added or changed.
+pub(crate) fn hide_times(file: &std::fs::File) {
+    let fixed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800); // 2000-01-01
+    let times = std::fs::FileTimes::new().set_accessed(fixed).set_modified(fixed);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(fixed)
+    };
+    let _ = file.set_times(times);
+}
+
+/// Pads `bytes` with spaces to a whole number of 64 KiB, so that the size of
+/// what is stored says little about how much is in it. JSON readers skip
+/// trailing spaces.
+pub fn pad_json(bytes: &mut Vec<u8>) {
+    const STEP: usize = 64 * 1024;
+    let padded = bytes.len().div_ceil(STEP).max(1) * STEP;
+    bytes.resize(padded, b' ');
 }
 
 fn random(buffer: &mut [u8]) -> Result<(), Error> {

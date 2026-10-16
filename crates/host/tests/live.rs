@@ -78,7 +78,7 @@ async fn a_sandboxed_video_site_works_over_tor() {
     // drive, so they are made for it.
     std::fs::create_dir_all(folder.join("state")).unwrap();
     std::fs::create_dir_all(folder.join("cache")).unwrap();
-    let target = Target::Onion { identity: identity.to_vec(), state_dir: folder.join("state"), cache_dir: folder.join("cache") };
+    let target = Target::Onion { identity: identity.to_vec(), state_dir: folder.join("state"), cache_dir: folder.join("cache"), kept: None, kept_key: Vec::new() };
     let records_file = folder.join("records.bin");
     let records = Records { file: records_file.clone(), key: vec![5; 32] };
     // With the converter present, pictures and smaller sizes are made too.

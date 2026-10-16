@@ -202,6 +202,7 @@ fn write_durably(file: &Path, contents: &[u8]) -> io::Result<()> {
     let mut out = std::fs::File::create(&temp)?;
     out.write_all(contents)?;
     out.sync_all()?;
+    blobs::hide_times(&out);
     drop(out);
     std::fs::rename(&temp, file)?;
     // The rename itself is only durable once the folder is written out.
@@ -274,7 +275,8 @@ impl Store {
     fn persist(&mut self) -> Result<(), Refused> {
         let (Some(storage), Some(disk)) = (&self.storage, &mut self.disk) else { return Ok(()) };
         let seal = || -> io::Result<Vec<u8>> {
-            let plain = Zeroizing::new(serde_json::to_vec(&self.state)?);
+            let mut plain = Zeroizing::new(serde_json::to_vec(&self.state)?);
+            blobs::pad_json(&mut plain);
             let mut nonce = [0u8; NONCE_LEN];
             getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
             let mut sealed = nonce.to_vec();
