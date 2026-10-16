@@ -150,6 +150,21 @@ impl Failure {
     }
 }
 
+/// The single empty site a freshly set-up decoy shows, so that opening it
+/// looks exactly like a new installation.
+fn decoy_site() -> Site {
+    torus_core::starters::by_name("board").unwrap_or_else(|| Site {
+        title: "My site".into(),
+        theme: Default::default(),
+        pages: Vec::new(),
+        collections: Vec::new(),
+        accounts: false,
+        seal_key: None,
+        limits: Default::default(),
+        moderation: Default::default(),
+    })
+}
+
 /// Refuses a site with anything in it that blocks publishing.
 fn checked(site: &Site) -> Result<(), Failure> {
     check(site).map_err(|findings| Failure { message: "The site has problems that block publishing.".into(), findings })
@@ -236,6 +251,9 @@ pub struct Backend {
     /// Sandboxes are named after this plus the site's number.
     sandbox_prefix: String,
     session: Mutex<Option<Session>>,
+    /// Which compartment is open: false is the main one, true the decoy.
+    /// It decides which vault file and which site folders are in use.
+    decoy: std::sync::atomic::AtomicBool,
     /// The local test server, and the site it serves.
     local: tokio::sync::Mutex<Option<(u32, Host)>>,
     /// One slot per site, each locked on its own: starting one site, which
@@ -306,6 +324,7 @@ impl Backend {
             host_program,
             sandbox_prefix: "torus.site".into(),
             session: Mutex::new(None),
+            decoy: std::sync::atomic::AtomicBool::new(false),
             local: Default::default(),
             hosted: Default::default(),
             mining: Mutex::new(None),
@@ -318,10 +337,10 @@ impl Backend {
     /// because it was killed or the device lost power. What it had packed
     /// away last is still in its encrypted copy.
     fn erase_leftovers(&self) {
-        let folders: Vec<PathBuf> = std::fs::read_dir(&self.tor_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
+        let roots = [self.tor_dir.clone(), self.alt_sites_dir()];
+        let folders: Vec<PathBuf> = roots
+            .iter()
+            .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("site-"))
             .map(|entry| entry.path())
             .collect();
@@ -331,9 +350,37 @@ impl Backend {
         }
     }
 
+    /// Whether the decoy compartment is the one open now.
+    fn is_decoy(&self) -> bool {
+        self.decoy.load(Ordering::Relaxed)
+    }
+
+    /// The main vault file, which a confined host must never be able to read.
     fn vault_path(&self) -> Result<PathBuf, Failure> {
         std::fs::create_dir_all(&self.data_dir).map_err(Failure::new)?;
         Ok(self.data_dir.join("project.vault"))
+    }
+
+    /// The decoy vault file. It always exists: on a fresh install it holds
+    /// random bytes under a passphrase nobody knows, so the file never shows
+    /// whether a decoy passphrase has been set.
+    fn alt_vault_path(&self) -> PathBuf {
+        self.data_dir.join("alt.vault")
+    }
+
+    /// The vault file for the compartment open now.
+    fn active_vault_path(&self) -> Result<PathBuf, Failure> {
+        Ok(if self.is_decoy() { self.alt_vault_path() } else { self.vault_path()? })
+    }
+
+    /// Where the open compartment keeps its sites. The decoy's are kept
+    /// apart from the main ones, so the two never touch.
+    fn sites_dir(&self) -> PathBuf {
+        if self.is_decoy() { self.alt_sites_dir() } else { self.tor_dir.clone() }
+    }
+
+    fn alt_sites_dir(&self) -> PathBuf {
+        self.tor_dir.with_file_name("alt-sites")
     }
 
     /// Where a site's Tor bookkeeping is kept encrypted between runs: in
@@ -407,6 +454,11 @@ impl Backend {
             return Err(Failure::new("A vault already exists."));
         }
         let vault = Vault::create(&path, &passphrase, b"{}").map_err(Failure::new)?;
+        // A decoy vault is made at the same moment, sealed under a random
+        // passphrase nobody holds. It exists whether or not the owner ever
+        // sets a decoy passphrase, so its presence reveals nothing.
+        self.make_blank_alt()?;
+        self.decoy.store(false, Ordering::Relaxed);
         let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0 };
         session.add(site);
         session.persist()?;
@@ -415,12 +467,36 @@ impl Backend {
         Ok(listed)
     }
 
+    /// Writes the decoy vault as an unopenable blank: a random passphrase,
+    /// empty contents. Used when an installation is created, and to clear a
+    /// decoy passphrase the owner no longer wants.
+    fn make_blank_alt(&self) -> Result<(), Failure> {
+        let mut random = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(random.as_mut()).map_err(Failure::new)?;
+        let pass = torus_seal::to_hex(random.as_ref());
+        Vault::create(&self.alt_vault_path(), &pass, b"{}").map_err(Failure::new)?;
+        let _ = folder::erase(&self.alt_sites_dir());
+        Ok(())
+    }
+
     pub fn unlock(&self, passphrase: String) -> Result<Vec<Listed>, Failure> {
         let passphrase = Zeroizing::new(passphrase);
-        let (mut vault, bytes) = Vault::open(&self.vault_path()?, &passphrase).map_err(Failure::new)?;
+        // Both compartments are always tried, in the same order and at the
+        // same cost, so the time taken never shows which one (if either)
+        // the passphrase opened, nor whether a decoy passphrase exists.
+        let main = Vault::open(&self.vault_path()?, &passphrase);
+        let alt = Vault::open(&self.alt_vault_path(), &passphrase);
+        let (decoy, opened) = match (main, alt) {
+            (Ok(main), _) => (false, Ok(main)),
+            (Err(_), Ok(alt)) => (true, Ok(alt)),
+            (Err(e), Err(_)) => (false, Err(e)),
+        };
+        let (mut vault, bytes) = opened.map_err(Failure::new)?;
+        self.decoy.store(decoy, Ordering::Relaxed);
+        let active = self.active_vault_path()?;
         // A vault made with weaker settings than today's is made again with them.
         if vault.weaker_than_default() {
-            vault = Vault::create(&self.vault_path()?, &passphrase, &bytes).map_err(Failure::new)?;
+            vault = Vault::create(&active, &passphrase, &bytes).map_err(Failure::new)?;
         }
         let mut payload: Payload = serde_json::from_slice(&bytes).map_err(Failure::new)?;
         if let Some(site) = payload.site.take() {
@@ -455,6 +531,45 @@ impl Backend {
     /// Forgets the vault's key and everything decrypted with it.
     pub fn lock(&self) {
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.decoy.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the compartment open now is the decoy one.
+    pub fn in_decoy(&self) -> bool {
+        self.is_decoy()
+    }
+
+    /// Sets the decoy passphrase: a second passphrase that opens a separate,
+    /// empty installation instead of the real one. Only from the main
+    /// compartment, and never the same as the main passphrase. An empty
+    /// passphrase clears it, making the decoy an unopenable blank again.
+    ///
+    /// Setting it takes every site offline first, because it rewrites the
+    /// decoy compartment's files.
+    pub async fn set_decoy(&self, passphrase: String) -> Result<(), Failure> {
+        if self.is_decoy() {
+            return Err(Failure::new("The decoy passphrase can only be changed from your real passphrase."));
+        }
+        let passphrase = Zeroizing::new(passphrase);
+        if passphrase.is_empty() {
+            self.shutdown_hosts().await;
+            return self.make_blank_alt();
+        }
+        if passphrase.chars().count() < MIN_PASSPHRASE {
+            return Err(Failure::new(format!("Use a passphrase of at least {MIN_PASSPHRASE} characters.")));
+        }
+        // It must not open the real compartment, or the decoy would be no cover.
+        if Vault::open(&self.vault_path()?, &passphrase).is_ok() {
+            return Err(Failure::new("That is your real passphrase. The decoy must be different."));
+        }
+        self.shutdown_hosts().await;
+        let alt = Vault::create(&self.alt_vault_path(), &passphrase, b"{}").map_err(Failure::new)?;
+        // A blank install behind it: one empty starter site, so the decoy
+        // looks like any new installation.
+        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0 };
+        session.add(crate::backend::decoy_site());
+        let _ = folder::erase(&self.alt_sites_dir());
+        session.persist()
     }
 
     pub fn save(&self, id: u32, site: Site) -> Result<(), Failure> {
@@ -577,7 +692,7 @@ impl Backend {
     /// and visitors' encrypted data. Inside this app's own folder, like
     /// everything else it keeps.
     fn site_dir(&self, id: u32) -> Result<PathBuf, Failure> {
-        Ok(self.tor_dir.join(format!("site-{id}")))
+        Ok(self.sites_dir().join(format!("site-{id}")))
     }
 
     /// Compiles a site and puts it on Tor in a host process of its own. A
@@ -843,13 +958,19 @@ impl Backend {
     /// Takes every site offline and packs their Tor bookkeeping away. Called
     /// when the app closes.
     pub async fn shutdown(&self) {
+        self.shutdown_hosts().await;
+        self.lock();
+    }
+
+    /// Takes every site offline and stops the local server and any search,
+    /// but keeps the vault unlocked.
+    async fn shutdown_hosts(&self) {
         self.mine_stop();
         *self.local.lock().await = None;
         let ids: Vec<u32> = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
         for id in ids {
             self.stop(id).await;
         }
-        self.lock();
     }
 }
 
@@ -948,6 +1069,37 @@ mod tests {
         backend.lock();
         backend.unlock("correct horse battery".into()).unwrap();
         assert!(backend.add_site(site("Delta", "four")).unwrap() > third, "the count was lost on unlocking");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A decoy passphrase opens a separate, empty installation; the real
+    /// sites stay hidden behind the real passphrase; and the files never
+    /// show whether a decoy passphrase has been set.
+    #[tokio::test]
+    async fn a_decoy_passphrase_opens_a_separate_installation() {
+        let (backend, dir) = backend("decoy");
+        backend.create_vault("the real passphrase here".into(), site("Secret", "hidden")).unwrap();
+        backend.add_site(site("Also secret", "hidden too")).unwrap();
+        // The decoy file exists from the start, before any decoy is set.
+        assert!(dir.join("data/alt.vault").exists(), "no decoy vault was made");
+
+        // A wrong passphrase opens nothing.
+        assert!(backend.unlock("not either passphrase".into()).is_err());
+
+        backend.set_decoy("the decoy passphrase ok".into()).await.unwrap();
+        assert!(backend.set_decoy("the real passphrase here".into()).await.is_err(), "the decoy must differ from the real one");
+
+        // The decoy passphrase opens a separate, nearly-empty installation.
+        let decoy = backend.unlock("the decoy passphrase ok".into()).unwrap();
+        assert!(backend.in_decoy());
+        assert!(!decoy.iter().any(|s| s.site.title == "Secret"), "a real site showed in the decoy");
+        backend.add_site(site("Decoy note", "nothing real")).unwrap();
+
+        // The real passphrase still opens the real sites, untouched.
+        let real = backend.unlock("the real passphrase here".into()).unwrap();
+        assert!(!backend.in_decoy());
+        assert!(real.iter().any(|s| s.site.title == "Secret") && real.iter().any(|s| s.site.title == "Also secret"));
+        assert!(!real.iter().any(|s| s.site.title == "Decoy note"), "a decoy site leaked into the real compartment");
         let _ = std::fs::remove_dir_all(dir);
     }
 

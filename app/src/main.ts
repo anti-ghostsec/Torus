@@ -851,6 +851,39 @@ function renderSettings() {
     el("p", "hint", "One file with the vault and every site's data, all encrypted. It opens only with this vault's passphrase. Restore it on a fresh install from the Unlock screen."),
   );
 
+  // Decoy passphrase: a second passphrase that opens a separate, empty
+  // installation. Only offered from the real compartment.
+  void invoke<boolean>("in_decoy").then((decoy) => {
+    if (decoy) return;
+    const decoyInput = el("input") as HTMLInputElement;
+    decoyInput.type = "password";
+    decoyInput.autocomplete = "off";
+    decoyInput.placeholder = "leave blank to turn off";
+    const setDecoy = el("button", "", "Set decoy passphrase");
+    setDecoy.addEventListener("click", async () => {
+      setDecoy.disabled = true;
+      try {
+        await invoke("set_decoy", { passphrase: decoyInput.value });
+        decoyInput.value = "";
+        note = "Decoy passphrase saved. Entering it on the Unlock screen opens a separate, empty set of sites.";
+        showStatus();
+      } catch (error) {
+        showFailure(error);
+      } finally {
+        setDecoy.disabled = false;
+      }
+    });
+    siteHost.append(
+      field("Decoy passphrase", decoyInput),
+      setDecoy,
+      el(
+        "p",
+        "hint",
+        "A second passphrase that opens a separate, empty installation instead of your real one. It must differ from your real passphrase. Nobody can tell from the files whether you have set one. Setting or changing it takes every site offline for a moment.",
+      ),
+    );
+  });
+
   // Replaces every page and collection, so it also takes two clicks.
   const kinds: [string, string][] = [["video", "Video site"], ["board", "Anonymous board"], ["microblog", "Microblog"]];
   const kind = el("select");

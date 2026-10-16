@@ -29,6 +29,16 @@ fn lock(backend: State<'_, Backend>) {
 }
 
 #[tauri::command]
+fn in_decoy(backend: State<'_, Backend>) -> bool {
+    backend.in_decoy()
+}
+
+#[tauri::command]
+async fn set_decoy(backend: State<'_, Backend>, passphrase: String) -> Result<(), Failure> {
+    backend.set_decoy(passphrase).await
+}
+
+#[tauri::command]
 async fn export_backup(backend: State<'_, Backend>, file: std::path::PathBuf) -> Result<(), Failure> {
     backend.export_backup(file).await
 }
@@ -205,6 +215,8 @@ pub fn run() {
             set_auto_lock_minutes,
             export_backup,
             import_backup,
+            in_decoy,
+            set_decoy,
             panic,
             save,
             add_site,
