@@ -11,6 +11,8 @@ pub fn by_name(name: &str) -> Option<Site> {
         "video" => Some(video_site()),
         "board" => Some(board()),
         "microblog" => Some(microblog()),
+        "wiki" => Some(wiki()),
+        "pastebin" => Some(pastebin()),
         _ => None,
     }
 }
@@ -50,7 +52,12 @@ fn moderate() -> Block {
 }
 
 fn form(collection: &str, label: &str) -> Block {
-    Block::Form { collection: collection.into(), submit_label: label.into() }
+    Block::Form { collection: collection.into(), submit_label: label.into(), open: false, prefill: false }
+}
+
+/// A form that takes the visitor to what they added once it is saved.
+fn form_then_open(collection: &str, label: &str) -> Block {
+    Block::Form { collection: collection.into(), submit_label: label.into(), open: true, prefill: false }
 }
 
 fn author() -> Block {
@@ -437,6 +444,163 @@ pub fn microblog() -> Site {
     }
 }
 
+/// A wiki: members start articles and anyone signed in can edit them. An
+/// edit is saved as a new version, so every article keeps its whole history,
+/// and undoing vandalism is a moderator removing the bad version.
+pub fn wiki() -> Site {
+    // The newest version of an article is the article.
+    let current = || {
+        Listing { scope: Scope::Children, limit: 1, paged: false, ..Listing::of("versions") }.with(vec![shown("text", 0)])
+    };
+    Site {
+        title: "My wiki".into(),
+        theme: Theme::default(),
+        accounts: true,
+        seal_key: None,
+        limits: Default::default(),
+        moderation: Default::default(),
+        collections: vec![
+            collection(
+                USERS,
+                None,
+                false,
+                vec![
+                    field(USER_NAME, "Name", FieldKind::Text, true),
+                    field("about", "About you", FieldKind::LongText, false),
+                ],
+            ),
+            collection("articles", None, true, vec![field("title", "Title", FieldKind::Text, true)]),
+            collection(
+                "versions",
+                Some("articles"),
+                true,
+                vec![
+                    field("text", "Article", FieldKind::Formatted, true),
+                    field("summary", "What you changed (optional)", FieldKind::Text, false),
+                ],
+            ),
+        ],
+        pages: vec![
+            page(
+                HOME_SLUG,
+                "Wiki",
+                None,
+                vec![
+                    heading(1, "Wiki"),
+                    text("Anyone with an account can start an article or improve one. Every edit is kept, so nothing is ever lost."),
+                    Block::Search { label: "Search".into() },
+                    heading(2, "Recently changed"),
+                    Listing { limit: 50, active_first: true, ..Listing::of("articles") }
+                        .with(vec![link_text("title"), count("versions", "edits")]),
+                    members(vec![
+                        heading(2, "Start an article"),
+                        form_then_open("articles", "Create"),
+                    ]),
+                    guests(vec![text("Sign in to write or edit."), link("Sign in", "/account")]),
+                ],
+            ),
+            page(
+                "article",
+                "Article",
+                Some("articles"),
+                vec![
+                    link("All articles", "/"),
+                    shown("title", 1),
+                    current(),
+                    Block::Divider,
+                    members(vec![
+                        heading(2, "Edit"),
+                        text("The form starts with the article as it is now. Change what you like and save: your version becomes the article, and the earlier one stays in the history."),
+                        Block::Form { collection: "versions".into(), submit_label: "Save".into(), open: false, prefill: true },
+                    ]),
+                    guests(vec![text("Sign in to edit this article."), link("Sign in", "/account")]),
+                    heading(2, "History"),
+                    Listing { scope: Scope::Children, limit: 25, ..Listing::of("versions") }.with(vec![
+                        author(),
+                        shown("summary", 0),
+                        link("See this version", "/version/{id}"),
+                        moderate(),
+                    ]),
+                    Block::Remove { label: "Delete this article".into() },
+                ],
+            ),
+            page(
+                "version",
+                "Earlier version",
+                Some("versions"),
+                vec![
+                    text("This is one version from an article's history. The article itself shows its newest version."),
+                    author(),
+                    shown("summary", 0),
+                    Block::Divider,
+                    shown("text", 0),
+                    moderate(),
+                ],
+            ),
+            account_page(),
+            page(
+                "member",
+                "Member",
+                Some(USERS),
+                vec![
+                    shown(USER_NAME, 1),
+                    shown("about", 0),
+                    count("versions", "edits"),
+                    heading(2, "Articles started"),
+                    Listing { scope: Scope::Owned, ..Listing::of("articles") }.with(vec![link_text("title")]),
+                ],
+            ),
+        ],
+    }
+}
+
+/// A list entry's title, then a link to its page.
+fn link_text(field: &str) -> Block {
+    // Kept as two blocks so each can be restyled or removed on its own.
+    Block::Columns { columns: vec![vec![shown(field, 3)], vec![link("Read", "/article/{id}")]] }
+}
+
+/// A pastebin: anyone pastes text or code without an account and is taken
+/// to its page, whose address is the only way to find it. Nothing is
+/// listed, so a paste is seen only by those its address is given to.
+pub fn pastebin() -> Site {
+    Site {
+        title: "My pastebin".into(),
+        theme: Theme::default(),
+        accounts: false,
+        seal_key: None,
+        limits: Default::default(),
+        moderation: Default::default(),
+        collections: vec![collection(
+            "pastes",
+            None,
+            false,
+            vec![
+                field("title", "Title (optional)", FieldKind::Text, false),
+                field("text", "Paste", FieldKind::Code, true),
+            ],
+        )],
+        pages: vec![
+            page(
+                HOME_SLUG,
+                "New paste",
+                None,
+                vec![
+                    heading(1, "New paste"),
+                    text("Paste text or code and save it. You are taken to its own page: share that address with whoever should see it. Pastes are never listed, and their addresses cannot be guessed."),
+                    form_then_open("pastes", "Save paste"),
+                ],
+            ),
+            page(
+                "paste",
+                "Paste",
+                Some("pastes"),
+                vec![shown("title", 1), shown("text", 0), link("New paste", "/")],
+            ),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +608,7 @@ mod tests {
 
     #[test]
     fn every_starter_passes_the_checks_and_renders_every_page() {
-        for name in ["video", "board", "microblog"] {
+        for name in ["video", "board", "microblog", "wiki", "pastebin"] {
             let site = by_name(name).unwrap();
             check(&site).unwrap_or_else(|findings| panic!("{name} does not pass its checks: {findings:#?}"));
             for page in &site.pages {

@@ -61,7 +61,8 @@ const CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self'; media-s
 /// only by this site's own pages.
 const PROGRESS_CSP: &str = "default-src 'none'; style-src 'self'; base-uri 'none'; frame-ancestors 'self'";
 /// The most text a form submission may carry, all fields together.
-const MAX_FORM_BYTES: usize = 64 * 1024;
+// Enough for the longest text field, sent with every character encoded.
+const MAX_FORM_BYTES: usize = 512 * 1024;
 const HTML: &str = "text/html; charset=utf-8";
 /// Says nothing about the software that set it.
 const SESSION_COOKIE: &str = "s";
@@ -842,16 +843,23 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
     };
     keep_files(&mut store, collection, &mut submission);
     let record = Record { fields, parent, owner, held, ..Record::default() };
-    if let Err(refused) = store.add(site, &collection.name, record) {
-        return refusal(refused);
-    }
+    let id = match store.add(site, &collection.name, record) {
+        Ok(id) => id,
+        Err(refused) => return refusal(refused),
+    };
     drop(store);
     if held {
         // Sent back to the page they would find nothing new on, a visitor
         // would think it was lost and send it again.
         return waiting_page(site, "Received. It will show once it has been approved.");
     }
-    see_other(site, submission.text(NEXT_FIELD))
+    // A form set to open what it added names that record's page, ending in
+    // `{id}`. Where that page is checked like any other address.
+    let next = submission.text(NEXT_FIELD);
+    match next.strip_suffix("/{id}") {
+        Some(page) => see_other(site, &format!("{page}/{id}")),
+        None => see_other(site, next),
+    }
 }
 
 /// A plain page telling the visitor their submission is waiting, with a link
@@ -1122,6 +1130,11 @@ fn clean(value: &str, kind: FieldKind) -> String {
             c => Some(c),
         })
         .collect();
+    if kind == FieldKind::Code {
+        // Code keeps the indent of its first line; only blank lines go.
+        let start = kept.find(|c: char| !c.is_whitespace()).map_or(kept.len(), |at| kept[..at].rfind('\n').map_or(0, |nl| nl + 1));
+        return kept[start..].trim_end().to_owned();
+    }
     kept.trim().to_owned()
 }
 
