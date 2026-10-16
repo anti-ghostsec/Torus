@@ -272,6 +272,23 @@ pub struct Prepared {
     pub hash: String,
 }
 
+/// Works out the wallet's addresses, and nothing else: it holds the view
+/// key but cannot spend, and needs none of the wallet's state.
+#[derive(Clone)]
+pub struct Addresses {
+    pair: ViewPair,
+    chain: Network,
+}
+
+impl Addresses {
+    pub fn address(&self, slot: Slot) -> String {
+        match slot.index() {
+            None => self.pair.legacy_address(self.chain).to_string(),
+            Some(index) => self.pair.subaddress(self.chain, index).to_string(),
+        }
+    }
+}
+
 pub struct Wallet {
     keys: Keys,
     pub state: State,
@@ -303,11 +320,11 @@ impl Wallet {
     }
 
     pub fn address(&self, slot: Slot) -> String {
-        let pair = self.keys.pair();
-        match slot.index() {
-            None => pair.legacy_address(self.state.chain()).to_string(),
-            Some(index) => pair.subaddress(self.state.chain(), index).to_string(),
-        }
+        self.addresses().address(slot)
+    }
+
+    pub fn addresses(&self) -> Addresses {
+        Addresses { pair: self.keys.pair(), chain: self.state.chain() }
     }
 
     /// Hands out the address `slot`, and watches for payments to it.
@@ -514,7 +531,7 @@ impl Wallet {
         let mut candidates = self.spendable_outputs(tip.min(self.state.height()));
         let spendable: Piconero = candidates.iter().map(|o| o.amount).sum();
         // The smallest set of the largest outputs that covers the payment and a fee.
-        candidates.sort_by(|a, b| b.amount.cmp(&a.amount));
+        candidates.sort_by_key(|o| std::cmp::Reverse(o.amount));
         let mut chosen = Vec::new();
         let mut total: Piconero = 0;
         for owned in candidates {

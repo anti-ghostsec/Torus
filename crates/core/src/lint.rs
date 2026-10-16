@@ -347,7 +347,7 @@ fn lint_blocks(blocks: &[Block], scope: &Scope<'_>, add: &mut impl FnMut(Severit
                 // A feed shows records' text to anyone, paid for or not.
                 if let Some(shown) = scope.record {
                     let fed = scope.site.any_block(&|b| matches!(b, Block::Feed { collection, .. } if *collection == shown.name));
-                    let shows_fields = blocks.iter().any(|b| shows_a_field(b));
+                    let shows_fields = blocks.iter().any(shows_a_field);
                     if fed && shows_fields {
                         add(
                             Severity::Warning,

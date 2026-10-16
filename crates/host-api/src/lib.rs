@@ -822,3 +822,34 @@ pub fn make_private(folder: &Path) -> io::Result<()> {
 
 #[cfg(not(windows))]
 pub fn remove_container(_container: &str, _programs: &[&Path]) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn relay_and_wallet_messages_cross_the_pipe() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        let fetch = Command::Ask { seq: 3, question: Box::new(Command::Fetch { route: "json_rpc".into(), body: vec![0, 1, 255], limit: 9 }) };
+        write_frame(&mut a, &fetch).await.unwrap();
+        match read_frame::<_, Command>(&mut b).await.unwrap() {
+            Some(Command::Ask { seq: 3, question }) => match *question {
+                Command::Fetch { route, body, limit } => assert_eq!((route.as_str(), body, limit), ("json_rpc", vec![0, 1, 255], 9)),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        let answer = Event::Answer { seq: 3, answer: Box::new(Event::Fetched { body: Ok(HexBytes(vec![42; 1000])) }) };
+        let bytes = serde_json::to_vec(&answer).unwrap();
+        assert!(bytes.len() < 2100, "bytes go as hex, not as a list of numbers");
+        write_frame(&mut b, &answer).await.unwrap();
+        assert!(matches!(read_frame::<_, Event>(&mut a).await.unwrap(), Some(Event::Answer { seq: 3, .. })));
+
+        let ask = Event::Bank { seq: 1, ask: torus_core::money::Ask::Purse { user: "u".into() } };
+        write_frame(&mut a, &ask).await.unwrap();
+        assert!(matches!(read_frame::<_, Event>(&mut b).await.unwrap(), Some(Event::Bank { seq: 1, .. })));
+        let told = Command::Banked { seq: 1, told: torus_core::money::Told::Refused("no".into()) };
+        write_frame(&mut b, &told).await.unwrap();
+        assert!(matches!(read_frame::<_, Command>(&mut a).await.unwrap(), Some(Command::Banked { seq: 1, .. })));
+    }
+}

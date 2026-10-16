@@ -1778,6 +1778,81 @@ mod tests {
 
     /// Hosting inside this program, as on Android, behaves like hosting in
     /// a program of its own, and leaves nothing running when it is stopped.
+    /// One request to a host on this computer, with what it answers.
+    async fn exchange(address: &str, request: String) -> String {
+        let name = address.trim_start_matches("http://");
+        let mut stream = tokio::net::TcpStream::connect(name).await.unwrap();
+        stream.write_all(request.replace("{host}", name).as_bytes()).await.unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    /// The relay reaches a real Monero node through Tor. Run inside this
+    /// program: the sandbox is tested with sites. Set TORUS_TEST_NODE to
+    /// choose the node.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "connects to the real Tor network and a public Monero node"]
+    async fn the_relay_reaches_a_monero_node_through_tor() {
+        let (_, dir) = backend("relay");
+        let node = std::env::var("TORUS_TEST_NODE").unwrap_or_else(|_| "xmr-node.cakewallet.com:18081".into());
+        let target = Target::Relay { node, state_dir: dir.join("state"), cache_dir: dir.join("cache"), kept: None, kept_key: Vec::new() };
+        let host = Arc::new(start_inline(target, decoy_site(), None).await.unwrap());
+        let fetcher = torus_wallet::transport::Fetcher::new(move |route, body, limit| {
+            let host = host.clone();
+            async move { host.fetch(&route, body, limit).await }
+        });
+        let daemon = torus_wallet::MoneroDaemon::new(fetcher).await.unwrap();
+        let tip = torus_wallet::monero_wallet::interface::prelude::ProvidesBlockchainMeta::latest_block_number(&daemon).await.unwrap();
+        println!("the chain is at block {tip}");
+        assert!(tip > 3_000_000);
+        // A new wallet reads a few blocks of the real chain.
+        let mut wallet = torus_wallet::Wallet::new(torus_wallet::Keys::generate(), torus_wallet::State::unborn(torus_wallet::Chain::Mainnet));
+        let found = wallet.sync(&daemon, 5).await.unwrap();
+        assert!(found.is_empty());
+        println!("read up to block {}", wallet.state.height());
+    }
+
+    #[tokio::test]
+    async fn a_sites_visitors_reach_the_wallet_through_the_editor() {
+        let mut shop = torus_core::starters::microblog();
+        shop.title = "Shop".into();
+        let host = start_inline(Target::Loopback, shop, None).await.unwrap();
+        let asked: Arc<Mutex<Vec<torus_core::money::Ask>>> = Arc::default();
+        let seen = asked.clone();
+        host.answer_bank_with(Arc::new(move |ask| {
+            seen.lock().unwrap().push(ask.clone());
+            Box::pin(async move {
+                match ask {
+                    torus_core::money::Ask::Purse { .. } => torus_core::money::Told::Purse(torus_core::money::Purse {
+                        address: "8pipedaddress".into(),
+                        balance: 7 * torus_core::money::PER_XMR,
+                        ..Default::default()
+                    }),
+                    torus_core::money::Ask::SiteAddress => torus_core::money::Told::SiteAddress(Some("8site".into())),
+                    _ => torus_core::money::Told::Done,
+                }
+            })
+        }));
+        let address = host.address().to_owned();
+        let body = "name=Ada&_password=correct+horse+battery";
+        let joined = exchange(
+            &address,
+            format!(
+                "POST /_account/signup HTTP/1.1\r\nHost: {{host}}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        let cookie = joined.lines().find_map(|l| l.strip_prefix("set-cookie: ")).and_then(|c| c.split(';').next()).unwrap().to_owned();
+        let account = exchange(&address, format!("GET /account HTTP/1.1\r\nHost: {{host}}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n")).await;
+        assert!(account.contains("<p class=\"balance\">7 XMR</p>"), "{account}");
+        assert!(account.contains("8pipedaddress"));
+        let users = host.records("users").await.unwrap();
+        let asked = asked.lock().unwrap().clone();
+        assert!(asked.contains(&torus_core::money::Ask::Purse { user: users[0].id.clone() }), "{asked:?}");
+    }
+
     #[tokio::test]
     async fn an_inline_host_serves_and_stops() {
         let host = start_inline(Target::Loopback, site("Inline", "served from inside"), None).await.unwrap();

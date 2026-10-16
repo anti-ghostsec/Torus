@@ -147,10 +147,20 @@ fn account_page() -> Page {
             },
             Block::Gate {
                 audience: Audience::Members,
-                blocks: vec![text("You are signed in."), Block::SignOut { submit_label: "Sign out".into() }],
+                // Shows only where the owner has made a Monero wallet.
+                blocks: vec![
+                    text("You are signed in."),
+                    Block::SignOut { submit_label: "Sign out".into() },
+                    Block::Wallet { label: "Your Monero".into() },
+                ],
             },
         ],
     )
+}
+
+/// Gives the author a little Monero. Shows only where the site has a wallet.
+fn tip() -> Block {
+    Block::Tip { amount: "0.01".into(), label: "Tip".into() }
 }
 
 fn members(blocks: Vec<Block>) -> Block {
@@ -242,6 +252,7 @@ pub fn video_site() -> Site {
                     shown("video", 0),
                     shown("title", 1),
                     author(),
+                    tip(),
                     views(),
                     count("likes", "likes"),
                     form("likes", "Like"),
@@ -435,6 +446,7 @@ pub fn microblog() -> Site {
                     shown("picture", 0),
                     count("likes", "likes"),
                     form("likes", "Like"),
+                    tip(),
                     Block::Remove { label: "Delete this post".into() },
                     Block::Divider,
                     heading(2, "Replies"),
