@@ -803,6 +803,28 @@ function renderSettings() {
     );
   }
 
+  // Auto-lock applies to the whole app, not one site, and is saved at once.
+  const lockAfter = el("input") as HTMLInputElement;
+  lockAfter.type = "number";
+  lockAfter.min = "0";
+  lockAfter.max = "1440";
+  void invoke<number>("auto_lock_minutes").then((m) => (lockAfter.value = String(m)));
+  lockAfter.addEventListener("change", async () => {
+    const minutes = Math.max(0, Math.min(1440, Math.round(Number(lockAfter.value) || 0)));
+    lockAfter.value = String(minutes);
+    idleMinutes = minutes;
+    stillHere();
+    try {
+      await invoke("set_auto_lock_minutes", { minutes });
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+  siteHost.append(
+    field("Lock after idle minutes (0 = never)", lockAfter),
+    el("p", "hint", "Applies to the whole app. Panic (the toolbar button, or Ctrl+Shift+Backspace) takes every site offline, locks, and closes at once."),
+  );
+
   // Replaces every page and collection, so it also takes two clicks.
   const kinds: [string, string][] = [["video", "Video site"], ["board", "Anonymous board"], ["microblog", "Microblog"]];
   const kind = el("select");
@@ -1384,6 +1406,8 @@ async function start() {
     }
     for (const entry of entries) entry.site.pages.forEach((p) => withIds(p.blocks));
     lock.hidden = true;
+    idleMinutes = await invoke<number>("auto_lock_minutes");
+    stillHere();
     open(entries[0]);
     window.setInterval(pollTor, 3000);
   });
@@ -1399,17 +1423,41 @@ async function lockNow() {
 }
 $("lock-now").addEventListener("click", lockNow);
 
-// Left alone for ten minutes, the app locks itself.
-const IDLE_MS = 10 * 60 * 1000;
+// Panic: take every site offline, forget the key, and close the app, in one
+// step. The backend does the work, then exits; nothing is left running.
+async function panic() {
+  if (!isTauri()) return;
+  flushSave();
+  try {
+    await invoke("panic");
+  } catch {
+    // Exiting mid-call ends this side too; nothing more to do.
+  }
+}
+$("panic").addEventListener("click", panic);
+// A hotkey unlikely to be pressed by accident, while the window has focus.
+document.addEventListener("keydown", (event) => {
+  if (event.ctrlKey && event.shiftKey && event.key === "Backspace") {
+    event.preventDefault();
+    void panic();
+  }
+});
+
+// Left alone, the app locks itself. How long is the owner's choice, kept in
+// the vault; 0 means never. Ten minutes until they set it otherwise.
+let idleMinutes = 10;
 let idle = 0;
 function stillHere() {
   clearTimeout(idle);
-  idle = window.setTimeout(() => {
-    if ($("lock").hidden) void lockNow();
-  }, IDLE_MS);
+  if (idleMinutes <= 0) return;
+  idle = window.setTimeout(
+    () => {
+      if ($("lock").hidden) void lockNow();
+    },
+    idleMinutes * 60 * 1000,
+  );
 }
 for (const kind of ["pointerdown", "keydown", "dragover"]) document.addEventListener(kind, stillHere, true);
-stillHere();
 
 // A field edit: keep the inspector as it is so typing keeps focus.
 function changed() {
