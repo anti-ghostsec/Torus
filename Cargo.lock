@@ -7240,7 +7240,7 @@ dependencies = [
 
 [[package]]
 name = "torus"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
@@ -7259,7 +7259,7 @@ dependencies = [
 
 [[package]]
 name = "torus-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -7267,7 +7267,7 @@ dependencies = [
 
 [[package]]
 name = "torus-host"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arti-client",
  "libc",
@@ -7285,7 +7285,7 @@ dependencies = [
 
 [[package]]
 name = "torus-host-api"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "serde",
@@ -7298,11 +7298,12 @@ dependencies = [
 
 [[package]]
 name = "torus-onion-key"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
  "ed25519-dalek",
+ "fiat-crypto",
  "getrandom 0.2.17",
  "sha3 0.10.9",
  "zeroize",
@@ -7310,7 +7311,7 @@ dependencies = [
 
 [[package]]
 name = "torus-runtime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -7333,7 +7334,7 @@ dependencies = [
 
 [[package]]
 name = "torus-seal"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.2.17",
@@ -7345,7 +7346,7 @@ dependencies = [
 
 [[package]]
 name = "torus-tor"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arti-client",
  "futures",
@@ -7372,7 +7373,7 @@ dependencies = [
 
 [[package]]
 name = "torus-vault"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "argon2",
  "chacha20poly1305",

@@ -29,7 +29,8 @@ fn site(text: &str) -> Site {
 
 async fn fetch(address: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(address.trim_start_matches("http://")).await?;
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await?;
+    let name = address.trim_start_matches("http://");
+    stream.write_all(format!("GET / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
     let mut out = String::new();
     stream.read_to_string(&mut out).await?;
     Ok(out)
@@ -222,7 +223,7 @@ async fn submissions_are_kept_across_host_restarts() {
     let mut stream = TcpStream::connect(&address).await.unwrap();
     let body = "_next=%2F&name=Persistent+visitor";
     let request = format!(
-        "POST /_form/notes HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /_form/notes HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -262,10 +263,11 @@ async fn the_owner_can_list_and_remove_what_was_added() {
     let host = Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook, None).await.unwrap();
     assert!(host.records("notes").await.unwrap().is_empty());
 
-    let mut stream = TcpStream::connect(host.address().trim_start_matches("http://")).await.unwrap();
+    let name = host.address().trim_start_matches("http://").to_owned();
+    let mut stream = TcpStream::connect(&name).await.unwrap();
     let body = "name=Unwanted";
     let request = format!(
-        "POST /_form/notes HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /_form/notes HTTP/1.1\r\nHost: {name}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -342,4 +344,18 @@ fn a_real_video_is_encoded_afresh_in_the_sandbox() {
     }
     drop(keeper);
     let _ = std::fs::remove_file(made);
+}
+
+/// A page elsewhere cannot read the local preview by pointing a name of its
+/// own at this computer: only requests to the preview's own address are answered.
+#[tokio::test]
+async fn the_local_preview_answers_only_to_its_own_name() {
+    let host = Host::start(Path::new(HOST), None, None, Target::Loopback, site("private draft"), None).await.unwrap();
+    let address = host.address().trim_start_matches("http://").to_owned();
+    assert!(fetch(host.address()).await.unwrap().contains("private draft"));
+    let mut stream = TcpStream::connect(&address).await.unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: attacker.example:80\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).await.unwrap();
+    assert!(answer.starts_with("HTTP/1.1 421") && !answer.contains("private draft"), "{answer}");
 }
