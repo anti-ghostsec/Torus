@@ -22,6 +22,13 @@ pub const SIGN_OUT_PATH: &str = "/_account/signout";
 /// the collection's name and the record's id.
 pub const REMOVE_PATH: &str = "/_remove/";
 pub const APPROVE_PATH: &str = "/_approve/";
+/// A collection's feed is served at this path followed by its name.
+pub const FEED_PATH: &str = "/_feed/";
+/// A puzzle's picture is served at this path followed by its id and `.png`.
+pub const PUZZLE_PATH: &str = "/_puzzle/";
+/// The fields a form's puzzle sends: which puzzle, and the letters typed.
+pub const PUZZLE_FIELD: &str = "_puzzle";
+pub const PUZZLE_ANSWER_FIELD: &str = "_answer";
 /// The query parameters a search box and the page links use.
 pub const SEARCH_PARAM: &str = "q";
 pub const PAGE_PARAM: &str = "p";
@@ -83,6 +90,17 @@ pub trait Data {
     /// pixels the shorter side has, and the copy's file.
     fn sizes(&self, _video: &str) -> Vec<(u32, String)> {
         Vec::new()
+    }
+
+    /// How many times the page at this address has been viewed.
+    fn views(&self, _path: &str) -> u64 {
+        0
+    }
+
+    /// Makes a new puzzle for a form and returns its id, where the site
+    /// can make puzzles.
+    fn puzzle(&self) -> Option<String> {
+        None
     }
 
     /// Whether a video may be shown yet. Where the host encodes every
@@ -215,9 +233,10 @@ pub fn render_page(site: &Site, page: &Page, record: Option<&Record>, data: &dyn
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n\
          <meta name=\"referrer\" content=\"no-referrer\">\n\
-         <title>{} - {}</title>\n<link rel=\"stylesheet\" href=\"{STYLE_PATH}\">\n</head>\n<body>\n",
+         <title>{} - {}</title>\n<link rel=\"stylesheet\" href=\"{STYLE_PATH}\">\n{}</head>\n<body>\n",
         escape(&page.title),
         escape(&site.title),
+        feed_links(site, &page.blocks),
     );
     let view = View {
         site,
@@ -332,6 +351,13 @@ impl View<'_> {
                 Block::Text { text, align } => paragraphs(html, text, *align),
                 Block::Link { label, href, align } => self.link(html, label, href, *align, shown),
                 Block::Divider => html.push_str("<hr>\n"),
+                Block::Feed { collection, label } => {
+                    let _ = writeln!(html, "<p><a class=\"feed\" href=\"{FEED_PATH}{}\">{}</a></p>", escape(collection), escape(label));
+                }
+                Block::Views { align } => {
+                    let count = if self.tagged { 1234 } else { self.data.views(self.here) };
+                    let _ = writeln!(html, "<p{}>{}</p>", class_with(*align, "count"), views_text(count));
+                }
                 Block::Columns { columns } => {
                     html.push_str("<div class=\"columns\">\n");
                     for (column_index, column) in columns.iter().enumerate() {
@@ -782,6 +808,9 @@ impl View<'_> {
             _ => None,
         };
         self.inputs(html, &collection.fields, filled.as_ref());
+        if self.site.moderation.puzzle_collections.contains(&collection.name) {
+            self.puzzle(html);
+        }
         self.close_form(html, submit_label);
         self.progress(html, files);
     }
@@ -836,8 +865,32 @@ impl View<'_> {
         self.open_form(html, &self.upload_address(SIGN_UP_PATH, files), files);
         self.inputs(html, &users.fields, None);
         self.password(html, true);
+        if self.site.moderation.puzzle_sign_up {
+            self.puzzle(html);
+        }
         self.close_form(html, submit_label);
         self.progress(html, files);
+    }
+
+    /// A picture of a few letters, drawn by the site, and a box to type them
+    /// in. Each one can be answered once.
+    fn puzzle(&self, html: &mut String) {
+        if self.tagged {
+            html.push_str("<p class=\"media\">A picture of letters to type in is shown here.</p>\n");
+            return;
+        }
+        match self.data.puzzle() {
+            Some(id) => {
+                let _ = writeln!(
+                    html,
+                    "<p><img class=\"puzzle\" src=\"{PUZZLE_PATH}{id}.png\" width=\"240\" height=\"80\" alt=\"A picture of six letters and digits\"></p>\n\
+                     <input type=\"hidden\" name=\"{PUZZLE_FIELD}\" value=\"{id}\">\n\
+                     <p><label>Type the letters in the picture<br><input type=\"text\" name=\"{PUZZLE_ANSWER_FIELD}\" maxlength=\"12\" \
+                     autocomplete=\"off\" autocapitalize=\"characters\" spellcheck=\"false\" required></label></p>"
+                );
+            }
+            None => html.push_str("<p class=\"empty\">This form needs a picture puzzle that could not be made. Reload the page.</p>\n"),
+        }
     }
 
     fn sign_in(&self, html: &mut String, submit_label: &str) {
@@ -876,6 +929,56 @@ fn paragraphs(html: &mut String, text: &str, align: Align) {
     for paragraph in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
         let _ = writeln!(html, "<p{}>{}</p>", class(align), escape(paragraph).replace('\n', "<br>"));
     }
+}
+
+/// Links in a page's head that let feed readers find the page's feeds.
+fn feed_links(site: &Site, blocks: &[Block]) -> String {
+    fn gather(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            if let Block::Feed { collection, .. } = block {
+                if !out.contains(collection) {
+                    out.push(collection.clone());
+                }
+            }
+            for inner in block.children() {
+                gather(inner, out);
+            }
+        }
+    }
+    let mut feeds = Vec::new();
+    gather(blocks, &mut feeds);
+    feeds
+        .iter()
+        .map(|name| {
+            format!(
+                "<link rel=\"alternate\" type=\"application/rss+xml\" title=\"{} - {}\" href=\"{FEED_PATH}{}\">\n",
+                escape(&site.title),
+                escape(name),
+                escape(name)
+            )
+        })
+        .collect()
+}
+
+/// A view count, said roughly: exact numbers would let someone who watches
+/// the count go up tell when one particular visit happened.
+pub fn views_text(count: u64) -> String {
+    if count < 10 {
+        return "Fewer than 10 views".into();
+    }
+    // Rounded down to tens, and above that to two significant digits.
+    let mut step = 10u64;
+    while count / step >= 100 {
+        step *= 10;
+    }
+    let shown = (count / step) * step;
+    let mut digits = shown.to_string();
+    let mut at = digits.len();
+    while at > 3 {
+        at -= 3;
+        digits.insert(at, ',');
+    }
+    format!("{digits}+ views")
 }
 
 /// Text with simple formatting, as described at [`FieldKind::Formatted`].
@@ -1094,6 +1197,7 @@ fn style(theme: &Theme, root: &str) -> String {
          .search input{{width:auto;min-width:60%}}\n\
          .pager a{{margin-right:1rem}}\n\
          .media{{padding:2rem 1rem;border:1px dashed {muted};border-radius:.4rem;text-align:center}}\n\
+         img.puzzle{{background:#fff;border:1px solid {muted}}}\n\
          pre.code{{overflow:auto;padding:.75rem;border:1px solid {muted};border-radius:.4rem;font:14px/1.5 ui-monospace,monospace;white-space:pre;tab-size:4}}\n\
          textarea.code{{font:14px/1.5 ui-monospace,monospace;white-space:pre;tab-size:4}}\n\
          .formatted code{{font-family:ui-monospace,monospace;font-size:.9em}}\n\
@@ -1107,6 +1211,18 @@ fn style(theme: &Theme, root: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_counts_are_said_roughly() {
+        let said: Vec<String> = [0, 9, 10, 19, 32, 99, 100, 345, 1234, 98_765, 1_234_567].map(views_text).to_vec();
+        assert_eq!(
+            said,
+            [
+                "Fewer than 10 views", "Fewer than 10 views", "10+ views", "10+ views", "30+ views", "90+ views", "100+ views",
+                "340+ views", "1,200+ views", "98,000+ views", "1,200,000+ views",
+            ]
+        );
+    }
     use crate::starters::video_site;
 
     fn text(text: &str) -> Block {

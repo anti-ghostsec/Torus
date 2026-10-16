@@ -60,6 +60,14 @@ fn form_then_open(collection: &str, label: &str) -> Block {
     Block::Form { collection: collection.into(), submit_label: label.into(), open: true, prefill: false }
 }
 
+fn feed(collection: &str, label: &str) -> Block {
+    Block::Feed { collection: collection.into(), label: label.into() }
+}
+
+fn views() -> Block {
+    Block::Views { align: Align::Left }
+}
+
 fn author() -> Block {
     Block::Author { align: Align::Left }
 }
@@ -205,7 +213,12 @@ pub fn video_site() -> Site {
                 HOME_SLUG,
                 "Home",
                 None,
-                vec![heading(1, "Latest videos"), Block::Search { label: "Search".into() }, videos(Scope::All, true)],
+                vec![
+                    heading(1, "Latest videos"),
+                    Block::Search { label: "Search".into() },
+                    videos(Scope::All, true),
+                    feed("videos", "Follow new videos in a feed reader"),
+                ],
             ),
             page(
                 "upload",
@@ -229,6 +242,7 @@ pub fn video_site() -> Site {
                     shown("video", 0),
                     shown("title", 1),
                     author(),
+                    views(),
                     count("likes", "likes"),
                     form("likes", "Like"),
                     shown("description", 0),
@@ -330,6 +344,7 @@ pub fn board() -> Site {
                 ]),
                 heading(2, "Start a thread"),
                 form(&threads, "Post"),
+                feed(&threads, &format!("Follow {title} in a feed reader")),
             ],
         ));
         site.pages.push(page(
@@ -406,6 +421,7 @@ pub fn microblog() -> Site {
                     guests(vec![text("Sign in to post, reply and like."), link("Sign in", "/account")]),
                     Block::Search { label: "Search".into() },
                     Listing::of("posts").with(post()),
+                    feed("posts", "Follow in a feed reader"),
                 ],
             ),
             account_page(),
@@ -497,6 +513,7 @@ pub fn wiki() -> Site {
                         form_then_open("articles", "Create"),
                     ]),
                     guests(vec![text("Sign in to write or edit."), link("Sign in", "/account")]),
+                    feed("articles", "Follow new articles in a feed reader"),
                 ],
             ),
             page(
@@ -507,6 +524,7 @@ pub fn wiki() -> Site {
                     link("All articles", "/"),
                     shown("title", 1),
                     current(),
+                    views(),
                     Block::Divider,
                     members(vec![
                         heading(2, "Edit"),
