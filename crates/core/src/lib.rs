@@ -7,6 +7,7 @@
 mod compile;
 mod lint;
 mod model;
+pub mod money;
 pub mod starters;
 
 pub use compile::{

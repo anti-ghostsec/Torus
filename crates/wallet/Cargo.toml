@@ -1,0 +1,23 @@
+[package]
+name = "torus-wallet"
+description = "The Monero wallet kept in the vault: one per compartment, an account per site, an address per site user"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+monero-wallet = "0.2"
+monero-daemon-rpc = "0.2"
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
+serde.workspace = true
+torus-core.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+hex = { version = "0.4", features = ["serde"] }
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
+torus-host-api.workspace = true

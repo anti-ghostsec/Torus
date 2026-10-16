@@ -29,3 +29,4 @@ torus-seal.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 crc32fast = "1"
 torus-core.workspace = true
+torus-wallet = { path = "../wallet" }
