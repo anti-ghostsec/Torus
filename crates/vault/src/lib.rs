@@ -25,8 +25,9 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = MAGIC.len() + SALT_LEN + 12;
 
-/// Argon2id cost: 64 MiB, 3 passes, 1 lane.
-const DEFAULT_COST: Cost = Cost { memory_kib: 64 * 1024, passes: 3, lanes: 1 };
+/// Argon2id cost: 256 MiB, 3 passes, 1 lane. Each guess at a passphrase
+/// costs an attacker that much memory and time.
+const DEFAULT_COST: Cost = Cost { memory_kib: 256 * 1024, passes: 3, lanes: 1 };
 /// Refuse absurd costs from a corrupt or hostile file instead of exhausting
 /// memory or computing for days.
 const MAX_MEMORY_KIB: u32 = 1024 * 1024;
@@ -107,6 +108,13 @@ impl Vault {
             .decrypt(XNonce::from_slice(nonce), Payload { msg: body, aad: &header })
             .map_err(|_| Error::Locked)?;
         Ok((Self { path: path.to_owned(), header, key: LockedKey::new(key) }, Zeroizing::new(contents)))
+    }
+
+    /// Whether this vault was made with a lower cost than vaults are made
+    /// with now, and so is cheaper to guess passphrases against.
+    pub fn weaker_than_default(&self) -> bool {
+        let word = |at: usize| u32::from_le_bytes(self.header[at..at + 4].try_into().expect("4 bytes"));
+        word(24) < DEFAULT_COST.memory_kib || word(28) < DEFAULT_COST.passes
     }
 
     /// Replaces the vault's contents. The old file stays intact until the new

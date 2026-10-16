@@ -30,3 +30,16 @@ fn editor_made_keys_mean_the_same_address_to_tor() {
         assert_eq!(torus_onion_key::address(&from_tor), torus_tor::address(&from_tor).unwrap());
     }
 }
+
+/// A mined vanity key means, to Tor, exactly the address it was mined for.
+#[test]
+fn mined_keys_mean_the_same_address_to_tor() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let prefix = torus_onion_key::Prefix::new("to").unwrap();
+    for _ in 0..5 {
+        let identity = torus_onion_key::mine(&prefix, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap();
+        let address = torus_tor::address(&identity).unwrap();
+        assert!(address.starts_with("to"), "{address}");
+        assert_eq!(torus_onion_key::address(&identity), address);
+    }
+}
