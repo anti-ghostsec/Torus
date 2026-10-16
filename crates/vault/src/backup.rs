@@ -24,15 +24,15 @@ const MAX_PATH: usize = 4096;
 const MAX_FILE: u64 = 64 * 1024 * 1024 * 1024;
 const CHUNK: usize = 1024 * 1024;
 
-/// Which files, relative to `root`, a backup includes. Everything the app
-/// keeps except the window's throwaway browser-engine folder.
+/// Which files, relative to `root`, a backup includes: everything the app
+/// keeps, so that both the main and any alternate compartment are carried,
+/// except the window's throwaway browser-engine folder and the readable Tor
+/// folders. Carrying every compartment keeps a backup from revealing whether
+/// a second passphrase exists, just as the files on disk do not.
 fn included(root: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
-    let vault = root.join("project.vault");
-    if vault.is_file() {
-        files.push(vault);
-    }
-    gather(root, &root.join("sites"), &mut files)?;
+    gather(root, root, &mut files)?;
+    files.sort();
     Ok(files)
 }
 
@@ -46,15 +46,20 @@ fn gather(root: &Path, at: &Path, out: &mut Vec<std::path::PathBuf>) -> io::Resu
         let path = entry?.path();
         // Links are never followed: a backup holds this app's own files only.
         let kind = fs::symlink_metadata(&path)?.file_type();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        // Left out: the window's throwaway engine folder, and the readable
+        // Tor folders (kept only while a site is online, and rebuilt from
+        // the encrypted copy). Everything else is carried.
+        let skip = rel
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("webview") | Some("state") | Some("cache")));
+        if skip {
+            continue;
+        }
         if kind.is_dir() {
             gather(root, &path, out)?;
         } else if kind.is_file() {
-            // The readable, temporary Tor folders are not part of a backup.
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            let temporary = rel.components().any(|c| matches!(c.as_os_str().to_str(), Some("state") | Some("cache")));
-            if !temporary {
-                out.push(path);
-            }
+            out.push(path);
         }
     }
     Ok(())
