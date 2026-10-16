@@ -78,16 +78,9 @@ async fn a_damaged_key_is_reported_not_served() {
 
 /// The one folder a confined host may use in these tests.
 fn sandbox_folder(container: &str) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        torus_host_api::container_folder(container).unwrap()
-    }
-    #[cfg(not(windows))]
-    {
-        let folder = std::env::temp_dir().join(container);
-        std::fs::create_dir_all(&folder).unwrap();
-        folder
-    }
+    let folder = std::env::temp_dir().join(container);
+    std::fs::create_dir_all(&folder).unwrap();
+    folder
 }
 
 /// Whether this kernel can confine files at all (Landlock). Containers and
@@ -138,7 +131,6 @@ async fn a_confined_host_cannot_open_the_users_files() {
 
     drop(host);
     torus_host_api::remove_container(&container, &[Path::new(HOST)]);
-    #[cfg(not(windows))]
     let _ = std::fs::remove_dir_all(&folder);
     let _ = std::fs::remove_file(secret);
 }
@@ -159,7 +151,7 @@ fn a_converter_can_reach_neither_the_network_nor_files() {
 
     let container = format!("torus.test-conv-{}", std::process::id());
     // Any program will do as the one it may run; this test never converts.
-    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, Path::new(HOST)).unwrap();
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, Path::new(HOST), &sandbox_folder(&container)).unwrap();
     let path = secret.to_string_lossy().into_owned();
     to.write_all(&[torus_host::media::PROBE]).unwrap();
     to.write_all(&u32::from(port).to_le_bytes()).unwrap();
@@ -313,7 +305,7 @@ fn a_real_video_is_encoded_afresh_in_the_sandbox() {
     assert!(video.windows(6).any(|w| w == b"SECRET"));
 
     let container = format!("torus.test-real-{}", std::process::id());
-    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, ffmpeg).unwrap();
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, ffmpeg, &sandbox_folder(&container)).unwrap();
     // A request: re-encode whole (3), then the video in pieces, then the end.
     to.write_all(&[3, 0, 0, 0, 0]).unwrap();
     let sending = std::thread::spawn(move || {

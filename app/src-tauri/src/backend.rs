@@ -291,6 +291,10 @@ impl Backend {
     }
 
     pub fn new(data_dir: PathBuf, tor_dir: PathBuf, host_program: PathBuf) -> Self {
+        // Only this user may look inside, wherever the folder was put.
+        if std::fs::create_dir_all(&data_dir).is_ok() {
+            let _ = torus_host_api::make_private(&data_dir);
+        }
         let backend = Self {
             data_dir,
             tor_dir,
@@ -308,16 +312,13 @@ impl Backend {
     /// because it was killed or the device lost power. What it had packed
     /// away last is still in its encrypted copy.
     fn erase_leftovers(&self) {
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut folders: Vec<PathBuf> = std::fs::read_dir(&self.tor_dir)
+        let folders: Vec<PathBuf> = std::fs::read_dir(&self.tor_dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("site-"))
             .map(|entry| entry.path())
             .collect();
-        #[cfg(windows)]
-        folders.extend(torus_host_api::container_folders(&self.sandbox_prefix).into_iter().map(|folder| folder.join("tor")));
         for site in folders {
             let _ = folder::erase(&site.join("state"));
             let _ = folder::erase(&site.join("cache"));
@@ -431,18 +432,13 @@ impl Backend {
             session.persist()
         })?;
         let _ = std::fs::remove_file(self.kept_tor_path(id)?);
-        match self.container(id) {
-            #[cfg(windows)]
-            Some(container) => {
-                let converter = converter_program(&self.host_program);
-                let mut programs = vec![self.host_program.as_path()];
-                programs.extend(converter.as_deref());
-                torus_host_api::remove_container(&container, &programs);
-            }
-            _ => {
-                let _ = folder::erase(&self.tor_dir.join(format!("site-{id}")));
-            }
+        if let Some(container) = self.container(id) {
+            let converter = converter_program(&self.host_program);
+            let mut programs = vec![self.host_program.as_path()];
+            programs.extend(converter.as_deref());
+            torus_host_api::remove_container(&container, &programs);
         }
+        let _ = folder::erase(&self.site_dir(id)?);
         Ok(())
     }
 
@@ -528,13 +524,9 @@ impl Backend {
     }
 
     /// The one folder a site's host may keep files in: Tor's bookkeeping
-    /// and visitors' encrypted data. On Windows it is the site's sandbox
-    /// folder, the only one a confined host can reach.
+    /// and visitors' encrypted data. Inside this app's own folder, like
+    /// everything else it keeps.
     fn site_dir(&self, id: u32) -> Result<PathBuf, Failure> {
-        #[cfg(windows)]
-        if let Some(container) = self.container(id) {
-            return Ok(torus_host_api::container_folder(&container).map_err(Failure::new)?.join("tor"));
-        }
         Ok(self.tor_dir.join(format!("site-{id}")))
     }
 

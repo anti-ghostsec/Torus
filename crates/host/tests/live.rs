@@ -73,11 +73,7 @@ async fn a_sandboxed_video_site_works_over_tor() {
 
     // Confined wherever the sandbox exists, with all its files inside the container.
     let container = torus_host_api::sandbox_available().then(|| format!("torus.live-{}", std::process::id()));
-    let folder = match &container {
-        #[cfg(windows)]
-        Some(name) => torus_host_api::container_folder(name).unwrap().join("tor"),
-        _ => dir.clone(),
-    };
+    let folder = dir.join("site");
     // A confined process cannot create folders by walking down from the
     // drive, so they are made for it.
     std::fs::create_dir_all(folder.join("state")).unwrap();

@@ -99,17 +99,48 @@ async fn stop(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
     Ok(())
 }
 
+/// Where everything this app keeps lives. On a computer that is one folder,
+/// `TorusData`, beside the program itself, so the app is portable and
+/// leaves nothing in the user's profile or anywhere else. On Android, the
+/// app's private storage, which only it can reach.
+fn data_root(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(mobile)]
+    {
+        Ok(app.path().app_data_dir()?)
+    }
+    #[cfg(desktop)]
+    {
+        let _ = app;
+        let program = std::env::current_exe()?;
+        let beside = program.parent().ok_or("the program has no folder")?;
+        let root = beside.join("TorusData");
+        std::fs::create_dir_all(&root)
+            .map_err(|e| format!("Torus keeps everything in {}, and cannot write there: {e}", root.display()))?;
+        Ok(root)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     torus_host_api::no_crash_dumps();
     tauri::Builder::default()
         .setup(|app| {
-            let paths = app.path();
-            app.manage(Backend::new(
-                paths.app_data_dir()?,
-                paths.app_local_data_dir()?.join("tor"),
-                torus_host_api::host_program()?,
-            ));
+            let root = data_root(app)?;
+            let backend = Backend::new(root.clone(), root.join("sites"), torus_host_api::host_program()?);
+
+            // The window's browser engine keeps its own files in the app's
+            // folder too, never in the user's profile. Its session is private
+            // and left behind by an earlier run is erased.
+            let engine = root.join("webview");
+            let _ = torus_vault::folder::erase(&engine);
+            let builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                .data_directory(engine)
+                .incognito(true)
+                .disable_drag_drop_handler();
+            #[cfg(desktop)]
+            let builder = builder.title("Torus").inner_size(1280.0, 800.0).min_inner_size(960.0, 600.0);
+            builder.build()?;
+            app.manage(backend);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
