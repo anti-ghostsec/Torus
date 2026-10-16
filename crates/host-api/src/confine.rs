@@ -10,35 +10,40 @@
 //! The program that decodes visitors' videos gets a container of its own
 //! with no capability at all: it can reach neither the network nor any
 //! file, and talks to its site's host over one pair of pipes.
+//!
+//! Containers are never registered with Windows. Registering one makes
+//! Windows create a folder for it in the user's profile and an entry in the
+//! registry; instead, a process is started straight into the container's
+//! identity, which follows from its name, and that identity is given access
+//! to one folder the app chooses, inside the app's own folder. Nothing is
+//! written anywhere else.
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, GENERIC_EXECUTE, GENERIC_READ, HANDLE,
+    CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE,
     HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP,
     TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
-    GetAppContainerFolderPath,
+    DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
     CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
 };
-use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -97,41 +102,18 @@ impl Drop for Sid {
 /// The container's identity, creating the container on first use.
 fn container_sid(name: &str) -> io::Result<Sid> {
     let name = wide(OsStr::new(name));
-    let name = PCWSTR(name.as_ptr());
-    unsafe {
-        match CreateAppContainerProfile(name, name, name, None) {
-            Ok(sid) => Ok(Sid(sid)),
-            // It already exists; its identity follows from its name.
-            Err(_) => Ok(Sid(DeriveAppContainerSidFromAppContainerName(name)?)),
-        }
-    }
+    // Derived, not registered: no profile folder and no registry entry.
+    unsafe { Ok(Sid(DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr()))?)) }
 }
 
-/// The one folder a container may write to. Windows creates it with the container.
-pub fn container_folder(name: &str) -> io::Result<PathBuf> {
-    let sid = container_sid(name)?;
-    unsafe {
-        let mut text = PWSTR::null();
-        ConvertSidToStringSidW(sid.0, &mut text)?;
-        let folder = GetAppContainerFolderPath(PCWSTR(text.0));
-        LocalFree(Some(HLOCAL(text.0.cast())));
-        let folder = folder?;
-        let path = PathBuf::from(OsString::from_wide(folder.as_wide()));
-        CoTaskMemFree(Some(folder.0.cast()));
-        Ok(path)
-    }
-}
-
-/// Removes a container and everything in its folder, and takes back its
-/// permission to run `programs`.
+/// Takes back a container's permission to run `programs`. Its folder is
+/// the caller's to erase. A profile registered by an older version of this
+/// app, if there is one, is removed as well.
 pub fn remove_container(name: &str, programs: &[&Path]) {
     if let Ok(sid) = container_sid(name) {
         for program in programs {
-            change_access(program, &sid, REVOKE_ACCESS);
+            change_access(program, &sid, REVOKE_ACCESS, false);
         }
-    }
-    if let Ok(folder) = container_folder(name) {
-        let _ = std::fs::remove_dir_all(folder);
     }
     let name = wide(OsStr::new(name));
     unsafe {
@@ -139,16 +121,79 @@ pub fn remove_container(name: &str, programs: &[&Path]) {
     }
 }
 
+/// Lets the container use one folder and everything that will be in it.
+fn allow_folder(folder: &Path, sid: &Sid) -> io::Result<()> {
+    if change_access(folder, sid, GRANT_ACCESS, true) {
+        Ok(())
+    } else {
+        Err(io::Error::other("could not give the sandbox its folder"))
+    }
+}
+
+/// Makes a folder readable and writable by the user running this program
+/// alone: inherited permissions are cut off, so neither other accounts nor
+/// sandboxes that every app package may use can look inside, wherever the
+/// folder sits.
+pub fn make_private(folder: &Path) -> io::Result<()> {
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::Security::Authorization::SET_ACCESS;
+    use windows::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        let token = Handle(token);
+        let mut size = 0u32;
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut size);
+        let mut buffer = vec![0u8; size as usize];
+        GetTokenInformation(token.0, TokenUser, Some(buffer.as_mut_ptr().cast()), size, &mut size)?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: PWSTR(user.User.Sid.0.cast()),
+                ..Default::default()
+            },
+        };
+        let mut acl: *mut ACL = null_mut();
+        if SetEntriesInAclW(Some(&[entry]), None, &mut acl) != ERROR_SUCCESS {
+            return Err(io::Error::other("could not describe the folder's permissions"));
+        }
+        let path = wide(folder.as_os_str());
+        let set = SetNamedSecurityInfoW(
+            PCWSTR(path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl),
+            None,
+        );
+        LocalFree(Some(HLOCAL(acl.cast())));
+        if set != ERROR_SUCCESS {
+            return Err(io::Error::other("could not make the folder private"));
+        }
+        Ok(())
+    }
+}
+
 /// Lets the container read and run the host program, which it could not
 /// otherwise open. Best effort: an installed copy already allows this and
 /// may not let us change it.
 fn allow_running(program: &Path, sid: &Sid) {
-    change_access(program, sid, GRANT_ACCESS);
+    change_access(program, sid, GRANT_ACCESS, false);
 }
 
-/// Grants the container read and run access to a file, or takes away every
-/// permission the container was given on it.
-fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE) {
+/// Grants the container access to a file or folder, or takes away every
+/// permission the container was given on it. On a folder (`inherit`), the
+/// container may read and write it and everything put in it; on a file, it
+/// may read and run it. Returns whether the change was made.
+fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE, inherit: bool) -> bool {
+    use windows::Win32::Security::SUB_CONTAINERS_AND_OBJECTS_INHERIT;
     let path = wide(program.as_os_str());
     let path = PCWSTR(path.as_ptr());
     unsafe {
@@ -165,12 +210,17 @@ fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE) {
             &mut descriptor,
         );
         if read != ERROR_SUCCESS {
-            return;
+            return false;
         }
+        let rights = match (mode == GRANT_ACCESS, inherit) {
+            (false, _) => 0,
+            (true, true) => GENERIC_ALL.0,
+            (true, false) => (GENERIC_READ | GENERIC_EXECUTE).0,
+        };
         let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: if mode == GRANT_ACCESS { (GENERIC_READ | GENERIC_EXECUTE).0 } else { 0 },
+            grfAccessPermissions: rights,
             grfAccessMode: mode,
-            grfInheritance: NO_INHERITANCE,
+            grfInheritance: if inherit { SUB_CONTAINERS_AND_OBJECTS_INHERIT } else { NO_INHERITANCE },
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
@@ -179,8 +229,9 @@ fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE) {
             },
         };
         let mut updated: *mut ACL = null_mut();
+        let mut changed = false;
         if SetEntriesInAclW(Some(&[entry]), Some(current), &mut updated) == ERROR_SUCCESS {
-            let _ = SetNamedSecurityInfoW(
+            changed = SetNamedSecurityInfoW(
                 path,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
@@ -188,10 +239,11 @@ fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE) {
                 None,
                 Some(updated),
                 None,
-            );
+            ) == ERROR_SUCCESS;
             LocalFree(Some(HLOCAL(updated.cast())));
         }
         LocalFree(Some(HLOCAL(descriptor.0)));
+        changed
     }
 }
 
@@ -280,12 +332,13 @@ fn pipe(child_reads: bool) -> io::Result<(Handle, Handle)> {
 }
 
 /// Starts `program` confined, returning our ends of its input and output.
-pub(crate) fn spawn(program: &Path, container: &str, terms: Terms<'_>) -> io::Result<(File, File, Confined)> {
+/// `folder` is the one place it may keep files; it is made if need be.
+pub(crate) fn spawn(program: &Path, container: &str, folder: &Path, terms: Terms<'_>) -> io::Result<(File, File, Confined)> {
     let step = |what: &str, e: io::Error| io::Error::other(format!("{what}: {e}"));
-    let sid = container_sid(container).map_err(|e| step("creating the container", e))?;
-    let folder = container_folder(container).map_err(|e| step("finding the container's folder", e))?;
+    let sid = container_sid(container).map_err(|e| step("naming the container", e))?;
     let temp = folder.join("tmp");
     std::fs::create_dir_all(&temp).map_err(|e| step("preparing the container's folder", e))?;
+    allow_folder(folder, &sid).map_err(|e| step("giving the container its folder", e))?;
     allow_running(program, &sid);
     for other in &terms.run {
         allow_running(other, &sid);

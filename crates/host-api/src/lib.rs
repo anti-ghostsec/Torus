@@ -202,13 +202,14 @@ fn confined(program: &Path, sandbox: &Sandbox<'_>, converter: Option<&Path>) -> 
             give: vec![reads, writes],
             run: vec![converter],
         };
-        let (_, _, process) = confine::spawn(program, &converter_container(container), its).map_err(failed)?;
+        let room = sandbox.folder.join("converter");
+        let (_, _, process) = confine::spawn(program, &converter_container(container), &room, its).map_err(failed)?;
         keeper.push(Box::new(process));
         let (reads, writes) = &link.host;
         terms.tell.push((CONVERTER_LINK, format!("{},{}", reads.number(), writes.number()).into()));
         terms.give = vec![reads, writes];
     }
-    let (stdin, stdout, process) = confine::spawn(program, container, terms).map_err(failed)?;
+    let (stdin, stdout, process) = confine::spawn(program, container, sandbox.folder, terms).map_err(failed)?;
     keeper.push(Box::new(process));
     // Our copies of the pipe ends close here, so each side notices when the other is gone.
     drop(link);
@@ -313,7 +314,12 @@ fn confined(_program: &Path, _sandbox: &Sandbox<'_>, _converter: Option<&Path>) 
 /// For checking the confinement itself.
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn converter_alone(program: &Path, container: &str, converter: &Path) -> io::Result<(std::fs::File, std::fs::File, Keeper)> {
+pub fn converter_alone(
+    program: &Path,
+    container: &str,
+    converter: &Path,
+    folder: &Path,
+) -> io::Result<(std::fs::File, std::fs::File, Keeper)> {
     use std::os::windows::io::{FromRawHandle, IntoRawHandle};
     let link = confine::link()?;
     let (reads, writes) = &link.converter;
@@ -328,7 +334,7 @@ pub fn converter_alone(program: &Path, container: &str, converter: &Path) -> io:
         give: vec![reads, writes],
         run: vec![converter],
     };
-    let (_, _, process) = confine::spawn(program, &converter_container(container), terms)?;
+    let (_, _, process) = confine::spawn(program, &converter_container(container), folder, terms)?;
     let confine::Link { host: (ours_reads, ours_writes), converter: theirs } = link;
     drop(theirs);
     // SAFETY: the handles are ours alone and are given away exactly once.
@@ -343,7 +349,12 @@ pub fn converter_alone(program: &Path, container: &str, converter: &Path) -> io:
 /// For checking the confinement itself.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[doc(hidden)]
-pub fn converter_alone(program: &Path, _container: &str, converter: &Path) -> io::Result<(std::fs::File, std::fs::File, Keeper)> {
+pub fn converter_alone(
+    program: &Path,
+    _container: &str,
+    converter: &Path,
+    _folder: &Path,
+) -> io::Result<(std::fs::File, std::fs::File, Keeper)> {
     let (ours_reads, converter_writes) = unix_pipe()?;
     let (converter_reads, ours_writes) = unix_pipe()?;
     let mut programs: Vec<&Path> = SYSTEM_READS.iter().map(Path::new).collect();
@@ -434,8 +445,7 @@ impl Host {
     /// Starts `program` and waits until it is serving `site`.
     ///
     /// With `sandbox` set, the process runs confined, able to keep files in
-    /// the sandbox's folder only; see [`container_folder`] for that folder
-    /// on Windows.
+    /// the sandbox's folder only.
     ///
     /// With `converter` set to a video converter's program, and only when
     /// confined, pictures and smaller copies are made from uploaded videos,
@@ -665,39 +675,33 @@ pub fn sandbox_available() -> bool {
     cfg!(any(windows, target_os = "linux", target_os = "android"))
 }
 
-/// The only folder a confined host may keep files in, created on first use.
-#[cfg(windows)]
-pub fn container_folder(container: &str) -> io::Result<PathBuf> {
-    confine::container_folder(container)
-}
-
-/// Removes a container and everything a host kept in it, and takes back
-/// its permission to run `programs`.
+/// Takes back a container's permission to run `programs`. What its host
+/// kept is in the folder the caller gave it, the caller's to erase.
 #[cfg(windows)]
 pub fn remove_container(container: &str, programs: &[&Path]) {
     confine::remove_container(&converter_container(container), programs);
     confine::remove_container(container, programs);
 }
 
-/// The folders of every container whose name starts with `prefix`, for
-/// clearing out what a host left behind when it could not tidy up.
-#[cfg(windows)]
-pub fn container_folders(prefix: &str) -> Vec<PathBuf> {
-    let Some(packages) = std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Packages")) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(packages) else { return Vec::new() };
-    entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
-        .map(|entry| entry.path().join("AC"))
-        .collect()
+/// Makes a folder readable and writable by this user alone, whatever the
+/// folder it sits in allows.
+pub fn make_private(folder: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        confine::make_private(folder)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = folder;
+        Ok(())
+    }
 }
 
-#[cfg(not(windows))]
-pub fn container_folder(_container: &str) -> io::Result<PathBuf> {
-    Err(io::ErrorKind::Unsupported.into())
-}
 
 #[cfg(not(windows))]
 pub fn remove_container(_container: &str, _programs: &[&Path]) {}

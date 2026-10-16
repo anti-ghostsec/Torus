@@ -1,7 +1,7 @@
 {
   "name": "torus",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "bundle": "node scripts/prepare-bundle.mjs && tauri build --config src-tauri/tauri.bundle.conf.json",
     "bundle:windows": "node scripts/prepare-bundle.mjs x86_64-pc-windows-gnu && tauri build --target x86_64-pc-windows-gnu --config src-tauri/tauri.bundle.conf.json",
-    "bundle:android": "node scripts/prepare-android.mjs && tauri android build --target aarch64 --apk"
+    "bundle:android": "node scripts/prepare-android.mjs && tauri android build --target aarch64 --apk",
+    "portable:windows": "node scripts/package-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

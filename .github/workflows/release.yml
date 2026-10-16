@@ -1,4 +1,4 @@
-# Builds the Windows installer and the Android app and publishes them as a
+# Builds the portable Windows app and the Android app and publishes them as a
 # GitHub release. Runs when a version tag (v1.2.3) is pushed, or by hand.
 #
 # To sign the Android app with your own key, add these repository secrets:
@@ -75,9 +75,9 @@ jobs:
         working-directory: app
         run: npm ci
 
-      - name: Windows installer
+      - name: Windows (portable)
         working-directory: app
-        run: npm run bundle:windows
+        run: npm run portable:windows
 
       - name: Android app
         working-directory: app
@@ -112,15 +112,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          INSTALLER=$(find target/x86_64-pc-windows-gnu/release/bundle/nsis -name '*-setup.exe' | head -1)
-          cp "$INSTALLER" "Torus_${TAG#v}_x64-setup.exe"
-          sha256sum "Torus_${TAG#v}_x64-setup.exe" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
+          cp target/portable/Torus_*_windows_portable.zip "Torus_${TAG#v}_windows_portable.zip"
+          sha256sum "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
           cat > notes.md <<'NOTES'
-          **Windows:** run `Torus_*_x64-setup.exe`. The installer is not code-signed, so Windows SmartScreen warns the first time: choose "More info", then "Run anyway".
+          **Windows (portable):** unzip `Torus_*_windows_portable.zip` anywhere on an NTFS drive and run `Torus\torus.exe`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus\TorusData`. It is not code-signed, so Windows SmartScreen warns the first time: choose "More info", then "Run anyway".
 
           **Android (64-bit ARM):** install `Torus_*_arm64.apk`. Android asks to allow installing apps from this source.
 
           Every site's host runs in a sandbox, every uploaded video is encoded afresh before anyone can watch it (up to 10 GB), and nothing is left readable on disk without the passphrase. Check downloads against `SHA256SUMS.txt`.
           NOTES
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "Torus $TAG" --notes-file notes.md --target "$GITHUB_SHA"
-          gh release upload "$TAG" "Torus_${TAG#v}_x64-setup.exe" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
+          gh release upload "$TAG" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
