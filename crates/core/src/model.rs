@@ -33,6 +33,39 @@ pub struct Site {
     /// How much room visitors' files may take on the device hosting the site.
     #[serde(default)]
     pub limits: Limits,
+    /// How the site is moderated: blocked words, and whether new accounts
+    /// wait for approval.
+    #[serde(default)]
+    pub moderation: Moderation,
+}
+
+/// The owner's standing rules for what visitors may add.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Moderation {
+    /// Words that may not appear in what visitors submit. Matched without
+    /// regard to case, as whole words and as parts of words.
+    pub blocked_words: Vec<String>,
+    /// What to do with a submission that contains a blocked word: refuse it
+    /// outright, or hold it for the owner or a moderator to approve.
+    #[serde(default)]
+    pub blocked_held: bool,
+    /// Whether a new account must be approved before it can sign in.
+    pub approve_accounts: bool,
+}
+
+impl Moderation {
+    /// The blocked words that actually constrain anything: non-empty, lowercased.
+    pub fn words(&self) -> impl Iterator<Item = String> + '_ {
+        self.blocked_words.iter().map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty())
+    }
+
+    /// Whether `text` contains any blocked word. Matching folds case and
+    /// looks inside words, so "scam" catches "Scams".
+    pub fn blocks(&self, text: &str) -> bool {
+        let lower = text.to_lowercase();
+        self.words().any(|word| lower.contains(&word))
+    }
 }
 
 /// How much room visitors' files may take. The owner sets these to what

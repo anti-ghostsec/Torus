@@ -58,6 +58,7 @@ fn guestbook() -> Site {
         accounts: false,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
     };
     check(&site).unwrap();
     site

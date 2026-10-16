@@ -54,6 +54,8 @@ type Site = {
   seal_key?: string | null;
   // How much room visitors' files may take, in megabytes.
   limits?: { video_mb: number; storage_mb: number; sizes?: boolean; shrink?: boolean };
+  // Blocked words, and whether new accounts wait for approval.
+  moderation?: { blocked_words: string[]; blocked_held?: boolean; approve_accounts?: boolean };
 };
 // A record as the running site stores it.
 type Stored = { id: string; fields: Record<string, string>; held?: boolean };
@@ -775,6 +777,31 @@ function renderSettings() {
       "Every uploaded video is encoded afresh, in a sandbox with no network and no files, before anyone can watch it: nothing the camera or phone recorded about it survives. Large videos take a while to appear. Leave room for twice the largest video while one is being prepared.",
     ),
   );
+
+  // Moderation: blocked words, and approval of new accounts.
+  const mod = (site.moderation ??= { blocked_words: [] });
+  const words = el("textarea") as HTMLTextAreaElement;
+  words.rows = 3;
+  words.placeholder = "one word per line";
+  words.value = mod.blocked_words.join("\n");
+  words.addEventListener("change", () => {
+    mod.blocked_words = words.value.split("\n").map((w) => w.trim()).filter(Boolean);
+    words.value = mod.blocked_words.join("\n");
+  });
+  siteHost.append(field("Blocked words", words));
+  siteHost.append(
+    field(
+      "Hold blocked posts for approval",
+      toggle(mod.blocked_held ?? false, (v) => (mod.blocked_held = v)),
+    ),
+    el("p", "hint", "Off: a post containing a blocked word is refused. On: it is kept out of sight until you approve it. Matching ignores case and looks inside words."),
+  );
+  if (site.accounts) {
+    siteHost.append(
+      field("New accounts need approval", toggle(mod.approve_accounts ?? false, (v) => (mod.approve_accounts = v))),
+      el("p", "hint", "A new account cannot sign in until you approve it under its collection's “Show what visitors added”."),
+    );
+  }
 
   // Replaces every page and collection, so it also takes two clicks.
   const kinds: [string, string][] = [["video", "Video site"], ["board", "Anonymous board"], ["microblog", "Microblog"]];

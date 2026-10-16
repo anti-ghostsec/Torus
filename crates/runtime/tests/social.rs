@@ -187,6 +187,7 @@ async fn a_sealed_collection_cannot_be_read_by_the_site_itself() {
         accounts: false,
         seal_key: Some(torus_seal::to_hex(&torus_seal::public_key(&secret).unwrap())),
         limits: Default::default(),
+        moderation: Default::default(),
         collections: vec![Collection {
             name: "tips".into(),
             fields: vec![Field { name: "message".into(), label: "Message".into(), kind: FieldKind::LongText, required: true }],
@@ -251,6 +252,7 @@ async fn old_text_in_a_field_that_became_a_file_field_cannot_name_a_file_to_dele
         accounts: false,
         seal_key: None,
         limits: Default::default(),
+        moderation: Default::default(),
         collections: vec![Collection {
             name: "notes".into(),
             fields: vec![Field { name: "note".into(), label: "Note".into(), kind, required: true }],
@@ -430,4 +432,43 @@ async fn a_flood_of_sign_ins_does_not_stop_members_posting() {
     )
     .await;
     assert_eq!(posted.status, 303, "{}", posted.text());
+}
+
+
+/// A blocked word is refused outright, or held for approval; and an account
+/// that must be approved cannot sign in until it is.
+#[tokio::test]
+async fn moderation_blocks_words_and_holds_new_accounts() {
+    let mut site = microblog();
+    site.moderation.blocked_words = vec!["spam".into()];
+    let (addr, live) = start(site.clone()).await;
+    let (ada, token) = join(addr, "Ada").await;
+    let text = |body: &'static str| [Part::Text("_token", &token), Part::Text("_next", "/"), Part::Text("text", body)];
+
+    // A post with a blocked word (case-folded, inside a word) is refused.
+    assert_eq!(upload(addr, "/_form/posts", Some(&ada), &text("a friendly hello")).await.status, 303);
+    assert_eq!(upload(addr, "/_form/posts", Some(&ada), &text("SPAMMY offer")).await.status, 400, "a blocked word was posted");
+
+    // Held instead of refused: kept, waiting, not shown to a guest.
+    site.moderation.blocked_held = true;
+    live.publish(site.clone());
+    assert!(upload(addr, "/_form/posts", Some(&ada), &text("more spam here")).await.text().contains("once it has been approved"));
+    assert!(!get(addr, "/", None).await.text().contains("more spam here"), "a held post showed to a guest");
+
+    // With approval on, a new account is held and cannot sign in yet.
+    site.moderation.approve_accounts = true;
+    live.publish(site);
+    let joined = post(addr, torus_core::SIGN_UP_PATH, None, &[("name", "newcomer"), ("_password", "correct horse battery")]).await;
+    assert!(joined.text().contains("once it has been approved"), "{}", joined.text());
+    assert!(joined.cookie().is_none(), "a held account was given a session");
+    let tried = post(addr, torus_core::SIGN_IN_PATH, None, &[("name", "newcomer"), ("_password", "correct horse battery")]).await;
+    assert_eq!(tried.status, 400);
+    assert!(tried.cookie().is_none());
+
+    // Once approved, the account can sign in.
+    let account = live.records("users").into_iter().find(|u| u.fields["name"] == "newcomer").unwrap().id;
+    assert!(live.approve("users", &account));
+    let ok = post(addr, torus_core::SIGN_IN_PATH, None, &[("name", "newcomer"), ("_password", "correct horse battery")]).await;
+    assert_eq!(ok.status, 303, "{}", ok.text());
+    assert!(ok.cookie().is_some());
 }
