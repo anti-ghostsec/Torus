@@ -386,3 +386,27 @@ h2:first-child {
   margin: 0;
   padding: 2px 7px;
 }
+
+/* The Monero wallet, under the whole site's settings. */
+.wallet h4 {
+  margin: 1rem 0 0.25rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+.wallet .balance {
+  margin: 0.5rem 0 0.25rem;
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+.wallet input[readonly] {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+}
+.wallet .hint {
+  overflow-wrap: anywhere;
+}
+.wallet button {
+  margin: 0.25rem 0.25rem 0.25rem 0;
+}

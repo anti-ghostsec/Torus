@@ -260,6 +260,7 @@ impl Ledger {
 
     /// Pays `price` from `user` to `to` for `key`, unless it is already
     /// open to them. `days` makes it last that many days from `today`.
+    #[allow(clippy::too_many_arguments)]
     pub fn unlock(&mut self, site: &str, user: &str, to: &Party, key: &str, price: Piconero, days: Option<u64>, today: u64) -> Result<bool, Refused> {
         let book = self.sites.get(site).ok_or(Refused::NoSuchSite)?;
         if book.has_unlocked(user, key, today) {

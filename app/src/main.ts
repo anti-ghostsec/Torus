@@ -31,6 +31,10 @@ type Block = { id: string } & (
   | { type: "author"; align: Align }
   | { type: "sign_up" | "sign_in" | "sign_out"; submit_label: string }
   | { type: "gate"; audience: "members" | "guests"; blocks: Block[] }
+  | { type: "wallet"; label: string }
+  | { type: "donate"; label: string }
+  | { type: "tip"; amount: string; label: string }
+  | { type: "paid"; price: string; label: string; days: number; blocks: Block[] }
 );
 type BlockType = Block["type"];
 type Field = {
@@ -96,6 +100,10 @@ const LABELS: Record<BlockType, string> = {
   approve: "Approve button for moderators",
   feed: "Feed for feed readers",
   views: "View count",
+  wallet: "Monero: visitor's wallet",
+  donate: "Monero: donations",
+  tip: "Monero: tip button",
+  paid: "Monero: paid content",
 };
 
 // Editing aids layered over the published stylesheet. Nothing here is published.
@@ -112,6 +120,8 @@ main.empty::before{content:"Drag a block here";display:block;padding:2rem;text-a
 article.empty::before{content:"Drag blocks here: they repeat for every record";display:block;padding:.75rem;text-align:center;opacity:.6}
 .gate{min-height:3rem;outline:1px dotted #8888;outline-offset:2px;border-radius:6px}
 .gate.empty::before{content:"Drag blocks here: only some visitors see them";display:block;padding:.75rem;text-align:center;opacity:.6}
+.paid{min-height:3rem;outline:1px dotted #8888;outline-offset:2px}
+.paid.empty::after{content:"Drag blocks here: only those who paid see them";display:block;padding:.75rem;text-align:center;opacity:.6}
 .marker{height:0;outline:2px solid #9b5fb8;pointer-events:none}
 `;
 
@@ -218,6 +228,17 @@ function create(type: BlockType): Block {
     case "gate":
       enableAccounts();
       return { id, type, audience: "members", blocks: [] };
+    case "wallet":
+      enableAccounts();
+      return { id, type, label: "Your Monero" };
+    case "donate":
+      return { id, type, label: "Support this site" };
+    case "tip":
+      enableAccounts();
+      return { id, type, amount: "0.01", label: "Tip" };
+    case "paid":
+      enableAccounts();
+      return { id, type, price: "0.05", label: "Pay to see this", days: 0, blocks: [] };
   }
 }
 
@@ -245,6 +266,8 @@ function blankSite(title: string): Site {
 type Entry = { id: number; site: Site; address: string | null };
 let entries: Entry[] = [{ id: 0, site: blankSite("My onion site"), address: null }];
 let current = entries[0];
+// The same, where a local name hides it.
+const editing = () => current;
 // The site being edited.
 let site = current.site;
 let pageIndex = 0;
@@ -275,7 +298,7 @@ const page = () => site.pages[pageIndex];
 // The lists of blocks a block holds: a column each, or a list's repeated blocks.
 function childLists(block: Block): Block[][] {
   if (block.type === "columns") return block.columns;
-  if (block.type === "list" || block.type === "gate") return [block.blocks];
+  if (block.type === "list" || block.type === "gate" || block.type === "paid") return [block.blocks];
   return [];
 }
 
@@ -697,6 +720,51 @@ function renderInspector() {
         ),
       );
       break;
+    case "wallet":
+      inspector.append(
+        field("Heading", textInput(block.label, (v) => (block.label = v))),
+        el(
+          "p",
+          "hint",
+          "Shows a signed-in visitor what they hold on this site, their own Monero address to add to it (with a QR code for phone wallets), and a form to withdraw. What they hold can be spent on this site with one click: tips and paid content. Put it on the account page.",
+        ),
+      );
+      break;
+    case "donate":
+      inspector.append(
+        field("Heading", textInput(block.label, (v) => (block.label = v))),
+        el("p", "hint", "The site's own Monero address, for anyone to give to, and for signed-in visitors a way to give from what they hold. It goes to what the site has earned."),
+      );
+      break;
+    case "tip":
+      inspector.append(
+        field("Amount in XMR", textInput(block.amount, (v) => (block.amount = v))),
+        field("Button label", textInput(block.label, (v) => (block.label = v))),
+        el("p", "hint", "One click gives this much, from what the visitor holds, to whoever added the record shown here (or to the site, where no record is shown). Nothing reaches the chain: it only moves between them."),
+      );
+      break;
+    case "paid": {
+      const days = el("input") as HTMLInputElement;
+      days.type = "number";
+      days.min = "0";
+      days.max = "3650";
+      days.value = String(block.days);
+      days.addEventListener("input", () => {
+        block.days = Math.max(0, Math.min(3650, Math.round(Number(days.value) || 0)));
+        changed();
+      });
+      inspector.append(
+        field("Price in XMR", textInput(block.price, (v) => (block.price = v))),
+        field("Words above the button", textInput(block.label, (v) => (block.label = v))),
+        field("Days it lasts (0: once, for good)", days),
+        el(
+          "p",
+          "hint",
+          "What you drag inside is shown only to visitors who paid. The payment goes to whoever added the record shown here, or to the site. With days set, it is a pass: a membership of the site, or on someone's profile page, a subscription to them, opening everything they have behind a pass.",
+        ),
+      );
+      break;
+    }
     case "divider":
   }
   if (block.type === "link" && found.record) {
@@ -1038,16 +1106,209 @@ function renderSettings() {
   siteHost.append(starter);
 
   siteHost.append(addressMiner());
+  siteHost.append(walletBox());
 
   // Deleting a site destroys its onion key, so it takes two deliberate clicks.
   const erase = el("button", "", "Delete site");
   erase.disabled = entries.length < 2;
-  erase.addEventListener("click", () => {
+  erase.addEventListener("click", async () => {
     if (erase.dataset.armed) return void deleteCurrent();
     erase.dataset.armed = "1";
-    erase.textContent = "Click again: erases the site and its address forever";
+    const held = await invoke<number>("wallet_held_by", { id: editing().id }).catch(() => 0);
+    erase.textContent = held
+      ? `Click again: erases the site and its address forever. The ${xmr(held)} it and its users hold becomes yours`
+      : "Click again: erases the site and its address forever";
   });
   siteHost.append(erase);
+}
+
+// Monero
+
+type WalletSummary = {
+  address: string;
+  node: string | null;
+  own: number;
+  spendable: number;
+  arriving: number;
+  owed: number;
+  height: number;
+  tip: number | null;
+  trouble: string | null;
+  sites: { site: number; address: string; earned: number; users: number; held_by_users: number; daily_limit: number }[];
+};
+type RestoreKeys = { address: string; spend_key: string; view_key: string; height: number };
+
+const PER_XMR = 1_000_000_000_000;
+// Whole piconero, printed without rounding.
+function xmr(amount: number) {
+  const whole = Math.floor(amount / PER_XMR);
+  const part = String(amount % PER_XMR).padStart(12, "0").replace(/0+$/, "");
+  return part ? `${whole}.${part} XMR` : `${whole} XMR`;
+}
+
+let walletTimer = 0;
+
+function walletBox() {
+  const box = el("div", "wallet");
+  box.append(el("h3", "", "Monero"));
+  const body = el("div");
+  box.append(body);
+  const plain = (text: string) => el("p", "hint", text);
+  const input = (placeholder: string, secret = false) => {
+    const node = el("input") as HTMLInputElement;
+    node.placeholder = placeholder;
+    node.autocomplete = "off";
+    node.spellcheck = false;
+    if (secret) node.type = "password";
+    return node;
+  };
+  const show = async () => {
+    clearTimeout(walletTimer);
+    let summary: WalletSummary | null = null;
+    try {
+      summary = await invoke<WalletSummary | null>("wallet");
+    } catch {
+      return;
+    }
+    if (!box.isConnected) return;
+    body.replaceChildren();
+    if (!summary) {
+      const make = el("button", "", "Make a wallet");
+      make.addEventListener("click", async () => {
+        try {
+          await invoke("wallet_create");
+          void show();
+        } catch (error) {
+          showFailure(error);
+        }
+      });
+      body.append(
+        plain(
+          "One wallet for all your sites, kept in the vault. Each site's signed-in visitors get their own address in it: what they send is theirs to tip, pay for content and withdraw, with one click on the site. Tips and payments between them never touch the chain.",
+        ),
+        plain("This is new: use small amounts until you have seen it work for you."),
+        make,
+      );
+      return;
+    }
+    // The node.
+    const node = input("an onion address and port, such as …onion:18089");
+    node.value = summary.node ?? "";
+    const setNode = el("button", "", "Use this node");
+    setNode.addEventListener("click", async () => {
+      try {
+        await invoke("wallet_node", { node: node.value });
+        note = "Reaching the node through Tor. The first time, that takes a few minutes.";
+        showStatus();
+        void show();
+      } catch (error) {
+        showFailure(error);
+      }
+    });
+    const state = summary.trouble
+      ? `Cannot reach the node: ${summary.trouble}`
+      : !summary.node
+        ? "Choose a Monero node for the wallet to read the chain from. It is reached only through Tor; one you run yourself is best, since a node sees which blocks are asked for and which payments are sent."
+        : summary.tip === null
+          ? "Reaching the node through Tor…"
+          : summary.height < summary.tip
+            ? `Reading the chain: block ${summary.height} of ${summary.tip}.`
+            : `Up to date at block ${summary.tip}.`;
+    body.append(field("Monero node", node), setNode, plain(state));
+
+    // The owner's own account.
+    body.append(
+      el("p", "balance", `Yours: ${xmr(summary.own)}`),
+      plain(`The wallet holds ${xmr(summary.spendable)} that can be spent now${summary.arriving ? ` and ${xmr(summary.arriving)} still settling` : ""}; ${xmr(summary.owed)} of it is owed to you, your sites and their users.`),
+      field("Your own address", Object.assign(input(""), { value: summary.address, readOnly: true })),
+    );
+    const to = input("a Monero address");
+    const amount = input("XMR, or nothing for all of it");
+    const send = el("button", "", "Send");
+    send.addEventListener("click", async () => {
+      if (!send.dataset.armed) {
+        send.dataset.armed = "1";
+        send.textContent = `Click again: send ${amount.value.trim() ? `${amount.value.trim()} XMR` : "all of yours"} out of the wallet`;
+        return;
+      }
+      send.disabled = true;
+      try {
+        const [sent, fee] = await invoke<[number, number]>("wallet_send", { address: to.value, amount: amount.value || null });
+        note = `Sent ${xmr(sent)}, and ${xmr(fee)} to the network as its fee.`;
+        showStatus();
+        void show();
+      } catch (error) {
+        showFailure(error);
+        send.disabled = false;
+      }
+    });
+    body.append(el("h4", "", "Send from yours"), field("To", to), field("Amount", amount), send);
+
+    // This site's books.
+    const mine = summary.sites.find((s) => s.site === current.id);
+    body.append(el("h4", "", "This site"));
+    if (!mine) {
+      body.append(plain("Nothing yet: the site's books open when a visitor first uses a Monero block."));
+    } else {
+      const collect = el("button", "", "Move earnings to yours");
+      collect.disabled = mine.earned === 0;
+      collect.addEventListener("click", async () => {
+        try {
+          await invoke("wallet_collect", { id: current.id, amount: null });
+          void show();
+        } catch (error) {
+          showFailure(error);
+        }
+      });
+      const limit = input("XMR per day");
+      limit.value = xmr(mine.daily_limit).replace(" XMR", "");
+      const setLimit = el("button", "", "Set limit");
+      setLimit.addEventListener("click", async () => {
+        try {
+          await invoke("wallet_limit", { id: current.id, amount: limit.value });
+          note = "Limit set.";
+          showStatus();
+        } catch (error) {
+          showFailure(error);
+        }
+      });
+      body.append(
+        plain(`Earned: ${xmr(mine.earned)}. ${mine.users} visitors hold ${xmr(mine.held_by_users)} in all.`),
+        collect,
+        field("Withdrawals by this site's visitors, together, per day", limit),
+        setLimit,
+        plain(
+          "The site's host process faces the network. Were it ever taken over, this limit is the most it could take out of the wallet in a day, and only from what this site's visitors hold: never from yours.",
+        ),
+        plain(`Donations go to the site's own address: ${mine.address}`),
+      );
+    }
+
+    // Restoring elsewhere.
+    const pass = input("this vault's passphrase", true);
+    const reveal = el("button", "", "Show the wallet's keys");
+    const keys = el("div");
+    reveal.addEventListener("click", async () => {
+      try {
+        const k = await invoke<RestoreKeys>("wallet_keys", { passphrase: pass.value });
+        pass.value = "";
+        keys.replaceChildren(
+          plain("Whoever sees these has the coins. Write them down on paper; never put them in a file, a photo or a message."),
+          field("Address", Object.assign(input(""), { value: k.address, readOnly: true })),
+          field("Secret spend key", Object.assign(input(""), { value: k.spend_key, readOnly: true })),
+          field("Secret view key", Object.assign(input(""), { value: k.view_key, readOnly: true })),
+          plain(`Restore height: ${k.height}. Any Monero wallet (Feather, Cake, the official one) can be restored from these: choose to restore from keys.`),
+        );
+        setTimeout(() => keys.replaceChildren(), 120_000);
+      } catch (error) {
+        showFailure(error);
+      }
+    });
+    body.append(el("h4", "", "Back up"), plain("The vault's backup has the wallet in it. To move the coins elsewhere without Torus, restore the wallet from its keys."), field("Passphrase", pass), reveal, keys);
+    walletTimer = window.setTimeout(() => void show(), 20_000);
+  };
+  void show();
+  return box;
 }
 
 // Choosing an address
