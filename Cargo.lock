@@ -7270,6 +7270,7 @@ name = "torus-host"
 version = "0.1.0"
 dependencies = [
  "arti-client",
+ "libc",
  "rustls",
  "tokio",
  "tor-rtcompat",

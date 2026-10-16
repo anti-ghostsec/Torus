@@ -209,3 +209,18 @@ async fn records_survive_a_restart_and_are_unreadable_on_disk() {
     assert!(get(again, "/").await.contains("<h3>Remembered</h3>"));
     let _ = std::fs::remove_file(&file);
 }
+
+/// A full collection refuses more instead of deleting what is already
+/// there, so flooding a site cannot wipe it.
+#[tokio::test]
+async fn a_full_collection_keeps_what_it_has() {
+    let live = Live::new(guestbook());
+    let addr = start(live.clone()).await;
+    assert_eq!(status(&post(addr, "/_form/notes", "name=first").await), "303");
+    // Fill it to the limit directly; over HTTP the per-minute limit would take hours.
+    for n in 1..5_000 {
+        live.add_for_test("notes", &format!("filler {n}"));
+    }
+    assert_eq!(status(&post(addr, "/_form/notes", "name=one+too+many").await), "507");
+    assert!(live.records("notes").iter().any(|r| r.fields["name"] == "first"), "the oldest was pushed out");
+}
