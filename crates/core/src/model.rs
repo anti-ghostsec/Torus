@@ -52,6 +52,13 @@ pub struct Moderation {
     pub blocked_held: bool,
     /// Whether a new account must be approved before it can sign in.
     pub approve_accounts: bool,
+    /// Collections a visitor may add to only after typing the letters in a
+    /// picture the site draws: a brake on scripts that flood a form.
+    #[serde(default)]
+    pub puzzle_collections: Vec<String>,
+    /// Whether signing up needs the same.
+    #[serde(default)]
+    pub puzzle_sign_up: bool,
 }
 
 impl Moderation {
@@ -361,6 +368,11 @@ pub enum Block {
     },
     /// Lets a member remove the record being shown, if they added it.
     Remove { label: String },
+    /// A link to a feed of a collection's newest records, for feed readers.
+    Feed { collection: String, label: String },
+    /// How often this page has been viewed, roughly. Nothing about who
+    /// viewed it, or when, is kept: only how many times.
+    Views { align: Align },
     /// Lets a moderator approve the record being shown, while it is
     /// waiting for that. Nobody else sees it.
     Approve { label: String },

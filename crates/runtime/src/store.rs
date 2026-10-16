@@ -116,7 +116,14 @@ struct State {
     /// Per uploaded video, what has been made from it.
     #[serde(default)]
     made: BTreeMap<String, Made>,
+    /// How many times each page with a view count has been viewed. Only the
+    /// number: nothing about who viewed it, or when.
+    #[serde(default)]
+    views: BTreeMap<String, u64>,
 }
+
+/// How many views are counted before the counts are written out on their own.
+const VIEWS_PER_WRITE: u32 = 50;
 
 pub struct Store {
     state: State,
@@ -128,6 +135,9 @@ pub struct Store {
     budgets: [(Instant, u32); 3],
     /// Whether uploaded videos are encoded afresh before anyone sees them.
     pub(crate) hold_videos: bool,
+    /// Views counted since the counts were last written out.
+    unsaved_views: u32,
+    pub(crate) puzzles: std::sync::Mutex<crate::puzzle::Puzzles>,
 }
 
 /// What is waiting to be written, shared with the writing thread.
@@ -237,6 +247,8 @@ impl Store {
             memory: BTreeMap::new(),
             budgets: [(Instant::now(), 0); 3],
             hold_videos: false,
+            unsaved_views: 0,
+            puzzles: std::sync::Mutex::new(crate::puzzle::Puzzles::new()),
         }
     }
 
@@ -266,6 +278,8 @@ impl Store {
             memory: BTreeMap::new(),
             budgets: [(Instant::now(), 0); 3],
             hold_videos: false,
+            unsaved_views: 0,
+            puzzles: std::sync::Mutex::new(crate::puzzle::Puzzles::new()),
         })
     }
 
@@ -364,6 +378,9 @@ impl Store {
                 let more = self.state.records.get(&other.name).into_iter().flatten().filter(hangs_on);
                 doomed.extend(more.map(|r| (other.name.clone(), r.id.clone())));
             }
+            // A removed record's page leaves no count behind.
+            let suffix = format!("/{id}");
+            self.state.views.retain(|path, _| !path.ends_with(&suffix));
             if collection == USERS {
                 self.state.moderators.remove(&id);
                 self.state.passwords.remove(&id);
@@ -374,6 +391,17 @@ impl Store {
             let _ = self.persist();
         }
         found
+    }
+
+    /// Counts one view of the page at `path`. Written out with the next
+    /// change, or every so many views, rather than once per view.
+    pub(crate) fn count_view(&mut self, path: &str) {
+        *self.state.views.entry(path.to_owned()).or_default() += 1;
+        self.unsaved_views += 1;
+        if self.unsaved_views >= VIEWS_PER_WRITE {
+            self.unsaved_views = 0;
+            let _ = self.persist();
+        }
     }
 
     /// Deletes a file this server stored, and whatever was made from it.
@@ -637,6 +665,14 @@ impl Data for Seen<'_> {
         self.store.find(collection, id).filter(|record| self.everything || !record.held)
     }
 
+    fn views(&self, path: &str) -> u64 {
+        self.store.views(path)
+    }
+
+    fn puzzle(&self) -> Option<String> {
+        self.store.puzzle()
+    }
+
     fn still(&self, video: &str) -> Option<String> {
         self.store.still(video)
     }
@@ -653,6 +689,14 @@ impl Data for Seen<'_> {
 impl Data for Store {
     fn visit(&self, collection: &str, each: &mut dyn FnMut(&Record)) {
         self.state.records.get(collection).into_iter().flatten().for_each(each);
+    }
+
+    fn views(&self, path: &str) -> u64 {
+        self.state.views.get(path).copied().unwrap_or(0)
+    }
+
+    fn puzzle(&self) -> Option<String> {
+        self.puzzles.lock().unwrap_or_else(|e| e.into_inner()).make()
     }
 
     fn find(&self, collection: &str, id: &str) -> Option<Record> {

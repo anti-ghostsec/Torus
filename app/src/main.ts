@@ -25,6 +25,8 @@ type Block = { id: string } & (
   | { type: "count"; collection: string; label: string; align: Align }
   | { type: "remove"; label: string }
   | { type: "approve"; label: string }
+  | { type: "feed"; collection: string; label: string }
+  | { type: "views"; align: Align }
   | { type: "field"; field: string; level: number; align: Align; preview: boolean }
   | { type: "author"; align: Align }
   | { type: "sign_up" | "sign_in" | "sign_out"; submit_label: string }
@@ -61,7 +63,13 @@ type Site = {
   // How much room visitors' files may take, in megabytes.
   limits?: { video_mb: number; storage_mb: number; sizes?: boolean; shrink?: boolean };
   // Blocked words, and whether new accounts wait for approval.
-  moderation?: { blocked_words: string[]; blocked_held?: boolean; approve_accounts?: boolean };
+  moderation?: {
+    blocked_words: string[];
+    blocked_held?: boolean;
+    approve_accounts?: boolean;
+    puzzle_collections?: string[];
+    puzzle_sign_up?: boolean;
+  };
 };
 // A record as the running site stores it.
 type Stored = { id: string; fields: Record<string, string>; held?: boolean };
@@ -86,6 +94,8 @@ const LABELS: Record<BlockType, string> = {
   count: "Count of records",
   remove: "Delete-my-own button",
   approve: "Approve button for moderators",
+  feed: "Feed for feed readers",
+  views: "View count",
 };
 
 // Editing aids layered over the published stylesheet. Nothing here is published.
@@ -187,6 +197,10 @@ function create(type: BlockType): Block {
     case "approve":
       enableAccounts();
       return { id, type, label: "Approve" };
+    case "feed":
+      return { id, type, collection: someCollection(), label: "Follow in a feed reader" };
+    case "views":
+      return { id, type, align: "left" };
     case "field":
       return { id, type, field: "", level: 0, align: "left", preview: false };
     case "author":
@@ -644,6 +658,27 @@ function renderInspector() {
         el("p", "hint", "Only moderators see this, and only on a record that is waiting for approval. Turn on waiting in the collection's settings."),
       );
       break;
+    case "feed":
+      inspector.append(
+        field("Shows", collectionChoice(block.collection, (v) => (block.collection = v))),
+        field("Link words", textInput(block.label, (v) => (block.label = v))),
+        el(
+          "p",
+          "hint",
+          "A link to an RSS feed of the newest 30 records, for readers such as Thunderbird or Newsboat. Feed readers also find it on their own. Records carry no time, so neither does the feed. Only collections with a feed block anywhere have a feed.",
+        ),
+      );
+      break;
+    case "views":
+      inspector.append(
+        alignField(block),
+        el(
+          "p",
+          "hint",
+          "How often this page has been viewed, said roughly (\"30+ views\"), so nobody can tell when one particular visit happened. Only the number is kept: no addresses, browsers, cookies or times. On a template page, each record has its own count.",
+        ),
+      );
+      break;
     case "sign_up":
     case "sign_in":
     case "sign_out":
@@ -810,6 +845,12 @@ function renderSettings() {
     siteHost.append(
       field("New accounts need approval", toggle(mod.approve_accounts ?? false, (v) => (mod.approve_accounts = v))),
       el("p", "hint", "A new account cannot sign in until you approve it under its collection's “Show what visitors added”."),
+      field("Picture puzzle on sign-up", toggle(mod.puzzle_sign_up ?? false, (v) => (mod.puzzle_sign_up = v))),
+      el(
+        "p",
+        "hint",
+        "New accounts must type the letters in a picture the site draws. It works without scripts and stops scripts that flood any form they find, but not someone set on reading the pictures by machine. Visitors who cannot see the picture cannot pass it. Collections can ask for one too, in their settings.",
+      ),
     );
   }
 
@@ -1051,22 +1092,32 @@ function pollMining() {
 function addressMiner() {
   const box = el("div", "miner");
   const wanted = el("input");
-  wanted.placeholder = "e.g. torus";
-  wanted.maxLength = 12;
+  wanted.placeholder = "e.g. torus, anonsite, anonpost";
   wanted.spellcheck = false;
   const estimate = el("p", "hint");
   const progress = el("p", "hint");
   const start = el("button", "", "Find this address");
   const use = el("button", "", "Use this address");
-  use.hidden = true;
-  const guess = (letters: number, perSecond: number) => duration(Math.pow(32, letters) / perSecond);
+  const keep = el("button", "", "Save it for later");
+  use.hidden = keep.hidden = true;
   // A first guess before any search has run: a little over a million keys a second per processor.
   const typical = 1_500_000 * Math.max(1, (navigator.hardwareConcurrency || 2) - 1);
+  const words = () =>
+    wanted.value
+      .toLowerCase()
+      .split(/[\s,]+/)
+      .filter(Boolean);
   const explain = () => {
-    const text = wanted.value.trim().toLowerCase();
-    if (!text) return void (estimate.textContent = "Letters a to z and digits 2 to 7. Each letter makes it about 32 times longer to find.");
-    if (/[^a-z2-7]/.test(text)) return void (estimate.textContent = "Only a to z and 2 to 7 can appear in an onion address (no 0, 1, 8 or 9).");
-    estimate.textContent = `On this device, "${text}" takes about ${guess(text.length, typical)} to find, on average. It could be sooner or later.`;
+    const list = words();
+    if (list.length === 0) {
+      return void (estimate.textContent =
+        "Letters a to z and digits 2 to 7. Each letter makes it about 32 times longer to find. List several, separated by commas, and the first one found is kept.");
+    }
+    const bad = list.find((w) => /[^a-z2-7]/.test(w));
+    if (bad) return void (estimate.textContent = `"${bad}": only a to z and 2 to 7 can appear in an onion address (no 0, 1, 8 or 9).`);
+    const tries = 1 / list.reduce((sum, w) => sum + Math.pow(32, -w.length), 0);
+    const which = list.length > 1 ? `one of these ${list.length}` : `"${list[0]}"`;
+    estimate.textContent = `On this device, ${which} takes about ${duration(tries / typical)} to find, on average. It could be sooner or later.`;
   };
   wanted.addEventListener("input", explain);
   explain();
@@ -1076,22 +1127,22 @@ function addressMiner() {
     if (!mine) {
       start.textContent = "Find this address";
       progress.textContent = status ? "Another site's address is being searched for." : "";
-      use.hidden = true;
+      use.hidden = keep.hidden = true;
       return;
     }
     if (mine.found) {
       start.textContent = "Search again";
       progress.textContent = `Found: ${mine.found}`;
-      use.hidden = false;
+      use.hidden = keep.hidden = false;
       return;
     }
     start.textContent = "Stop";
     const chance = 1 - Math.exp(-mine.tried / mine.expected);
     const left = Math.max(0, mine.expected - mine.tried) / Math.max(1, mine.per_second);
     progress.textContent =
-      `Searching for "${mine.prefix}" on ${mine.threads} processors: ${(mine.per_second / 1e6).toFixed(1)} million keys a second, ` +
+      `Searching for ${mine.prefix} on ${mine.threads} processors: ${(mine.per_second / 1e6).toFixed(1)} million keys a second, ` +
       `${(mine.tried / 1e6).toFixed(0)} million tried. ${Math.round(chance * 100)}% of searches this long have found it; about ${duration(left)} to go on average. ` +
-      "It keeps going while the app is open.";
+      "It keeps going while the app is open, even locked. Closing the app stops it.";
   };
 
   start.addEventListener("click", async () => {
@@ -1109,26 +1160,148 @@ function addressMiner() {
     }
   });
 
-  use.addEventListener("click", async () => {
-    // Replacing an address loses the old one for good: two clicks.
-    if (current.address && !use.dataset.armed) {
-      use.dataset.armed = "1";
-      use.textContent = `Click again: ${current.address} stops working forever`;
-      return;
+  // Giving a site another address: the old one is kept among the saved ones.
+  const replaced = (button: HTMLButtonElement, label: string) => {
+    if (current.address && !button.dataset.armed) {
+      button.dataset.armed = "1";
+      button.textContent = `Click again: replaces ${current.address} (it is kept under Saved addresses)`;
+      return false;
     }
+    delete button.dataset.armed;
+    button.textContent = label;
+    return true;
+  };
+
+  use.addEventListener("click", async () => {
+    if (!replaced(use, "Use this address")) return;
     try {
       current.address = await invoke<string>("mine_use", { id: current.id, replace: Boolean(current.address) });
-      use.hidden = true;
-      delete use.dataset.armed;
-      use.textContent = "Use this address";
+      use.hidden = keep.hidden = true;
       progress.textContent = `This site's address is now ${current.address}. Publish it to Tor to put it online there.`;
       showStatus();
+      void listSaved();
     } catch (error) {
       showFailure(error);
     }
   });
 
-  box.append(field("Choose the address's first letters", wanted), estimate, start, use, progress);
+  keep.addEventListener("click", async () => {
+    try {
+      const address = await invoke<string>("mine_save");
+      use.hidden = keep.hidden = true;
+      progress.textContent = `Saved ${address}. It is kept in the vault until you use or forget it.`;
+      void listSaved();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+
+  // Saved addresses: kept in the vault, for any site, or to move elsewhere.
+  const saved = el("div", "saved");
+  const filePass = el("input") as HTMLInputElement;
+  filePass.type = "password";
+  filePass.autocomplete = "off";
+  filePass.placeholder = "at least 10 characters";
+  const needPass = () => {
+    if (filePass.value.length >= 10) return true;
+    showFailure({ message: "Type a passphrase of at least 10 characters for the address file first." } as Failure);
+    return false;
+  };
+  const exportAddress = async (address: string) => {
+    if (!needPass()) return;
+    const file = await saveDialog({
+      defaultPath: `${address.slice(0, 16)}.toruskey`,
+      filters: [{ name: "Torus address", extensions: ["toruskey"] }],
+    });
+    if (!file) return;
+    try {
+      await invoke("export_key", { address, file, passphrase: filePass.value });
+      filePass.value = "";
+      note = "Address file saved. Anyone with it and its passphrase can run a site at that address.";
+      showStatus();
+    } catch (error) {
+      showFailure(error);
+    }
+  };
+  async function listSaved() {
+    let addresses: string[] = [];
+    try {
+      addresses = await invoke<string[]>("saved_addresses");
+    } catch {
+      return;
+    }
+    saved.replaceChildren();
+    if (current.address) {
+      const row = el("div", "record");
+      const out = el("button", "", "Export");
+      out.addEventListener("click", () => void exportAddress(current.address!));
+      row.append(el("span", "", `This site: ${current.address}`), out);
+      saved.append(row);
+    }
+    if (addresses.length === 0) saved.append(el("p", "hint", "No saved addresses."));
+    for (const address of addresses) {
+      const row = el("div", "record");
+      const take = el("button", "", "Use for this site");
+      take.addEventListener("click", async () => {
+        if (!replaced(take, "Use for this site")) return;
+        try {
+          current.address = await invoke<string>("use_saved", { id: current.id, address, replace: Boolean(current.address) });
+          showStatus();
+          void listSaved();
+        } catch (error) {
+          showFailure(error);
+        }
+      });
+      const out = el("button", "", "Export");
+      out.addEventListener("click", () => void exportAddress(address));
+      const forget = el("button", "", "Forget");
+      forget.addEventListener("click", async () => {
+        if (!forget.dataset.armed) {
+          forget.dataset.armed = "1";
+          forget.textContent = "Click again: gone for good";
+          return;
+        }
+        await invoke("forget_saved", { address }).catch(showFailure);
+        void listSaved();
+      });
+      row.append(el("span", "", address), take, out, forget);
+      saved.append(row);
+    }
+  }
+  const bring = el("button", "", "Import an address file");
+  bring.addEventListener("click", async () => {
+    if (!filePass.value) return showFailure({ message: "Type the file's passphrase first, then import." } as Failure);
+    const file = await openDialog({ filters: [{ name: "Torus address", extensions: ["toruskey"] }] });
+    if (!file || Array.isArray(file)) return;
+    try {
+      const address = await invoke<string>("import_key", { file, passphrase: filePass.value });
+      filePass.value = "";
+      note = `Imported ${address}. It is under Saved addresses.`;
+      showStatus();
+      void listSaved();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+
+  box.append(
+    field("Choose the address's first letters", wanted),
+    estimate,
+    start,
+    use,
+    keep,
+    progress,
+    el("h3", "", "Saved addresses"),
+    saved,
+    field("Address file passphrase", filePass),
+    bring,
+    el(
+      "p",
+      "hint",
+      "An address file holds an address's secret key, sealed with the passphrase above. Whoever has the file and the passphrase can run a site at that address, and so can whoever made it: never use an address someone else found for you.",
+    ),
+  );
+  void listSaved();
   void invoke<MineStatus | null>("mine_status").then((status) => {
     mineView?.(status);
     if (status && !status.found) pollMining();
@@ -1150,8 +1323,11 @@ function renameCollection(collection: Collection, name: string) {
   collection.name = name;
   for (const p of site.pages) if (p.template === old) p.template = name;
   everyBlock((block) => {
-    if ((block.type === "form" || block.type === "list") && block.collection === old) block.collection = name;
+    const named = block.type === "form" || block.type === "list" || block.type === "count" || block.type === "feed";
+    if (named && block.collection === old) block.collection = name;
   });
+  const mod = site.moderation;
+  if (mod?.puzzle_collections) mod.puzzle_collections = mod.puzzle_collections.map((n) => (n === old ? name : n));
 }
 
 function unusedName(wanted: string, taken: string[]) {
@@ -1202,6 +1378,14 @@ function renderCollections() {
         field("One per member, like a vote or a like", flag(collection.once_each, (v) => (collection.once_each = v))),
         field("Sealed: only you can read it, not even the site", flag(collection.sealed, (v) => (collection.sealed = v))),
         field("Hold new entries until approved", flag(collection.review ?? false, (v) => (collection.review = v))),
+        field(
+          "Picture puzzle before adding",
+          flag((site.moderation?.puzzle_collections ?? []).includes(collection.name), (v) => {
+            const mod = (site.moderation ??= { blocked_words: [] });
+            const others = (mod.puzzle_collections ?? []).filter((n) => n !== collection.name);
+            mod.puzzle_collections = v ? [...others, collection.name] : others;
+          }),
+        ),
       );
     }
 
