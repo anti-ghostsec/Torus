@@ -1,0 +1,126 @@
+# Builds the Windows installer and the Android app and publishes them as a
+# GitHub release. Runs when a version tag (v1.2.3) is pushed, or by hand.
+#
+# To sign the Android app with your own key, add these repository secrets:
+#   ANDROID_KEYSTORE_BASE64  the keystore file, base64-encoded
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+# Without them the APK is signed with a throwaway key made for that run, so a
+# later release cannot be installed over it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      NDK_VERSION: 29.0.14206865
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules
+          df -h /
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nsis nasm yasm pkg-config autoconf automake libtool
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu aarch64-linux-android
+
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Video converter (FFmpeg) for Windows and Android
+        run: |
+          tools/ffmpeg/build.sh windows
+          tools/ffmpeg/build.sh android
+          rm -rf tools/ffmpeg/.work
+
+      - name: Front end
+        working-directory: app
+        run: npm ci
+
+      - name: Windows installer
+        working-directory: app
+        run: npm run bundle:windows
+
+      - name: Android app
+        working-directory: app
+        run: |
+          chmod +x src-tauri/gen/android/gradlew
+          npm run bundle:android
+
+      - name: Sign the Android app
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/37.0.0"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+          else
+            echo "::warning::No signing key in the repository secrets; using a throwaway key."
+            KEYSTORE_PASSWORD=$(openssl rand -hex 16)
+            KEY_ALIAS=torus
+            keytool -genkeypair -keystore release.jks -alias "$KEY_ALIAS" -keyalg RSA -keysize 4096 \
+              -validity 10000 -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -dname "CN=Torus"
+          fi
+          APK=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*release-unsigned.apk' | head -1)
+          "$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks release.jks --ks-key-alias "$KEY_ALIAS" --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --out "Torus_${TAG#v}_arm64.apk" aligned.apk
+          "$BT/apksigner" verify "Torus_${TAG#v}_arm64.apk"
+          rm -f release.jks aligned.apk
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INSTALLER=$(find target/x86_64-pc-windows-gnu/release/bundle/nsis -name '*-setup.exe' | head -1)
+          cp "$INSTALLER" "Torus_${TAG#v}_x64-setup.exe"
+          sha256sum "Torus_${TAG#v}_x64-setup.exe" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
+          cat > notes.md <<'NOTES'
+          **Windows:** run `Torus_*_x64-setup.exe`. The installer is not code-signed, so Windows SmartScreen warns the first time: choose "More info", then "Run anyway".
+
+          **Android (64-bit ARM):** install `Torus_*_arm64.apk`. Android asks to allow installing apps from this source.
+
+          Every site's host runs in a sandbox, every uploaded video is encoded afresh before anyone can watch it (up to 10 GB), and nothing is left readable on disk without the passphrase. Check downloads against `SHA256SUMS.txt`.
+          NOTES
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "Torus $TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          gh release upload "$TAG" "Torus_${TAG#v}_x64-setup.exe" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
