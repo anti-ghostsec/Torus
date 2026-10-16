@@ -135,6 +135,15 @@ impl Tor {
         Ok(Self { client, known: Mutex::default() })
     }
 
+    /// Opens a connection through Tor to `host` (an onion address or a name
+    /// on the open internet) at `port`. Onion addresses are always allowed:
+    /// a Monero node reached that way never learns where the wallet is.
+    pub async fn open(&self, host: &str, port: u16) -> Result<arti_client::DataStream, Error> {
+        let mut prefs = arti_client::StreamPrefs::new();
+        prefs.connect_to_onion_services(tor_config::BoolOrAuto::Explicit(true));
+        self.client.connect_with_prefs((host, port), &prefs).await.map_err(|e| err("could not reach the node through Tor", e))
+    }
+
     /// Starts serving `live` at the address of `identity`. `name` tells this
     /// app's services apart and never leaves the machine; it must stay paired
     /// with the same identity for as long as this connection lives.

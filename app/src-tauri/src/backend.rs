@@ -22,6 +22,8 @@ use torus_core::{check, lint, render_canvas, Canvas, Finding, Site};
 use torus_host_api::{Host, Records, Sandbox, Target};
 use torus_onion_key::Identity;
 use torus_vault::{folder, Vault};
+
+use crate::money::{StoredMoney, Treasury};
 use zeroize::Zeroizing;
 
 /// What the vault file holds once decrypted.
@@ -41,6 +43,9 @@ struct Payload {
     /// on a site. None of them is any site's address now.
     #[serde(default)]
     saved: Vec<Vec<u8>>,
+    /// The Monero wallet, once one has been made.
+    #[serde(default)]
+    money: Option<StoredMoney>,
     // Vaults written before multiple sites existed held exactly one.
     #[serde(default, skip_serializing)]
     site: Option<Site>,
@@ -112,6 +117,7 @@ struct Session {
     next_id: u32,
     auto_lock_minutes: u32,
     saved: Vec<Identity>,
+    money: Option<StoredMoney>,
 }
 
 impl Session {
@@ -133,6 +139,7 @@ impl Session {
             next_id: self.next_id,
             auto_lock_minutes: self.auto_lock_minutes,
             saved: self.saved.iter().map(|key| key.to_vec()).collect(),
+            money: self.money.clone(),
             ..Payload::default()
         };
         let mut bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
@@ -286,6 +293,47 @@ pub struct MineStatus {
 
 type Slot = Arc<tokio::sync::Mutex<Option<Hosted>>>;
 
+/// Saves the wallet into the open vault.
+fn keep_money(session: Arc<Mutex<Option<Session>>>) -> crate::money::Keep {
+    Arc::new(move |stored| {
+        let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
+        let session = session.as_mut().ok_or("The vault is locked.")?;
+        session.money = Some(stored);
+        session.persist().map_err(|e| e.message)
+    })
+}
+
+/// Starts the relay: a sandboxed host that reaches the node through Tor
+/// and is told nothing secret. Its folder is the open compartment's.
+fn reach_node(tor_dir: &Path, host_program: &Path, prefix: &str, decoy: Arc<AtomicBool>) -> crate::money::Reach {
+    let (tor_dir, program, container) = (tor_dir.to_owned(), host_program.to_owned(), format!("{prefix}-relay"));
+    Arc::new(move |node, tor_key| {
+        let decoy = decoy.load(Ordering::Relaxed);
+        let sites = if decoy { tor_dir.with_file_name("alt-sites") } else { tor_dir.clone() };
+        let (program, container) = (program.clone(), if decoy { format!("{container}-alt") } else { container.clone() });
+        Box::pin(async move {
+            if !torus_host_api::sandbox_available() {
+                return Err("This system cannot confine the program that faces the network, so the wallet cannot reach a node here.".to_owned());
+            }
+            let dir = sites.join("relay");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let target = Target::Relay {
+                node,
+                state_dir: dir.join("state"),
+                cache_dir: dir.join("cache"),
+                kept: Some(dir.join("tor-state.bin")),
+                kept_key: tor_key.to_vec(),
+            };
+            let sandbox = Sandbox { name: &container, folder: &dir };
+            let host = Arc::new(Host::start(&program, Some(sandbox), None, target, decoy_site(), None).await?);
+            Ok(torus_wallet::transport::Fetcher::new(move |route, body, limit| {
+                let host = host.clone();
+                async move { host.fetch(&route, body, limit).await }
+            }))
+        })
+    })
+}
+
 pub struct Backend {
     /// Holds the vault file, and the encrypted copies of Tor's bookkeeping.
     data_dir: PathBuf,
@@ -294,10 +342,12 @@ pub struct Backend {
     host_program: PathBuf,
     /// Sandboxes are named after this plus the site's number.
     sandbox_prefix: String,
-    session: Mutex<Option<Session>>,
+    session: Arc<Mutex<Option<Session>>>,
     /// Which compartment is open: false is the main one, true the decoy.
     /// It decides which vault file and which site folders are in use.
-    decoy: std::sync::atomic::AtomicBool,
+    decoy: Arc<AtomicBool>,
+    /// The open compartment's Monero wallet.
+    treasury: Arc<Treasury>,
     /// The local test server, and the site it serves.
     local: tokio::sync::Mutex<Option<(u32, Host)>>,
     /// One slot per site, each locked on its own: starting one site, which
@@ -357,18 +407,32 @@ impl Backend {
         Host::start(&self.host_program, sandbox, converter.as_deref(), target, site, records).await
     }
 
+    /// Answers a site's questions to the wallet: those of site `id` only.
+    fn banker(&self, id: u32) -> torus_host_api::Banker {
+        let treasury = self.treasury.clone();
+        Arc::new(move |ask| {
+            let treasury = treasury.clone();
+            Box::pin(async move { treasury.ask(id, ask).await })
+        })
+    }
+
     pub fn new(data_dir: PathBuf, tor_dir: PathBuf, host_program: PathBuf) -> Self {
         // Only this user may look inside, wherever the folder was put.
         if std::fs::create_dir_all(&data_dir).is_ok() {
             let _ = torus_host_api::make_private(&data_dir);
         }
+        let session: Arc<Mutex<Option<Session>>> = Arc::default();
+        let decoy: Arc<AtomicBool> = Arc::default();
+        let sandbox_prefix = "torus.site".to_owned();
+        let treasury = Treasury::new(keep_money(session.clone()), reach_node(&tor_dir, &host_program, &sandbox_prefix, decoy.clone()));
         let backend = Self {
             data_dir,
             tor_dir,
             host_program,
-            sandbox_prefix: "torus.site".into(),
-            session: Mutex::new(None),
-            decoy: std::sync::atomic::AtomicBool::new(false),
+            sandbox_prefix,
+            session,
+            decoy,
+            treasury,
             local: Default::default(),
             hosted: Default::default(),
             mining: Mutex::new(None),
@@ -629,7 +693,7 @@ impl Backend {
         // sets a decoy passphrase, so its presence reveals nothing.
         self.make_blank_alt()?;
         self.decoy.store(false, Ordering::Relaxed);
-        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new() };
+        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new(), money: None };
         session.add(site);
         session.persist()?;
         let listed = session.listed();
@@ -693,7 +757,11 @@ impl Backend {
         }
         let next_id = sites.iter().map(|e| e.id + 1).max().unwrap_or(1).max(payload.next_id);
         let saved = payload.saved.into_iter().map(identity_from).collect::<Result<Vec<_>, _>>()?;
-        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved };
+        let money = payload.money.take();
+        if let Err(e) = self.treasury.load(money.as_ref()) {
+            return Err(Failure::new(e));
+        }
+        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money };
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
         Ok(listed)
@@ -701,6 +769,7 @@ impl Backend {
 
     /// Forgets the vault's key and everything decrypted with it.
     pub fn lock(&self) {
+        self.treasury.unload();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.decoy.store(false, Ordering::Relaxed);
     }
@@ -737,7 +806,7 @@ impl Backend {
         let alt = Vault::create(&self.alt_vault_path(), &passphrase, b"{}").map_err(Failure::new)?;
         // A blank install behind it: one empty starter site, so the decoy
         // looks like any new installation.
-        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new() };
+        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new(), money: None };
         session.add(crate::backend::decoy_site());
         let _ = folder::erase(&self.alt_sites_dir());
         session.persist()
@@ -763,6 +832,8 @@ impl Backend {
     pub async fn delete_site(&self, id: u32) -> Result<(), Failure> {
         self.with_session(|session| session.entry(id).map(|_| ()))?;
         self.stop(id).await;
+        // Whatever the site and its users held becomes the owner's own.
+        self.treasury.close_site(id).await.map_err(Failure::new)?;
         self.with_session(|session| {
             session.sites.retain(|e| e.id != id);
             session.persist()
@@ -903,6 +974,9 @@ impl Backend {
             .start_host(Some(Sandbox { name: &container, folder: &dir }), target, site, Some(records))
             .await
             .map_err(Failure::new)?;
+        // Its visitors reach the wallet, for this site's books only. The
+        // local test server is never given it.
+        host.answer_bank_with(self.banker(id));
         let mut online = Hosted { host: Some(host), files_confined: true };
         // Trust nothing: ask the running host to open the vault. If it can,
         // its files are not confined.
@@ -1255,6 +1329,67 @@ impl Backend {
     }
 
     /// How many idle minutes before the vault locks itself; 0 never.
+    pub async fn wallet(&self) -> Result<Option<crate::money::Summary>, Failure> {
+        self.with_session(|_| Ok(()))?;
+        Ok(self.treasury.summary().await)
+    }
+
+    pub async fn wallet_create(&self) -> Result<(), Failure> {
+        self.with_session(|_| Ok(()))?;
+        self.treasury.create().await.map_err(Failure::new)
+    }
+
+    pub async fn wallet_node(&self, node: String) -> Result<(), Failure> {
+        self.treasury.set_node(node).await.map_err(Failure::new)
+    }
+
+    /// The wallet's secret keys, for restoring it elsewhere. Only with the
+    /// passphrase typed again: whoever sees them has the coins.
+    pub async fn wallet_keys(&self, passphrase: String) -> Result<crate::money::Restore, Failure> {
+        let passphrase = Zeroizing::new(passphrase);
+        let path = self.active_vault_path()?;
+        tokio::task::spawn_blocking(move || Vault::open(&path, &passphrase).map(|_| ()))
+            .await
+            .map_err(Failure::new)?
+            .map_err(|_| Failure::new("That passphrase is not this vault's."))?;
+        self.treasury.restore_keys().await.map_err(Failure::new)
+    }
+
+    fn amount(text: Option<String>) -> Result<Option<u64>, Failure> {
+        match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            None => Ok(None),
+            Some(text) => match torus_core::money::parse_xmr(text) {
+                Some(amount) if amount > 0 => Ok(Some(amount)),
+                _ => Err(Failure::new("That is not an amount of XMR, such as 0.05.")),
+            },
+        }
+    }
+
+    /// Sends from the owner's own account. Returns what was sent and the fee.
+    pub async fn wallet_send(&self, address: String, amount: Option<String>) -> Result<(u64, u64), Failure> {
+        let amount = Self::amount(amount)?;
+        self.treasury.send_own(address, amount).await.map_err(Failure::new)
+    }
+
+    /// Moves what a site has earned into the owner's own account.
+    pub async fn wallet_collect(&self, id: u32, amount: Option<String>) -> Result<(), Failure> {
+        let amount = Self::amount(amount)?;
+        self.treasury.collect(id, amount).await.map_err(Failure::new)
+    }
+
+    pub async fn wallet_limit(&self, id: u32, amount: String) -> Result<(), Failure> {
+        let limit = match amount.trim() {
+            "0" => 0,
+            text => Self::amount(Some(text.to_owned()))?.ok_or_else(|| Failure::new("Give an amount of XMR, or 0 to allow no withdrawals."))?,
+        };
+        self.treasury.set_daily_limit(id, limit).await.map_err(Failure::new)
+    }
+
+    /// What a site and its users hold: deleting the site gives it to the owner.
+    pub fn wallet_held_by(&self, id: u32) -> u64 {
+        self.treasury.held_by(id)
+    }
+
     pub fn auto_lock_minutes(&self) -> u32 {
         self.session.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.auto_lock_minutes)
     }

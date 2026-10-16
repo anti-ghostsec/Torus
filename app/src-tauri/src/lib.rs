@@ -1,4 +1,5 @@
 mod backend;
+mod money;
 
 use backend::{Backend, Failure, Listed, MineStatus, OnionStatus, View};
 use tauri::{Manager, State};
@@ -96,6 +97,46 @@ fn add_site(backend: State<'_, Backend>, site: Site) -> Result<u32, Failure> {
 #[tauri::command]
 async fn delete_site(backend: State<'_, Backend>, id: u32) -> Result<(), Failure> {
     backend.delete_site(id).await
+}
+
+#[tauri::command]
+async fn wallet(backend: State<'_, Backend>) -> Result<Option<money::Summary>, Failure> {
+    backend.wallet().await
+}
+
+#[tauri::command]
+async fn wallet_create(backend: State<'_, Backend>) -> Result<(), Failure> {
+    backend.wallet_create().await
+}
+
+#[tauri::command]
+async fn wallet_node(backend: State<'_, Backend>, node: String) -> Result<(), Failure> {
+    backend.wallet_node(node).await
+}
+
+#[tauri::command]
+async fn wallet_keys(backend: State<'_, Backend>, passphrase: String) -> Result<money::Restore, Failure> {
+    backend.wallet_keys(passphrase).await
+}
+
+#[tauri::command]
+async fn wallet_send(backend: State<'_, Backend>, address: String, amount: Option<String>) -> Result<(u64, u64), Failure> {
+    backend.wallet_send(address, amount).await
+}
+
+#[tauri::command]
+async fn wallet_collect(backend: State<'_, Backend>, id: u32, amount: Option<String>) -> Result<(), Failure> {
+    backend.wallet_collect(id, amount).await
+}
+
+#[tauri::command]
+async fn wallet_limit(backend: State<'_, Backend>, id: u32, amount: String) -> Result<(), Failure> {
+    backend.wallet_limit(id, amount).await
+}
+
+#[tauri::command]
+fn wallet_held_by(backend: State<'_, Backend>, id: u32) -> u64 {
+    backend.wallet_held_by(id)
 }
 
 #[tauri::command]
@@ -290,6 +331,14 @@ pub fn run() {
             forget_saved,
             export_key,
             import_key,
+            wallet,
+            wallet_create,
+            wallet_node,
+            wallet_keys,
+            wallet_send,
+            wallet_collect,
+            wallet_limit,
+            wallet_held_by,
             stop
         ])
         .build(tauri::generate_context!())

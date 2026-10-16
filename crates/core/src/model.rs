@@ -401,6 +401,26 @@ pub enum Block {
     SignOut { submit_label: String },
     /// Shows `blocks` only to signed-in visitors, or only to the others.
     Gate { audience: Audience, blocks: Vec<Block> },
+    /// The signed-in visitor's Monero on this site: what they hold, their
+    /// own address to add to it, and a form to withdraw it.
+    Wallet { label: String },
+    /// The site's own Monero address, for anyone to give to. Signed-in
+    /// visitors can also give from what they hold.
+    Donate { label: String },
+    /// A button that gives `amount` XMR, from what the visitor holds, to
+    /// whoever added the record being shown, or to the site.
+    Tip { amount: String, label: String },
+    /// Shows `blocks` only to visitors who have paid `price` XMR, to whoever
+    /// added the record being shown or to the site. With `days` set, what
+    /// is paid for is a pass of that many days to everything the same
+    /// payee has behind a pass; without, just the record or page.
+    Paid {
+        price: String,
+        label: String,
+        #[serde(default)]
+        days: u16,
+        blocks: Vec<Block>,
+    },
 }
 
 impl Block {
@@ -408,7 +428,7 @@ impl Block {
     pub fn children(&self) -> Vec<&Vec<Block>> {
         match self {
             Block::Columns { columns } => columns.iter().collect(),
-            Block::List { blocks, .. } | Block::Gate { blocks, .. } => vec![blocks],
+            Block::List { blocks, .. } | Block::Gate { blocks, .. } | Block::Paid { blocks, .. } => vec![blocks],
             _ => Vec::new(),
         }
     }
