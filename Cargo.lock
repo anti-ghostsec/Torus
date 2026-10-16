@@ -7575,7 +7575,7 @@ dependencies = [
 
 [[package]]
 name = "torus"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -7597,7 +7597,7 @@ dependencies = [
 
 [[package]]
 name = "torus-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "qrcode",
  "serde",
@@ -7606,7 +7606,7 @@ dependencies = [
 
 [[package]]
 name = "torus-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arti-client",
  "libc",
@@ -7624,7 +7624,7 @@ dependencies = [
 
 [[package]]
 name = "torus-host-api"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "hex",
  "libc",
@@ -7638,7 +7638,7 @@ dependencies = [
 
 [[package]]
 name = "torus-onion-key"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -7651,7 +7651,7 @@ dependencies = [
 
 [[package]]
 name = "torus-runtime"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -7675,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "torus-seal"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.2.17",
@@ -7687,7 +7687,7 @@ dependencies = [
 
 [[package]]
 name = "torus-tor"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arti-client",
  "futures",
@@ -7714,7 +7714,7 @@ dependencies = [
 
 [[package]]
 name = "torus-vault"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -7726,7 +7726,7 @@ dependencies = [
 
 [[package]]
 name = "torus-wallet"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "curve25519-dalek",
  "hex",
