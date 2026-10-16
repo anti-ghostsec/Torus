@@ -26,8 +26,9 @@ use windows::Win32::Foundation::{
     HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -41,13 +42,15 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
     TerminateProcess, UpdateProcThreadAttribute, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 
 /// `SE_GROUP_ENABLED`: the capability is switched on.
@@ -55,9 +58,10 @@ const ENABLED: u32 = 4;
 /// `SECURITY_MAX_SID_SIZE`.
 const MAX_SID: usize = 68;
 
-// A child inherits every inheritable handle that exists at the instant it is
-// created, so two launches must never overlap or one host would receive the
-// other's pipes.
+// Each launch names the handles the child receives (a handle list), so it can
+// never pick up another handle the editor happens to hold. Launches are
+// still made one at a time, since the extra pipe ends are marked
+// inheritable for the instant of their launch.
 static LAUNCH: Mutex<()> = Mutex::new(());
 
 fn wide(text: &OsStr) -> Vec<u16> {
@@ -118,8 +122,14 @@ pub fn container_folder(name: &str) -> io::Result<PathBuf> {
     }
 }
 
-/// Removes a container and everything in its folder.
-pub fn remove_container(name: &str) {
+/// Removes a container and everything in its folder, and takes back its
+/// permission to run `programs`.
+pub fn remove_container(name: &str, programs: &[&Path]) {
+    if let Ok(sid) = container_sid(name) {
+        for program in programs {
+            change_access(program, &sid, REVOKE_ACCESS);
+        }
+    }
     if let Ok(folder) = container_folder(name) {
         let _ = std::fs::remove_dir_all(folder);
     }
@@ -133,6 +143,12 @@ pub fn remove_container(name: &str) {
 /// otherwise open. Best effort: an installed copy already allows this and
 /// may not let us change it.
 fn allow_running(program: &Path, sid: &Sid) {
+    change_access(program, sid, GRANT_ACCESS);
+}
+
+/// Grants the container read and run access to a file, or takes away every
+/// permission the container was given on it.
+fn change_access(program: &Path, sid: &Sid, mode: ACCESS_MODE) {
     let path = wide(program.as_os_str());
     let path = PCWSTR(path.as_ptr());
     unsafe {
@@ -152,8 +168,8 @@ fn allow_running(program: &Path, sid: &Sid) {
             return;
         }
         let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: (GENERIC_READ | GENERIC_EXECUTE).0,
-            grfAccessMode: GRANT_ACCESS,
+            grfAccessPermissions: if mode == GRANT_ACCESS { (GENERIC_READ | GENERIC_EXECUTE).0 } else { 0 },
+            grfAccessMode: mode,
             grfInheritance: NO_INHERITANCE,
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
@@ -185,6 +201,8 @@ pub(crate) struct Terms<'a> {
     pub network: bool,
     /// How many processes there may be, the one started included.
     pub processes: u32,
+    /// The most memory each of them may commit, in bytes.
+    pub memory: usize,
     /// Added to the few things the process is told about its surroundings.
     /// Names must sort after `TMP`.
     pub tell: Vec<(&'a str, OsString)>,
@@ -289,10 +307,10 @@ pub(crate) fn spawn(program: &Path, container: &str, terms: Terms<'_>) -> io::Re
         };
 
         let mut size = 0usize;
-        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
+        let _ = InitializeProcThreadAttributeList(None, 2, None, &mut size);
         let mut storage = vec![0u8; size];
         let attributes = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
-        InitializeProcThreadAttributeList(Some(attributes), 1, None, &mut size)?;
+        InitializeProcThreadAttributeList(Some(attributes), 2, None, &mut size)?;
         UpdateProcThreadAttribute(
             attributes,
             0,
@@ -305,6 +323,18 @@ pub(crate) fn spawn(program: &Path, container: &str, terms: Terms<'_>) -> io::Re
 
         let (our_stdin, child_stdin) = pipe(true)?;
         let (our_stdout, child_stdout) = pipe(false)?;
+        // Exactly these handles are passed on, and no other the editor holds.
+        let mut passed: Vec<HANDLE> = vec![child_stdin.0, child_stdout.0];
+        passed.extend(terms.give.iter().map(|end| end.0 .0));
+        UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            Some(passed.as_ptr().cast::<c_void>()),
+            passed.len() * size_of::<HANDLE>(),
+            None,
+            None,
+        )?;
 
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -372,8 +402,10 @@ pub(crate) fn spawn(program: &Path, container: &str, terms: Terms<'_>) -> io::Re
         std::mem::forget((our_stdin, our_stdout));
 
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         limits.BasicLimitInformation.ActiveProcessLimit = terms.processes;
+        limits.ProcessMemoryLimit = terms.memory;
         SetInformationJobObject(
             confined._job.0,
             JobObjectExtendedLimitInformation,

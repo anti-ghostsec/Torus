@@ -407,3 +407,27 @@ async fn held_posts_are_invisible_until_approved() {
     assert!(live.approve("posts", &waiting.id) && !live.approve("posts", &waiting.id));
     assert!(get(addr, "/", None).await.text().contains("Second try"));
 }
+
+/// Shared limits are kept apart: a flood of sign-in attempts, which anyone
+/// can send, leaves members able to post.
+#[tokio::test]
+async fn a_flood_of_sign_ins_does_not_stop_members_posting() {
+    let (addr, _live) = start(microblog()).await;
+    let (ada, ada_token) = join(addr, "Ada").await;
+    let mut refused = 0;
+    for _ in 0..40 {
+        let tried = post(addr, torus_core::SIGN_IN_PATH, None, &[("name", "Ada"), ("_password", "wrong guess here")]).await;
+        if tried.status == 429 {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 10, "sign-ins have a budget of their own");
+    let posted = upload(
+        addr,
+        "/_form/posts",
+        Some(&ada),
+        &[Part::Text("_token", &ada_token), Part::Text("_next", "/"), Part::Text("text", "Still here")],
+    )
+    .await;
+    assert_eq!(posted.status, 303, "{}", posted.text());
+}

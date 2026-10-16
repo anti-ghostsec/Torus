@@ -12,7 +12,10 @@
 use crate::blobs::{self, Source, Staged, Target, Writer};
 
 /// An index larger than this is not held in memory to be moved.
-const MAX_INDEX: u64 = 64 * 1024 * 1024;
+/// Long recordings have long indexes: a 10 GB video's runs to tens of
+/// megabytes. The converter reads videos from a pipe and cannot jump to an
+/// index at the end, so this limit is generous.
+const MAX_INDEX: u64 = 256 * 1024 * 1024;
 const MAX_TOP_BOXES: usize = 64;
 const MAX_DEPTH: usize = 8;
 

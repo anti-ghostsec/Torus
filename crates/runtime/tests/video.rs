@@ -387,7 +387,7 @@ fn element(id: &[u8], body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn piped_webm(fill: u8) -> Vec<u8> {
+fn piped_webm(fill: u8, block: usize) -> Vec<u8> {
     let entry = element(&[0xAE], &[element(&[0xD7], &[1]), element(&[0x83], &[1])].concat());
     let mut out = [
         element(&[0x1A, 0x45, 0xDF, 0xA3], &element(&[0x42, 0x82], b"webm")),
@@ -397,7 +397,7 @@ fn piped_webm(fill: u8) -> Vec<u8> {
     ]
     .concat();
     for second in 0..3u16 {
-        let block = element(&[0xA3], &[vec![0x81, 0, 0, 0x80], vec![fill; 2_000]].concat());
+        let block = element(&[0xA3], &[vec![0x81, 0, 0, 0x80], vec![fill; block]].concat());
         out.extend(element(&[0x1F, 0x43, 0xB6, 0x75], &[element(&[0xE7], &(second * 1000).to_be_bytes()), block].concat()));
     }
     out
@@ -420,11 +420,43 @@ impl torus_runtime::Converter for Stand {
                 image::RgbImage::from_pixel(1920, 1080, image::Rgb([200, 30, 30])).write_to(&mut png, image::ImageFormat::Png).unwrap();
                 png.into_inner()
             }
-            torus_runtime::Job::Smaller(pixels) => piped_webm((pixels / 10) as u8),
-            torus_runtime::Job::Whole => piped_webm(0xEE),
+            // Smaller copies come out smaller, as real ones do.
+            torus_runtime::Job::Smaller(pixels) => piped_webm((pixels / 10) as u8, pixels as usize * 2),
+            torus_runtime::Job::Whole => piped_webm(0xEE, 2_000),
         };
         made.chunks(700).all(|piece| output(piece))
     }
+}
+
+/// A converter that cannot read anything.
+struct Broken;
+
+impl torus_runtime::Converter for Broken {
+    fn convert(
+        &self,
+        _job: torus_runtime::Job,
+        input: &mut (dyn Iterator<Item = hyper::body::Bytes> + Send),
+        _output: &mut (dyn FnMut(&[u8]) -> bool + Send),
+    ) -> bool {
+        input.for_each(drop);
+        false
+    }
+}
+
+/// A video the converter cannot encode afresh is never shown as uploaded.
+#[tokio::test]
+async fn a_video_that_cannot_be_encoded_stays_hidden() {
+    let (addr, live) = start(video_site()).await;
+    live.convert_with(std::sync::Arc::new(Broken));
+    let (cookie, token) = join(addr, "Ada").await;
+    let video = fake_video(100_000);
+    let parts = [Part::Text("_token", &token), Part::Text("_next", "/"), Part::Text("title", "Bad"), Part::File("video", &video)];
+    assert_eq!(upload(addr, "/_form/videos", Some(&cookie), &parts).await.status, 303);
+    let record = live.records("videos")[0].clone();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(get(addr, &format!("/_file/{}", record.fields["video"]), None).await.status, 404);
+    let watch = get(addr, &format!("/watch/{}", record.id), None).await.text();
+    assert!(!watch.contains("<video") && watch.contains("being prepared"), "{watch}");
 }
 
 #[tokio::test]
@@ -442,17 +474,21 @@ async fn a_picture_and_smaller_sizes_are_made_from_an_uploaded_video() {
     .await;
     assert_eq!(sent.status, 303, "{}", sent.text());
     let uploaded = live.records("videos")[0].fields["video"].clone();
+    // What was uploaded is never served, not even before it is encoded afresh.
+    assert_eq!(get(addr, &format!("/_file/{uploaded}"), None).await.status, 404, "the upload itself was served");
 
-    // Everything is made in the background; the upload itself did not wait for it.
+    // Everything is made in the background; the upload itself did not wait
+    // for it. The clean encoding shows first, the smaller copies after.
+    let id = live.records("videos")[0].id.clone();
     let mut now = uploaded.clone();
-    for _ in 0..200 {
+    for _ in 0..400 {
         now = live.records("videos")[0].fields["video"].clone();
-        if now != uploaded {
+        if now != uploaded && get(addr, &format!("/watch/{id}"), None).await.text().contains("<strong>720p</strong>") {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert_ne!(now, uploaded, "the smaller encoding takes the upload's place");
+    assert_ne!(now, uploaded, "the new encoding takes the upload's place");
     assert_eq!(get(addr, &format!("/_file/{uploaded}"), None).await.status, 404, "and the upload is gone");
 
     // Cards show a picture, not a video.
@@ -465,7 +501,6 @@ async fn a_picture_and_smaller_sizes_are_made_from_an_uploaded_video() {
     assert_eq!((decoded.width(), decoded.height()), (480, 270));
 
     // The watch page plays the middle size unless another is picked; the download is the full one.
-    let id = live.records("videos")[0].id.clone();
     let watch = get(addr, &format!("/watch/{id}"), None).await.text();
     assert!(watch.contains("<a href=\"/watch/") && watch.contains("?v=360\">360p</a> · <strong>720p</strong> · "), "{watch}");
     assert!(watch.contains(&format!("?v=0\">Full size</a> · <a href=\"/_file/{now}\">Download the video</a>")));

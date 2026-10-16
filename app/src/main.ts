@@ -753,7 +753,7 @@ function renderSettings() {
     return input;
   };
   siteHost.append(
-    field("Largest video (MB)", megabytes(limits.video_mb, 300, (v) => (limits.video_mb = v))),
+    field("Largest video (MB, up to 10 GB)", megabytes(limits.video_mb, 10240, (v) => (limits.video_mb = v))),
     field("Room for all files (MB)", megabytes(limits.storage_mb, 1048576, (v) => (limits.storage_mb = v))),
   );
   // What the converter makes from uploaded videos, where this device has one.
@@ -768,9 +768,12 @@ function renderSettings() {
     return input;
   };
   siteHost.append(
-    field("Re-encode videos to save room", toggle(limits.shrink ?? true, (v) => (limits.shrink = v))),
     field("Make 360p and 720p copies", toggle(limits.sizes ?? true, (v) => (limits.sizes = v))),
-    el("p", "hint", "Pictures for cards, smaller copies and re-encoding are made on a Windows computer hosting the site. A phone keeps videos as they were uploaded."),
+    el(
+      "p",
+      "hint",
+      "Every uploaded video is encoded afresh, in a sandbox with no network and no files, before anyone can watch it: nothing the camera or phone recorded about it survives. Large videos take a while to appear. Leave room for twice the largest video while one is being prepared.",
+    ),
   );
 
   // Replaces every page and collection, so it also takes two clicks.
@@ -1101,7 +1104,7 @@ function showFailure(error: unknown) {
 }
 
 // Sites currently on Tor, as last reported by the backend.
-let hosted = new Map<number, { reachable: boolean; broken: boolean }>();
+let hosted = new Map<number, { reachable: boolean; broken: boolean; files_confined: boolean }>();
 let localUrl = "";
 // A message that takes over the status line until the next site switch or publish.
 let note = "";
@@ -1113,6 +1116,8 @@ function showStatus() {
     note ||
     (state?.broken
       ? "The onion service stopped working. Publish again to restart it."
+      : state && !state.files_confined
+        ? `Online at ${address}. This device's system lacks Landlock, so the site's program is confined in every way but one: it is not kept away from this app's other files, all of which are encrypted.`
       : state?.reachable
         ? `Live: ${address}`
         : state
@@ -1126,7 +1131,7 @@ function showStatus() {
 }
 
 async function pollTor() {
-  const list = await invoke<{ id: number; reachable: boolean; broken: boolean }[]>("onion_status");
+  const list = await invoke<{ id: number; reachable: boolean; broken: boolean; files_confined: boolean }[]>("onion_status");
   hosted = new Map(list.map((state) => [state.id, state]));
   showStatus();
 }

@@ -74,8 +74,9 @@ async fn a_sandboxed_video_site_works_over_tor() {
     // Confined wherever the sandbox exists, with all its files inside the container.
     let container = torus_host_api::sandbox_available().then(|| format!("torus.live-{}", std::process::id()));
     let folder = match &container {
+        #[cfg(windows)]
         Some(name) => torus_host_api::container_folder(name).unwrap().join("tor"),
-        None => dir.clone(),
+        _ => dir.clone(),
     };
     // A confined process cannot create folders by walking down from the
     // drive, so they are made for it.
@@ -85,10 +86,10 @@ async fn a_sandboxed_video_site_works_over_tor() {
     let records_file = folder.join("records.bin");
     let records = Records { file: records_file.clone(), key: vec![5; 32] };
     // With the converter present, pictures and smaller sizes are made too.
-    let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ffmpeg/ffmpeg.exe");
+    let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) { "../../tools/ffmpeg/ffmpeg.exe" } else { "../../tools/ffmpeg/ffmpeg" });
     let converter = ffmpeg.is_file().then_some(ffmpeg.as_path());
-    let host =
-        Host::start(Path::new(HOST), container.as_deref(), converter, target, video_site(), Some(records)).await.unwrap();
+    let sandbox = container.as_deref().map(|name| torus_host_api::Sandbox { name, folder: &folder });
+    let host = Host::start(Path::new(HOST), sandbox, converter, target, video_site(), Some(records)).await.unwrap();
     println!("address: {}", host.address());
     assert_eq!(host.address(), expected, "Tor published at a different address than the editor shows");
     if container.is_some() {
@@ -242,7 +243,7 @@ async fn a_sandboxed_video_site_works_over_tor() {
 
     drop(host);
     if let Some(name) = &container {
-        torus_host_api::remove_container(name);
+        torus_host_api::remove_container(name, &[Path::new(HOST)]);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

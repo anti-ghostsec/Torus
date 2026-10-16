@@ -5,3 +5,6 @@ dist/
 .cargo/config.toml
 app/src-tauri/binaries/
 tools/ffmpeg/ffmpeg.exe
+tools/ffmpeg/.work/
+tools/ffmpeg/android/
+tools/ffmpeg/windows/

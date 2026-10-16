@@ -47,8 +47,8 @@ pub struct Limits {
     /// Whether smaller copies of a video are made for visitors to choose
     /// from. They load faster and take a little more room.
     pub sizes: bool,
-    /// Whether an uploaded video is encoded again to take less room, and
-    /// the upload dropped when that worked.
+    /// No longer read: every uploaded video is now encoded afresh before it
+    /// is shown. Kept so that sites saved by older versions still load.
     pub shrink: bool,
 }
 
@@ -63,7 +63,7 @@ impl Limits {
 
     /// Never more than a video field accepts at all, whatever was typed.
     pub fn video_bytes(self) -> u64 {
-        (u64::from(self.video_mb.max(1)) * Self::MEGABYTE).min(FieldKind::Video.max_len() as u64)
+        (u64::from(self.video_mb.max(1)) * Self::MEGABYTE).min(FieldKind::Video.max_bytes())
     }
 
     pub fn storage_bytes(self) -> u64 {
@@ -181,13 +181,24 @@ impl FieldKind {
         matches!(self, FieldKind::Image | FieldKind::Video)
     }
 
-    /// The most a visitor may submit: characters of text, or bytes of a file.
+    /// The most characters of text a visitor may submit. Files are measured
+    /// with [`FieldKind::max_bytes`] instead.
     pub fn max_len(self) -> usize {
         match self {
             FieldKind::Text => 200,
             FieldKind::LongText => 10_000,
+            // As many as fit a file's id.
+            FieldKind::Image | FieldKind::Video => 64,
+        }
+    }
+
+    /// The largest file a visitor may upload to a field of this kind. In
+    /// bytes, as a `u64` because a video can be larger than 32 bits count.
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            FieldKind::Text | FieldKind::LongText => self.max_len() as u64 * 4,
             FieldKind::Image => 8 * 1024 * 1024,
-            FieldKind::Video => 300 * 1024 * 1024,
+            FieldKind::Video => 10 * 1024 * 1024 * 1024,
         }
     }
 }

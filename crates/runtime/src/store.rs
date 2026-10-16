@@ -5,9 +5,9 @@
 //! where a request came from, and no record carries a time.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -19,11 +19,14 @@ use zeroize::Zeroizing;
 
 use crate::blobs::{self, Source, Staged, Target};
 
-/// Beyond this, the oldest record of a collection makes room for the newest.
+/// A collection holds at most this many records. Beyond it, additions are
+/// refused: nothing a visitor has added is ever pushed out to make room,
+/// so flooding a site cannot erase what is on it.
 const MAX_RECORDS: usize = 5_000;
-/// At most this many additions are accepted per minute across the site.
-/// On Tor there is no visitor address to limit by, so the limit is shared.
-const MAX_PER_MINUTE: u32 = 30;
+/// On Tor there is no visitor address to limit by, so limits are shared by
+/// all visitors. Each kind of request has a budget of its own, so that
+/// using up one (say, with sign-in attempts) leaves the others alone.
+const PER_MINUTE: [u32; 3] = [30, 30, 10];
 
 const SESSION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_SESSIONS: usize = 20_000;
@@ -35,6 +38,15 @@ pub struct Storage {
     /// files go into a folder beside it.
     pub file: PathBuf,
     pub key: Zeroizing<[u8; 32]>,
+}
+
+/// What a request spends from the shared per-minute budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Budget {
+    /// Adding to a collection, removing, approving.
+    Posts = 0,
+    SignIns = 1,
+    SignUps = 2,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -72,6 +84,13 @@ struct Made {
     /// Whether everything that was going to be made has been.
     #[serde(default)]
     done: bool,
+    /// Whether encoding it afresh failed, so that it is never shown.
+    #[serde(default)]
+    failed: bool,
+    /// Whether the file is the converter's own encoding rather than what a
+    /// visitor uploaded.
+    #[serde(default)]
+    clean: bool,
 }
 
 /// What is written to disk.
@@ -102,10 +121,95 @@ struct State {
 pub struct Store {
     state: State,
     storage: Option<Storage>,
+    /// Writes the data file, off the threads that answer visitors.
+    disk: Option<Disk>,
     /// File contents, when there is no storage to put them in.
     memory: BTreeMap<String, Arc<Vec<u8>>>,
-    window: Instant,
-    in_window: u32,
+    budgets: [(Instant, u32); 3],
+    /// Whether uploaded videos are encoded afresh before anyone sees them.
+    pub(crate) hold_videos: bool,
+}
+
+/// What is waiting to be written, shared with the writing thread.
+#[derive(Default)]
+struct Queue {
+    /// The newest sealed state, and its number. Older ones not yet written
+    /// are skipped: only the newest matters.
+    next: Option<(u64, Vec<u8>)>,
+    closing: bool,
+    /// Whether the last write failed.
+    failed: bool,
+}
+
+struct Disk {
+    queue: Arc<(Mutex<Queue>, Condvar)>,
+    /// The number of the newest state that is safely on disk.
+    written: tokio::sync::watch::Receiver<u64>,
+    queued: u64,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Disk {
+    fn start(file: PathBuf) -> Self {
+        let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
+        let (tell, written) = tokio::sync::watch::channel(0u64);
+        let shared = queue.clone();
+        let thread = std::thread::spawn(move || loop {
+            let (lock, wake) = &*shared;
+            let mut waiting = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.next.is_none() && !waiting.closing {
+                waiting = wake.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            let Some((number, sealed)) = waiting.next.take() else { return };
+            drop(waiting);
+            let worked = write_durably(&file, &sealed).is_ok();
+            lock.lock().unwrap_or_else(|e| e.into_inner()).failed = !worked;
+            // Waiters are released either way; a failure shows on the next save.
+            tell.send_replace(number);
+        });
+        Self { queue, written, queued: 0, thread: Some(thread) }
+    }
+
+    fn enqueue(&mut self, sealed: Vec<u8>) -> bool {
+        self.queued += 1;
+        let (lock, wake) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        queue.next = Some((self.queued, sealed));
+        let failed = queue.failed;
+        wake.notify_one();
+        !failed
+    }
+}
+
+impl Drop for Disk {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.queue;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).closing = true;
+        wake.notify_one();
+        // What was saved last is written before the store goes away.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Replaces `file` so that a crash or power cut at any moment leaves either
+/// the old contents or the new, never a damaged mix of the two.
+fn write_durably(file: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut temp = file.to_path_buf().into_os_string();
+    temp.push(".new");
+    let temp = PathBuf::from(temp);
+    let mut out = std::fs::File::create(&temp)?;
+    out.write_all(contents)?;
+    out.sync_all()?;
+    drop(out);
+    std::fs::rename(&temp, file)?;
+    // The rename itself is only durable once the folder is written out.
+    #[cfg(unix)]
+    if let Some(dir) = file.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn now() -> u64 {
@@ -125,7 +229,14 @@ fn cookie_hash(cookie: &str) -> String {
 impl Store {
     /// Everything lives in memory only.
     pub fn volatile() -> Self {
-        Self { state: State::default(), storage: None, memory: BTreeMap::new(), window: Instant::now(), in_window: 0 }
+        Self {
+            state: State::default(),
+            storage: None,
+            disk: None,
+            memory: BTreeMap::new(),
+            budgets: [(Instant::now(), 0); 3],
+            hold_videos: false,
+        }
     }
 
     /// Loads what was stored before, or starts empty if nothing was.
@@ -146,14 +257,23 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e),
         };
-        Ok(Self { state, storage: Some(storage), memory: BTreeMap::new(), window: Instant::now(), in_window: 0 })
+        let disk = Disk::start(storage.file.clone());
+        Ok(Self {
+            state,
+            storage: Some(storage),
+            disk: Some(disk),
+            memory: BTreeMap::new(),
+            budgets: [(Instant::now(), 0); 3],
+            hold_videos: false,
+        })
     }
 
-    /// Rewrites the data file. The old one stays intact until the new one is
-    /// completely written.
-    fn persist(&self) -> Result<(), Refused> {
-        let Some(storage) = &self.storage else { return Ok(()) };
-        let write = || -> io::Result<()> {
+    /// Seals the data and hands it to the writing thread. The old file stays
+    /// intact until the new one is completely written. `Err` when sealing
+    /// failed or the previous write did not reach the disk.
+    fn persist(&mut self) -> Result<(), Refused> {
+        let (Some(storage), Some(disk)) = (&self.storage, &mut self.disk) else { return Ok(()) };
+        let seal = || -> io::Result<Vec<u8>> {
             let plain = Zeroizing::new(serde_json::to_vec(&self.state)?);
             let mut nonce = [0u8; NONCE_LEN];
             getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
@@ -163,24 +283,34 @@ impl Store {
                     .encrypt(XNonce::from_slice(&nonce), plain.as_slice())
                     .map_err(|_| io::Error::other("could not encrypt the site's data"))?,
             );
-            let mut temp = storage.file.clone().into_os_string();
-            temp.push(".new");
-            std::fs::write(&temp, sealed)?;
-            std::fs::rename(&temp, &storage.file)
+            Ok(sealed)
         };
-        write().map_err(|_| Refused::Storage)
+        let sealed = seal().map_err(|_| Refused::Storage)?;
+        if disk.enqueue(sealed) { Ok(()) } else { Err(Refused::Storage) }
     }
 
-    /// Counts one addition against the shared limit.
-    pub(crate) fn allow(&mut self) -> Result<(), Refused> {
-        if self.window.elapsed() >= Duration::from_secs(60) {
-            self.window = Instant::now();
-            self.in_window = 0;
+    /// Waits, outside the store's lock, until everything saved so far is
+    /// on disk. Answers to visitors are sent only after this, so what they
+    /// were told was saved has been.
+    pub(crate) fn settled(&self) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        let disk = self.disk.as_ref()?;
+        let (mut written, wanted) = (disk.written.clone(), disk.queued);
+        Some(async move {
+            let _ = written.wait_for(|done| *done >= wanted).await;
+        })
+    }
+
+    /// Counts one request against its shared per-minute budget.
+    pub(crate) fn allow(&mut self, budget: Budget) -> Result<(), Refused> {
+        let (window, used) = &mut self.budgets[budget as usize];
+        if window.elapsed() >= Duration::from_secs(60) {
+            *window = Instant::now();
+            *used = 0;
         }
-        if self.in_window >= MAX_PER_MINUTE {
+        if *used >= PER_MINUTE[budget as usize] {
             return Err(Refused::TooFast);
         }
-        self.in_window += 1;
+        *used += 1;
         Ok(())
     }
 
@@ -194,13 +324,11 @@ impl Store {
         record.seq = self.state.next_seq;
         let id = record.id.clone();
         let list = self.state.records.entry(collection.to_owned()).or_default();
-        list.push(record);
-        // The oldest makes room, and takes its files and whatever belongs to
-        // it along, so nothing is left behind that no page can reach.
-        let oldest = (list.len() > MAX_RECORDS).then(|| list[0].id.clone());
-        if let Some(oldest) = oldest {
-            self.remove(site, collection, &oldest);
+        if list.len() >= MAX_RECORDS {
+            return Err(Refused::Full);
         }
+        let _ = site;
+        list.push(record);
         self.persist()?;
         Ok(id)
     }
@@ -323,9 +451,39 @@ impl Store {
         Some(new)
     }
 
-    pub(crate) fn converted(&mut self, video: &str) {
+    /// Marks a video as finished: everything that was going to be made from
+    /// it has been. `failed` when it could not be encoded afresh, so that
+    /// it stays hidden instead of being shown as uploaded.
+    pub(crate) fn converted(&mut self, video: &str, failed: bool) {
         if self.state.files.contains_key(video) {
-            self.state.made.entry(video.to_owned()).or_default().done = true;
+            let made = self.state.made.entry(video.to_owned()).or_default();
+            made.done = true;
+            made.failed = failed;
+            let _ = self.persist();
+        }
+    }
+
+    /// Whether a file may be served and shown. Where videos are encoded
+    /// afresh, an uploaded one is held back until that has worked; the
+    /// copies made from it are clean from the start.
+    pub(crate) fn prepared(&self, file: &str) -> bool {
+        if !self.hold_videos {
+            return true;
+        }
+        let Some(info) = self.state.files.get(file) else { return false };
+        if !info.content_type.starts_with("video/") {
+            return true;
+        }
+        let made = self.state.made.get(file);
+        let is_copy = self.state.made.values().any(|m| m.sizes.iter().any(|(_, copy)| copy == file));
+        is_copy || made.is_some_and(|m| m.done && !m.failed && m.clean)
+    }
+
+    /// Records that a video is now the converter's own output, with
+    /// nothing left of what the camera wrote.
+    pub(crate) fn mark_clean(&mut self, video: &str) {
+        if self.state.files.contains_key(video) {
+            self.state.made.entry(video.to_owned()).or_default().clean = true;
             let _ = self.persist();
         }
     }
@@ -442,6 +600,11 @@ impl Store {
     }
 
     pub(crate) fn file(&self, id: &str) -> Option<(FileInfo, Source)> {
+        self.file_unchecked(id).filter(|_| self.prepared(id))
+    }
+
+    /// A stored file whether or not it may be shown yet: for making things from it.
+    pub(crate) fn file_unchecked(&self, id: &str) -> Option<(FileInfo, Source)> {
         let info = self.state.files.get(id)?.clone();
         let source = match self.file_target() {
             Target::Memory => Source::Memory(self.memory.get(id)?.clone()),
@@ -477,6 +640,10 @@ impl Data for Seen<'_> {
 
     fn sizes(&self, video: &str) -> Vec<(u32, String)> {
         self.store.sizes(video)
+    }
+
+    fn ready(&self, video: &str) -> bool {
+        self.store.prepared(video)
     }
 }
 

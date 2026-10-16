@@ -2,6 +2,11 @@
 //! input, or, started in the other role, converts that site's videos.
 
 fn main() {
+    // Before anything else, and before a single byte is read from anyone:
+    // the editor's instructions for confining this process are in its
+    // environment, and everything after this runs confined.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = torus_host_api::confine_from_surroundings();
     torus_host_api::no_crash_dumps();
     // Started as a converter, this program serves nothing and has no network.
     if let Some(code) = torus_host::media::serve_if_converter() {

@@ -84,6 +84,13 @@ pub trait Data {
     fn sizes(&self, _video: &str) -> Vec<(u32, String)> {
         Vec::new()
     }
+
+    /// Whether a video may be shown yet. Where the host encodes every
+    /// upload afresh, a video is held back until that is done, so that
+    /// nothing the camera wrote into the original is ever served.
+    fn ready(&self, _video: &str) -> bool {
+        true
+    }
 }
 
 /// A site with nothing submitted yet.
@@ -576,6 +583,9 @@ impl View<'_> {
                 let _ = writeln!(html, "<p class=\"media\">{}</p>", escape(&placeholder(&field.label)));
             }
             FieldKind::Image | FieldKind::Video if !is_id(value) => {}
+            FieldKind::Video if !self.data.ready(value) => {
+                let _ = writeln!(html, "<p class=\"media\">This video is being prepared. It shows here once it is ready.</p>");
+            }
             FieldKind::Image => {
                 let _ = writeln!(html, "<p{}><img src=\"{FILE_PATH}{value}\" alt=\"\"></p>", class(align));
             }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use torus_core::{Align, Block, Page, Site, Theme};
-use torus_host_api::{Host, Target};
+use torus_host_api::{Host, Sandbox, Target};
 
 const HOST: &str = env!("CARGO_BIN_EXE_torus-host");
 
@@ -76,12 +76,45 @@ async fn a_damaged_key_is_reported_not_served() {
     assert!(error.contains("damaged"), "unexpected error: {error}");
 }
 
+/// The one folder a confined host may use in these tests.
+fn sandbox_folder(container: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        torus_host_api::container_folder(container).unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        let folder = std::env::temp_dir().join(container);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+}
+
+/// Whether this kernel can confine files at all (Landlock). Containers and
+/// old kernels may not; the editor refuses to publish there, and the file
+/// checks below are skipped.
+fn files_can_be_confined() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // landlock_create_ruleset(NULL, 0, VERSION) answers with the version.
+        (unsafe { libc::syscall(444, std::ptr::null::<u8>(), 0usize, 1u32) }) >= 1
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        true
+    }
+}
+
 /// The promise of the sandbox, checked from the inside: a confined host is
 /// asked to open files and must fail on anything outside its own folder.
-#[cfg(windows)]
 #[tokio::test]
 async fn a_confined_host_cannot_open_the_users_files() {
+    if !files_can_be_confined() {
+        eprintln!("skipped: this kernel cannot confine files");
+        return;
+    }
     let container = format!("torus.test-{}", std::process::id());
+    let folder = sandbox_folder(&container);
     let secret = std::env::temp_dir().join(format!("torus-secret-{}.txt", std::process::id()));
     std::fs::write(&secret, "stands in for the vault").unwrap();
     // A file that already exists outside any container: this test program.
@@ -93,23 +126,25 @@ async fn a_confined_host_cannot_open_the_users_files() {
     assert!(free.can_read(&program).await.unwrap(), "the control case should be able to read the program");
     drop(free);
 
-    let host = Host::start(Path::new(HOST), Some(&container), None, Target::Loopback, site("x"), None).await.unwrap();
+    let sandbox = Sandbox { name: &container, folder: &folder };
+    let host = Host::start(Path::new(HOST), Some(sandbox), None, Target::Loopback, site("x"), None).await.unwrap();
     assert!(!host.can_read(&secret).await.unwrap(), "a confined host read a file in the user's temp folder");
     assert!(!host.can_read(&program).await.unwrap(), "a confined host read a program beside its own");
 
     // Its own folder is the one place it may use.
-    let own = torus_host_api::container_folder(&container).unwrap().join("note.txt");
+    let own = folder.join("note.txt");
     std::fs::write(&own, "mine").unwrap();
     assert!(host.can_read(&own).await.unwrap(), "a confined host could not read its own folder");
 
     drop(host);
-    torus_host_api::remove_container(&container);
+    torus_host_api::remove_container(&container, &[Path::new(HOST)]);
+    #[cfg(not(windows))]
+    let _ = std::fs::remove_dir_all(&folder);
     let _ = std::fs::remove_file(secret);
 }
 
 /// The process that decodes visitors' videos can reach nothing: not a
 /// listener on this machine, not the internet, not a file.
-#[cfg(windows)]
 #[test]
 fn a_converter_can_reach_neither_the_network_nor_files() {
     use std::io::{Read, Write};
@@ -135,11 +170,12 @@ fn a_converter_can_reach_neither_the_network_nor_files() {
     let mut answer = [0u8; 4 + 3 + 4 + 1];
     from.read_exact(&mut answer).unwrap();
     assert_eq!(answer[..4], 3u32.to_le_bytes());
-    assert_eq!(answer[4..7], [0, 0, 0], "the converter reached the listener, the internet or the file, in that order");
+    let file_expected = u8::from(!files_can_be_confined());
+    assert_eq!(answer[4..7], [0, 0, file_expected], "the converter reached the listener, the internet or the file, in that order");
     assert_eq!(answer[7..], [0, 0, 0, 0, 1]);
 
     drop(keeper);
-    torus_host_api::remove_container(&format!("torus.test-conv-{}", std::process::id()));
+    torus_host_api::remove_container(&format!("torus.test-conv-{}", std::process::id()), &[Path::new(HOST)]);
     let _ = std::fs::remove_file(secret);
 }
 
@@ -153,7 +189,7 @@ fn remove_leftover_test_containers() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("torus.test-") || name.starts_with("torus.live-") {
             println!("removing {name}");
-            torus_host_api::remove_container(&name);
+            torus_host_api::remove_container(&name, &[]);
         }
     }
 }
@@ -250,4 +286,68 @@ async fn the_owner_can_list_and_remove_what_was_added() {
     assert!(host.remove("notes", &records[0].id).await.unwrap());
     assert!(!host.remove("notes", &records[0].id).await.unwrap());
     assert!(host.records("notes").await.unwrap().is_empty());
+}
+
+/// A real video, with what a phone writes about where and on what it was
+/// recorded, goes through the real converter in its sandbox and comes back
+/// as a clean VP9 WebM with none of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_real_video_is_encoded_afresh_in_the_sandbox() {
+    use std::io::{Read, Write};
+    let ffmpeg = Path::new("/usr/bin/ffmpeg");
+    if !ffmpeg.is_file() {
+        eprintln!("skipped: no ffmpeg on this system");
+        return;
+    }
+    let made = std::env::temp_dir().join(format!("torus-phone-{}.mp4", std::process::id()));
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30", "-f", "lavfi"])
+        .args(["-i", "sine=frequency=440", "-t", "2", "-c:v", "mpeg4", "-c:a", "aac", "-movflags", "+faststart"])
+        .args(["-metadata", "title=SECRET-TITLE", "-metadata", "location=+51.5007-000.1246/", "-metadata", "comment=SECRET-PHONE"])
+        .arg(&made)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let video = std::fs::read(&made).unwrap();
+    assert!(video.windows(6).any(|w| w == b"SECRET"));
+
+    let container = format!("torus.test-real-{}", std::process::id());
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, ffmpeg).unwrap();
+    // A request: re-encode whole (3), then the video in pieces, then the end.
+    to.write_all(&[3, 0, 0, 0, 0]).unwrap();
+    let sending = std::thread::spawn(move || {
+        for piece in video.chunks(64 * 1024) {
+            to.write_all(&(piece.len() as u32).to_le_bytes()).unwrap();
+            to.write_all(piece).unwrap();
+        }
+        to.write_all(&0u32.to_le_bytes()).unwrap();
+        to.flush().unwrap();
+        to
+    });
+    let mut out = Vec::new();
+    loop {
+        let mut length = [0u8; 4];
+        from.read_exact(&mut length).unwrap();
+        let length = u32::from_le_bytes(length) as usize;
+        if length == 0 {
+            break;
+        }
+        let mut piece = vec![0u8; length];
+        from.read_exact(&mut piece).unwrap();
+        out.extend_from_slice(&piece);
+    }
+    let mut worked = [0u8];
+    from.read_exact(&mut worked).unwrap();
+    let _to = sending.join().unwrap();
+    assert_eq!(worked, [1], "the conversion failed");
+    assert!(out.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]), "not a WebM");
+    assert!(out.windows(5).any(|w| w == b"V_VP9"), "not VP9");
+    assert!(out.windows(6).any(|w| w == b"A_OPUS"), "no Opus sound");
+    // The upload's own encoder and version; the converter writes a bare "Lavf", the same for every video.
+    for secret in [b"SECRET".as_slice(), b"51.5007", b"Lavf6", b"testsrc"] {
+        assert!(!out.windows(secret.len()).any(|w| w == secret), "{:?} survived", String::from_utf8_lossy(secret));
+    }
+    drop(keeper);
+    let _ = std::fs::remove_file(made);
 }
