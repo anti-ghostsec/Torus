@@ -1195,6 +1195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "deniable"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "blake2",
+ "chacha20 0.9.1",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
+ "zeroize",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
