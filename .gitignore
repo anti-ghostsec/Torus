@@ -4,6 +4,7 @@ dist/
 # Machine-specific: points the build output outside the synced folder.
 .cargo/config.toml
 app/src-tauri/binaries/
+tools/ffmpeg/ffmpeg
 tools/ffmpeg/ffmpeg.exe
 tools/ffmpeg/.work/
 tools/ffmpeg/android/
