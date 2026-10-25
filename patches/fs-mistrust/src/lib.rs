@@ -191,7 +191,7 @@ pub struct Mistrust {
     ))]
     #[builder(
         setter(into),
-        field(type = "TrustedUser", build = "if self.should_be_enabled() == disable::Status::DisableChecks { None } else { match self.trust_user.get_uid() { Ok(u) => u, Err(Error::PasswdGroupIoError(_)) => None, Err(e) => return Err(e) } }")
+        field(type = "TrustedUser", build = "match self.trust_user.get_uid() { Ok(u) => u, Err(Error::PasswdGroupIoError(_)) => None, Err(e) => return Err(e) }")
     )]
     trust_user: Option<u32>,
 
