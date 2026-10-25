@@ -290,13 +290,15 @@ async fn the_owner_can_list_and_remove_what_was_added() {
 #[test]
 fn a_real_video_is_encoded_afresh_in_the_sandbox() {
     use std::io::{Read, Write};
-    let ffmpeg = Path::new("/usr/bin/ffmpeg");
-    if !ffmpeg.is_file() {
+    let generator = Path::new("/usr/bin/ffmpeg");
+    if !generator.is_file() {
         eprintln!("skipped: no ffmpeg on this system");
         return;
     }
+    let ffmpeg_tools = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/ffmpeg/linux/ffmpeg"));
+    let converter = if ffmpeg_tools.is_file() { ffmpeg_tools } else { generator };
     let made = std::env::temp_dir().join(format!("torus-phone-{}.mp4", std::process::id()));
-    let status = std::process::Command::new(ffmpeg)
+    let status = std::process::Command::new(generator)
         .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30", "-f", "lavfi"])
         .args(["-i", "sine=frequency=440", "-t", "2", "-c:v", "mpeg4", "-c:a", "aac", "-movflags", "+faststart"])
         .args(["-metadata", "title=SECRET-TITLE", "-metadata", "location=+51.5007-000.1246/", "-metadata", "comment=SECRET-PHONE"])
@@ -308,7 +310,7 @@ fn a_real_video_is_encoded_afresh_in_the_sandbox() {
     assert!(video.windows(6).any(|w| w == b"SECRET"));
 
     let container = format!("torus.test-real-{}", std::process::id());
-    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, ffmpeg, &sandbox_folder(&container)).unwrap();
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, converter, &sandbox_folder(&container)).unwrap();
     // A request: re-encode whole (3), then the video in pieces, then the end.
     to.write_all(&[3, 0, 0, 0, 0]).unwrap();
     let sending = std::thread::spawn(move || {

@@ -853,7 +853,7 @@ function renderSettings() {
   siteHost.append(field("Visitors can create accounts", accounts));
 
   // How much of this device visitors' files may fill.
-  const limits = (site.limits ??= { video_mb: 300, storage_mb: 5120 });
+  const limits = (site.limits ??= { video_mb: 1024, storage_mb: 5120 });
   const megabytes = (value: number, most: number, set: (v: number) => void) => {
     const input = el("input");
     input.type = "number";

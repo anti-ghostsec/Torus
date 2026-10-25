@@ -85,7 +85,7 @@ PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig ./
   --disable-everything --disable-autodetect --disable-network --disable-doc --disable-debug \
   --disable-ffplay --disable-ffprobe --disable-avdevice --disable-postproc --disable-shared --enable-static \
   --enable-ffmpeg --enable-avfilter --enable-swscale --enable-swresample \
-  --enable-libvpx --enable-libopus \
+  --enable-libvpx --enable-libopus --enable-zlib \
   --enable-protocol=pipe \
   --enable-demuxer=mov,matroska \
   --enable-muxer=webm,image2pipe \
