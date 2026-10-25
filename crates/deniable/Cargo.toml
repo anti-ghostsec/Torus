@@ -1,0 +1,18 @@
+# This crate is copied, unchanged, into Torus, The Sentinel Protocol, FerroOS
+# and Enclave. Change it in one place and copy the folder to the others, so
+# the copies never drift apart. It inherits nothing from any workspace.
+[package]
+name = "deniable"
+description = "Deniable storage: encrypted volumes hidden in a container of random bytes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+blake2 = "0.10"
+chacha20 = "0.9"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = { version = "0.2", features = ["std"] }
+zeroize = "1"
