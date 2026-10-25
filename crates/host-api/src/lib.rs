@@ -199,7 +199,34 @@ type Output = Box<dyn AsyncRead + Send + Unpin>;
 /// Whatever keeps the process alive; dropping it ends the process.
 type Keeper = Box<dyn std::any::Any + Send + Sync>;
 
-fn plain(program: &Path) -> Result<(Input, Output, Keeper), String> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn plain(program: &Path, converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
+    let failed = |e: io::Error| format!("could not start the host process: {e}");
+    let mut keeper: Vec<Keeper> = Vec::new();
+    let mut host_told = Vec::new();
+    let mut host_ends = Vec::new();
+    if let Some(converter) = converter {
+        // The converter is the same program started in another role.
+        let (host_reads, converter_writes) = unix_pipe().map_err(failed)?;
+        let (converter_reads, host_writes) = unix_pipe().map_err(failed)?;
+        let told = vec![
+            (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
+            (CONVERTER_ROLE, "3,4".into()),
+        ];
+        let process = unix_launch(program, told, vec![converter_reads, converter_writes], false).map_err(failed)?;
+        keeper.push(Box::new(Mutex::new(process)));
+        host_told.push((CONVERTER_LINK, "3,4".into()));
+        host_ends = vec![host_reads, host_writes];
+    }
+    let mut process = unix_launch(program, host_told, host_ends, true).map_err(failed)?;
+    let stdin = process.stdin.take().expect("piped above");
+    let stdout = process.stdout.take().expect("piped above");
+    keeper.push(Box::new(Mutex::new(process)));
+    Ok((Box::new(stdin), Box::new(stdout), Box::new(keeper)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn plain(program: &Path, _converter: Option<&Path>) -> Result<(Input, Output, Keeper), String> {
     let mut launch = Launch::new(program);
     launch.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     // The host inherits nothing about the user's session.
@@ -521,9 +548,8 @@ impl Host {
     /// With `sandbox` set, the process runs confined, able to keep files in
     /// the sandbox's folder only.
     ///
-    /// With `converter` set to a video converter's program, and only when
-    /// confined, pictures and smaller copies are made from uploaded videos,
-    /// by a second process that has neither network nor files.
+    /// With `converter` set to a video converter's program, pictures and
+    /// smaller copies are made from uploaded videos, by a second process.
     pub async fn start(
         program: &Path,
         sandbox: Option<Sandbox<'_>>,
@@ -534,7 +560,7 @@ impl Host {
     ) -> Result<Self, String> {
         let (stdin, stdout, keeper) = match sandbox {
             Some(sandbox) => confined(program, &sandbox, converter)?,
-            None => plain(program)?,
+            None => plain(program, converter)?,
         };
         Self::over(stdin, stdout, keeper, target, site, records).await
     }

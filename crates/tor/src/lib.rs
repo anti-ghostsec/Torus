@@ -127,8 +127,8 @@ impl Tor {
         config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
         // Arti normally inspects the permissions of every folder above its
         // own. On Windows that check verifies nothing, and inside the sandbox
-        // those folders cannot even be looked at, so it only gets in the way.
-        #[cfg(windows)]
+        // those folders cannot even be looked at (nor can /etc/passwd), so it
+        // only gets in the way.
         config.storage().permissions().dangerously_trust_everyone();
         let config = config.build().map_err(|e| err("invalid Tor configuration", e))?;
         let client = TorClient::create_bootstrapped(config).await.map_err(|e| err("could not connect to Tor", e))?;

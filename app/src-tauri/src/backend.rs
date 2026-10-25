@@ -391,7 +391,11 @@ fn converter_program(host_program: &Path) -> Option<PathBuf> {
     };
     let beside = host_program.with_file_name(name);
     let developing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/ffmpeg").join(name);
-    [beside, developing].into_iter().find(|path| cfg!(debug_assertions) || path.parent() == host_program.parent()).filter(|path| path.is_file())
+    let developing_linux = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/ffmpeg/linux").join(name);
+    [beside, developing, developing_linux]
+        .into_iter()
+        .find(|path| cfg!(debug_assertions) || path.parent() == host_program.parent())
+        .filter(|path| path.is_file())
 }
 
 impl Backend {
@@ -403,7 +407,7 @@ impl Backend {
         site: Site,
         records: Option<Records>,
     ) -> Result<Host, String> {
-        let converter = sandbox.as_ref().and_then(|_| converter_program(&self.host_program));
+        let converter = converter_program(&self.host_program);
         Host::start(&self.host_program, sandbox, converter.as_deref(), target, site, records).await
     }
 
@@ -895,6 +899,7 @@ impl Backend {
         // this server is never reachable from outside this computer. It
         // keeps nothing on disk.
         let host = self.start_host(None, Target::Loopback, site, None).await.map_err(Failure::new)?;
+        host.answer_bank_with(self.banker(id));
         let address = host.address().to_owned();
         *slot = Some((id, host));
         Ok(address)
@@ -979,8 +984,7 @@ impl Backend {
             .start_host(Some(Sandbox { name: &container, folder: &dir }), target, site, Some(records))
             .await
             .map_err(Failure::new)?;
-        // Its visitors reach the wallet, for this site's books only. The
-        // local test server is never given it.
+        // Its visitors reach the wallet, for this site's books only.
         host.answer_bank_with(self.banker(id));
         let mut online = Hosted { host: Some(host), files_confined: true };
         // Trust nothing: ask the running host to open the vault. If it can,
