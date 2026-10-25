@@ -9,7 +9,7 @@
 # The result lands in tools/ffmpeg/<target>/ffmpeg (or ffmpeg.exe).
 set -euo pipefail
 
-TARGET=${1:?android or windows}
+TARGET=${1:?android, windows or linux}
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${FFMPEG_WORK:-$HERE/.work}/$TARGET
 OUT=$HERE/$TARGET
@@ -42,6 +42,14 @@ case $TARGET in
       --extra-ldflags="-static -static-libgcc")
     EXE=ffmpeg.exe
     ;;
+  linux)
+    HOST=x86_64-linux-gnu
+    export CC=$HOST-gcc CXX=$HOST-g++ AR=$HOST-ar RANLIB=$HOST-ranlib NM=$HOST-nm STRIP=$HOST-strip
+    VPX_TARGET=x86_64-linux-gcc
+    FF_FLAGS=(--target-os=linux --arch=x86_64 --cc="$CC" --cxx="$CXX" --ar="$AR"
+      --ranlib="$RANLIB" --nm="$NM" --strip="$STRIP" --enable-pic --extra-ldflags="-static")
+    EXE=ffmpeg
+    ;;
   *) echo "unknown target $TARGET" >&2; exit 2 ;;
 esac
 
@@ -54,7 +62,14 @@ rm -rf opus && mkdir opus && tar -xzf opus.tar.gz -C opus --strip-components=1
   --disable-doc --disable-extra-programs --with-pic >/dev/null && make -j"$JOBS" >/dev/null && make install >/dev/null)
 
 # libvpx (VP8/VP9)
-[ -d libvpx ] || git clone -q --depth 1 --branch $VPX_TAG https://chromium.googlesource.com/webm/libvpx
+if [ ! -d libvpx ]; then
+  if command -v git >/dev/null 2>&1; then
+    git clone -q --depth 1 --branch $VPX_TAG https://chromium.googlesource.com/webm/libvpx
+  else
+    fetch "https://github.com/webmproject/libvpx/archive/refs/tags/$VPX_TAG.tar.gz" libvpx.tar.gz
+    mkdir libvpx && tar -xzf libvpx.tar.gz -C libvpx --strip-components=1
+  fi
+fi
 (cd libvpx && make distclean >/dev/null 2>&1 || true
  CROSS=${HOST}- ./configure --target=$VPX_TARGET --prefix="$PREFIX" --disable-shared --enable-static \
    --disable-examples --disable-tools --disable-docs --disable-unit-tests --enable-vp9-highbitdepth \

@@ -24,10 +24,15 @@ const binaries = join(root, "app", "src-tauri", "binaries");
 mkdirSync(binaries, { recursive: true });
 copyFileSync(built, join(binaries, `torus-host-${triple}${exe}`));
 
-// Built by tools/ffmpeg/build.sh windows, or put in place by hand.
-const converter = [join(root, "tools", "ffmpeg", "windows", `ffmpeg${exe}`), join(root, "tools", "ffmpeg", `ffmpeg${exe}`)].find(existsSync);
+// Built by tools/ffmpeg/build.sh (windows, linux, android), or put in place by hand.
+const platformDir = triple.includes("windows") ? "windows" : triple.includes("android") ? "android" : "linux";
+const converter = [
+  join(root, "tools", "ffmpeg", platformDir, `ffmpeg${exe}`),
+  join(root, "tools", "ffmpeg", `ffmpeg${exe}`),
+  join(root, "tools", "ffmpeg", "windows", `ffmpeg${exe}`),
+].find(existsSync);
 if (!converter) {
-  throw new Error("The video converter is missing: run tools/ffmpeg/build.sh windows");
+  throw new Error(`The video converter is missing: run tools/ffmpeg/build.sh ${platformDir}`);
 }
 copyFileSync(converter, join(binaries, `ffmpeg-${triple}${exe}`));
 console.log(`Prepared ${binaries}`);

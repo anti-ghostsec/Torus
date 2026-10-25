@@ -1,5 +1,6 @@
-# Builds the portable Windows app and the Android app and publishes them as a
-# GitHub release. Runs when a version tag (v1.2.3) is pushed, or by hand.
+# Builds the portable Linux app, portable Windows app and the Android app and
+# publishes them as a GitHub release. Runs when a version tag (v1.2.3) is pushed,
+# or by hand.
 #
 # To sign the Android app with your own key, add these repository secrets:
 #   ANDROID_KEYSTORE_BASE64  the keystore file, base64-encoded
@@ -39,7 +40,8 @@ jobs:
       - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 nsis nasm yasm pkg-config autoconf automake libtool
+          sudo apt-get install -y mingw-w64 nsis nasm yasm pkg-config autoconf automake libtool \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
 
       - uses: actions/setup-java@v4
         with:
@@ -65,8 +67,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Video converter (FFmpeg) for Windows and Android
+      - name: Video converter (FFmpeg) for Linux, Windows and Android
         run: |
+          tools/ffmpeg/build.sh linux
           tools/ffmpeg/build.sh windows
           tools/ffmpeg/build.sh android
           rm -rf tools/ffmpeg/.work
@@ -74,6 +77,10 @@ jobs:
       - name: Front end
         working-directory: app
         run: npm ci
+
+      - name: Linux (portable)
+        working-directory: app
+        run: npm run portable:linux
 
       - name: Windows (portable)
         working-directory: app
@@ -112,9 +119,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cp target/portable/Torus_*_linux_portable.tar.gz "Torus_${TAG#v}_linux_portable.tar.gz"
           cp target/portable/Torus_*_windows_portable.zip "Torus_${TAG#v}_windows_portable.zip"
-          sha256sum "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
+          sha256sum "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
           cat > notes.md <<'NOTES'
+          **Linux (portable):** unpack `Torus_*_linux_portable.tar.gz` and run `Torus/torus`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus/TorusData`. Sites are confined using Linux Landlock and seccomp sandboxing.
+
           **Windows (portable):** unzip `Torus_*_windows_portable.zip` anywhere on an NTFS drive and run `Torus\torus.exe`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus\TorusData`. It is not code-signed, so Windows SmartScreen warns the first time: choose "More info", then "Run anyway".
 
           **Android (64-bit ARM):** install `Torus_*_arm64.apk`. Android asks to allow installing apps from this source.
@@ -122,4 +132,4 @@ jobs:
           Every site's host runs in a sandbox, every uploaded video is encoded afresh before anyone can watch it (up to 10 GB), and nothing is left readable on disk without the passphrase. Check downloads against `SHA256SUMS.txt`.
           NOTES
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "Torus $TAG" --notes-file notes.md --target "$GITHUB_SHA"
-          gh release upload "$TAG" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
+          gh release upload "$TAG" "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
