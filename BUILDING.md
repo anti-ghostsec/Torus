@@ -1,15 +1,16 @@
 # Building Torus
 
-Both targets build from a Linux machine (tested on Ubuntu 24.04).
+Builds from a Linux machine (tested on Ubuntu 24.04).
 
 ## Requirements
 
-- Rust (stable) with the targets `x86_64-pc-windows-gnu` and `aarch64-linux-android`
+- Rust (stable)
 - Node 22 and `npm install` in `app/`
-- Windows: `mingw-w64` and `nsis`
+- Linux: `pkg-config`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`
+- Windows: `mingw-w64` and `nsis` (with rust target `x86_64-pc-windows-gnu`)
 - Android: the Android SDK (platform `android-37.0`, build-tools 37) and NDK 29, with
-  `ANDROID_HOME` and `ANDROID_NDK_HOME` set, and Java 17+
-- Video converter: `git`, `curl`, `make`, `nasm`/`yasm`, `pkg-config`
+  `ANDROID_HOME` and `ANDROID_NDK_HOME` set, and Java 17+ (with rust target `aarch64-linux-android`)
+- Video converter: `git` or `curl`, `make`, `nasm`/`yasm`, `pkg-config`
 
 ## The video converter
 
@@ -18,9 +19,23 @@ watch it. Build the static, LGPL-only FFmpeg the app ships (VP9/Opus, no network
 code) once per target:
 
 ```sh
+tools/ffmpeg/build.sh linux     # -> tools/ffmpeg/linux/ffmpeg
 tools/ffmpeg/build.sh windows   # -> tools/ffmpeg/windows/ffmpeg.exe
 ANDROID_NDK_HOME=... tools/ffmpeg/build.sh android   # -> tools/ffmpeg/android/ffmpeg
 ```
+
+## Linux
+
+```sh
+cd app && npm run portable:linux
+```
+
+This makes `target/portable/Torus_<version>_linux_portable.tar.gz`: a `Torus`
+folder with `torus`, `torus-host` and `ffmpeg`. Nothing is installed.
+Everything the app keeps, encrypted, goes in a `TorusData` folder beside
+`torus`. The sandbox confines each site using Linux Landlock and seccomp.
+
+(`npm run bundle:linux` makes `.deb` and `.AppImage` packages.)
 
 ## Windows
 

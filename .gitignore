@@ -8,3 +8,4 @@ tools/ffmpeg/ffmpeg.exe
 tools/ffmpeg/.work/
 tools/ffmpeg/android/
 tools/ffmpeg/windows/
+tools/ffmpeg/linux/

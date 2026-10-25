@@ -8,9 +8,11 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "bundle": "node scripts/prepare-bundle.mjs && tauri build --config src-tauri/tauri.bundle.conf.json",
+    "bundle": "node scripts/prepare-bundle.mjs && tauri build --config src-tauri/tauri.linux.conf.json",
+    "bundle:linux": "node scripts/prepare-bundle.mjs && tauri build --config src-tauri/tauri.linux.conf.json",
     "bundle:windows": "node scripts/prepare-bundle.mjs x86_64-pc-windows-gnu && tauri build --target x86_64-pc-windows-gnu --config src-tauri/tauri.bundle.conf.json",
     "bundle:android": "node scripts/prepare-android.mjs && tauri android build --target aarch64 --apk",
+    "portable:linux": "node scripts/package-portable-linux.mjs",
     "portable:windows": "node scripts/package-portable.mjs"
   },
   "dependencies": {
