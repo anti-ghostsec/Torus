@@ -206,13 +206,17 @@ fn plain(program: &Path, converter: Option<&Path>) -> Result<(Input, Output, Kee
     let mut host_told = Vec::new();
     let mut host_ends = Vec::new();
     if let Some(converter) = converter {
-        // The converter is the same program started in another role.
+        // The converter is the same program started in another role. The
+        // host runs unconfined here, but the converter reads whatever is
+        // uploaded, so it is confined as always: no network, no files, and
+        // the one program it may run.
         let (host_reads, converter_writes) = unix_pipe().map_err(failed)?;
         let (converter_reads, host_writes) = unix_pipe().map_err(failed)?;
-        let told = vec![
-            (CONVERTER_PROGRAM, converter.as_os_str().to_owned()),
-            (CONVERTER_ROLE, "3,4".into()),
-        ];
+        let mut programs: Vec<&Path> = SYSTEM_READS.iter().map(Path::new).collect();
+        programs.push(converter);
+        let mut told = unix_confine::surroundings(&[Path::new(DISCARD)], &programs, true);
+        told.push((CONVERTER_PROGRAM, converter.as_os_str().to_owned()));
+        told.push((CONVERTER_ROLE, "3,4".into()));
         let process = unix_launch(program, told, vec![converter_reads, converter_writes], false).map_err(failed)?;
         keeper.push(Box::new(Mutex::new(process)));
         host_told.push((CONVERTER_LINK, "3,4".into()));
