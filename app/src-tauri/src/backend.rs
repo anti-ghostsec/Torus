@@ -1857,6 +1857,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_publish_local_has_wallet_and_video_upload() {
+        let (backend, dir) = backend("local-video");
+        backend.create_vault("correct horse battery".into(), torus_core::starters::video_site()).unwrap();
+        let address = backend.publish_local(1, torus_core::starters::video_site()).await.unwrap();
+        let guest_account = exchange(&address, format!("GET /account HTTP/1.1\r\nHost: {{host}}\r\nConnection: close\r\n\r\n")).await;
+        assert!(guest_account.contains("Sign in") && guest_account.contains("Create account"));
+        let body = "name=Alice&_password=correct+horse+battery";
+        let joined = exchange(
+            &address,
+            format!(
+                "POST /_account/signup HTTP/1.1\r\nHost: {{host}}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        ).await;
+        let cookie = joined.lines().find_map(|l| l.strip_prefix("set-cookie: ")).and_then(|c| c.split(';').next()).unwrap().to_owned();
+        let member_account = exchange(&address, format!("GET /account HTTP/1.1\r\nHost: {{host}}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n")).await;
+        assert!(member_account.contains("Your Monero"));
+        let token = member_account.lines().find_map(|l| {
+            if l.contains("name=\"_token\"") {
+                let after = l.split("value=\"").nth(1)?;
+                Some(after.split('"').next()?.to_owned())
+            } else {
+                None
+            }
+        }).unwrap();
+
+        // Now test video upload to /_form/videos
+        let boundary = "---------------------------1234567890123456789012345678";
+        let mut body_bytes = Vec::new();
+        let add_text = |b: &mut Vec<u8>, name: &str, val: &str| {
+            b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n").as_bytes());
+        };
+        add_text(&mut body_bytes, "_token", &token);
+        add_text(&mut body_bytes, "_next", "/upload");
+        add_text(&mut body_bytes, "title", "Test Video");
+        add_text(&mut body_bytes, "description", "Test Description");
+        
+        body_bytes.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"test.mp4\"\r\nContent-Type: video/mp4\r\n\r\n").as_bytes());
+        let ftyp = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2mp41\x00\x00\x00\x08mdat";
+        body_bytes.extend_from_slice(ftyp);
+        body_bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let name = address.trim_start_matches("http://");
+        let mut stream = tokio::net::TcpStream::connect(name).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        let head = format!("POST /_form/videos HTTP/1.1\r\nHost: {name}\r\nCookie: {cookie}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body_bytes.len());
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&body_bytes).await.unwrap();
+        let mut res = String::new();
+        use tokio::io::AsyncReadExt;
+        stream.read_to_string(&mut res).await.unwrap();
+        assert!(res.contains("303") || res.contains("200"), "Upload failed: {res}");
+        backend.stop(1).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn an_inline_host_serves_and_stops() {
         let host = start_inline(Target::Loopback, site("Inline", "served from inside"), None).await.unwrap();
         let address = host.address().to_owned();

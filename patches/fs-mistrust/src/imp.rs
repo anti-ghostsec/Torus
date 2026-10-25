@@ -136,7 +136,9 @@ impl<'a> super::Verifier<'a> {
 
         self.check_type(path, path_type, meta, &mut errors);
         #[cfg(target_family = "unix")]
-        self.check_permissions(path, path_type, meta, &mut errors);
+        if !self.mistrust.is_disabled() {
+            self.check_permissions(path, path_type, meta, &mut errors);
+        }
         errors
     }
 
@@ -179,6 +181,9 @@ impl<'a> super::Verifier<'a> {
         meta: &Metadata,
         errors: &mut Vec<Error>,
     ) {
+        if self.mistrust.is_disabled() {
+            return;
+        }
         // We need to check that the owner is trusted, since the owner can
         // always change the permissions of the object.  (If we're talking
         // about a directory, the owner cah change the permissions and owner
