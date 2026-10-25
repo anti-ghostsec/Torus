@@ -94,7 +94,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { video_mb: 300, storage_mb: 5 * 1024, sizes: true, shrink: true }
+        Self { video_mb: 1024, storage_mb: 5 * 1024, sizes: true, shrink: true }
     }
 }
 

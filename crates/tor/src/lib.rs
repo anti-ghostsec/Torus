@@ -203,4 +203,13 @@ mod tests {
         assert_eq!(address_a.len(), 56 + ".onion".len());
         assert!(address_a.ends_with(".onion"));
     }
+
+    #[test]
+    fn tor_config_builds_without_passwd_or_group_databases() {
+        let dir = std::env::temp_dir().join(format!("tor-config-test-{}", std::process::id()));
+        let mut config = TorClientConfigBuilder::from_directories(&dir.join("state"), &dir.join("cache"));
+        config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
+        config.storage().permissions().dangerously_trust_everyone();
+        assert!(config.build().is_ok());
+    }
 }
