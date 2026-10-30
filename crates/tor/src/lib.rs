@@ -16,6 +16,7 @@ use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
 use tor_rtcompat::PreferredRuntime;
 use torus_runtime::{serve_connection, Live};
+use tokio::net::TcpStream;
 use futures::StreamExt;
 use safelog::DisplayRedacted;
 use tokio::task::JoinHandle;
@@ -108,6 +109,15 @@ impl Drop for Onion {
     }
 }
 
+/// What a service does with each visitor.
+#[derive(Clone)]
+enum Handler {
+    /// Serves the site's own pages.
+    Serve(Live),
+    /// Passes the visitor to the app on this port of 127.0.0.1.
+    Forward(u16),
+}
+
 /// A connection to the Tor network, shared by every site this app hosts.
 pub struct Tor {
     client: Arc<TorClient<PreferredRuntime>>,
@@ -144,10 +154,22 @@ impl Tor {
         self.client.connect_with_prefs((host, port), &prefs).await.map_err(|e| err("could not reach the node through Tor", e))
     }
 
-    /// Starts serving `live` at the address of `identity`. `name` tells this
+    /// Starts serving `live` at the address of `identity`.
+    pub fn launch(&self, name: &str, identity: &Identity, live: Live) -> Result<Onion, Error> {
+        self.launch_with(name, identity, Handler::Serve(live))
+    }
+
+    /// Starts passing visitors to the app listening on `port` of this
+    /// computer, at the address of `identity`. What the app answers goes back
+    /// unchanged: none of the runtime's own protections apply to it.
+    pub fn launch_forward(&self, name: &str, identity: &Identity, port: u16) -> Result<Onion, Error> {
+        self.launch_with(name, identity, Handler::Forward(port))
+    }
+
+    /// Starts serving at the address of `identity`. `name` tells this
     /// app's services apart and never leaves the machine; it must stay paired
     /// with the same identity for as long as this connection lives.
-    pub fn launch(&self, name: &str, identity: &Identity, live: Live) -> Result<Onion, Error> {
+    fn launch_with(&self, name: &str, identity: &Identity, handler: Handler) -> Result<Onion, Error> {
         let service_config = OnionServiceConfigBuilder::default()
             .nickname(name.parse().map_err(|e| err("invalid service name", e))?)
             // Makes visitors solve a puzzle when the service is being flooded.
@@ -176,12 +198,29 @@ impl Tor {
             let mut streams = std::pin::pin!(handle_rend_requests(requests));
             while let Some(request) = streams.next().await {
                 let is_http = matches!(request.request(), IncomingStreamRequest::Begin(begin) if begin.port() == 80);
-                let live = live.clone();
+                let handler = handler.clone();
                 tokio::spawn(async move {
                     if !is_http {
                         let _ = request.reject(End::new_misc()).await;
-                    } else if let Ok(stream) = request.accept(Connected::new_empty()).await {
-                        serve_connection(stream, live).await;
+                        return;
+                    }
+                    match handler {
+                        Handler::Serve(live) => {
+                            if let Ok(stream) = request.accept(Connected::new_empty()).await {
+                                serve_connection(stream, live).await;
+                            }
+                        }
+                        Handler::Forward(port) => {
+                            // Connect first, so a visitor to an app that is
+                            // not running is turned away instead of left hanging.
+                            let Ok(mut app) = TcpStream::connect(("127.0.0.1", port)).await else {
+                                let _ = request.reject(End::new_misc()).await;
+                                return;
+                            };
+                            if let Ok(mut stream) = request.accept(Connected::new_empty()).await {
+                                let _ = tokio::io::copy_bidirectional(&mut stream, &mut app).await;
+                            }
+                        }
                     }
                 });
             }

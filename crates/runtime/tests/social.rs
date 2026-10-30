@@ -188,6 +188,7 @@ async fn a_sealed_collection_cannot_be_read_by_the_site_itself() {
         seal_key: Some(torus_seal::to_hex(&torus_seal::public_key(&secret).unwrap())),
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![Collection {
             name: "tips".into(),
             fields: vec![Field { name: "message".into(), label: "Message".into(), kind: FieldKind::LongText, required: true }],
@@ -253,6 +254,7 @@ async fn old_text_in_a_field_that_became_a_file_field_cannot_name_a_file_to_dele
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![Collection {
             name: "notes".into(),
             fields: vec![Field { name: "note".into(), label: "Note".into(), kind, required: true }],

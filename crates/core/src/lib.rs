@@ -18,6 +18,6 @@ pub use compile::{
 };
 pub use lint::{lint, Finding, Severity};
 pub use model::{
-    Align, Audience, Block, Collection, Field, FieldKind, Layout, Limits, Page, Record, Scope, Site, Theme, HOME_SLUG,
+    Align, Audience, Block, Collection, Field, FieldKind, Forward, Layout, Limits, Page, Record, Scope, Site, Theme, HOME_SLUG,
     ID_TOKEN, SEALED_FIELD, USERS, USER_NAME,
 };

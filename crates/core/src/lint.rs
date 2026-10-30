@@ -79,6 +79,20 @@ pub fn lint(site: &Site) -> Vec<Finding> {
     if !site.pages.iter().any(|p| p.slug == HOME_SLUG) {
         site_wide(Severity::Error, "The site needs a home page with the slug \"index\".".into());
     }
+    if let Some(forward) = site.forward {
+        if forward.port == 0 {
+            site_wide(Severity::Error, "Forwarding needs the port the app listens on.".into());
+        } else {
+            site_wide(
+                Severity::Warning,
+                format!(
+                    "Visitors are passed to the app on port {}. Torus does not build or check its pages, so it cannot \
+                     stop them leaking scripts, outside requests or details about this computer.",
+                    forward.port
+                ),
+            );
+        }
+    }
     if contains_email(&site.title) {
         site_wide(Severity::Warning, "The site title contains an email address.".into());
     }
@@ -447,6 +461,7 @@ fn contains_email(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{check, Forward};
 
     #[test]
     fn classifies_links() {
@@ -470,5 +485,25 @@ mod tests {
         assert!(contains_email("write to me@example.com today"));
         assert!(!contains_email("meet @ noon"));
         assert!(!contains_email("user@localhost"));
+    }
+
+    #[test]
+    fn a_forwarded_site_is_always_warned_about() {
+        let mut site = crate::starters::by_name("board").unwrap();
+        assert!(!lint(&site).iter().any(|f| f.message.contains("does not build or check")));
+        site.forward = Some(Forward { port: 3000 });
+        let findings = lint(&site);
+        assert!(findings.iter().any(|f| f.severity == Severity::Warning && f.message.contains("port 3000")));
+        assert!(check(&site).is_ok(), "a warning alone does not stop publishing");
+        site.forward = Some(Forward { port: 0 });
+        assert!(check(&site).is_err(), "port 0 is not an app");
+    }
+
+    #[test]
+    fn sites_saved_before_forwarding_still_load() {
+        let mut saved = serde_json::to_value(crate::starters::by_name("board").unwrap()).unwrap();
+        saved.as_object_mut().unwrap().remove("forward");
+        let site: Site = serde_json::from_value(saved).unwrap();
+        assert_eq!(site.forward, None);
     }
 }

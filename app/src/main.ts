@@ -74,6 +74,8 @@ type Site = {
     puzzle_collections?: string[];
     puzzle_sign_up?: boolean;
   };
+  // An app on this computer that visitors are passed to instead of these pages.
+  forward?: { port: number } | null;
 };
 // A record as the running site stores it.
 type Stored = { id: string; fields: Record<string, string>; held?: boolean };
@@ -890,6 +892,73 @@ function renderSettings() {
       "Every uploaded video is encoded afresh, in a sandbox with no network and no files, before anyone can watch it: nothing the camera or phone recorded about it survives. Large videos take a while to appear. Leave room for twice the largest video while one is being prepared.",
     ),
   );
+
+  // Passing visitors to an app with a server of its own. It skips every
+  // protection Torus gives its own pages, so it is only turned on after the
+  // owner has been shown what that means.
+  const forwardRisks = [
+    "Torus doesn't build or check that app's pages, so its leak checker can't protect you. The app can send scripts, load things from other sites, or reveal details about this computer, such as its clock, software versions or file times.",
+    "The app runs outside Torus's sandbox, with your own user's access to this computer. A flaw in it that a visitor can reach is a flaw in your computer.",
+    "If the app contacts other sites itself, such as to fetch data, those sites see this computer's real internet address unless the app is set up to go through Tor.",
+    "Nothing the app keeps is in the encrypted vault, and the panic action and decoy passphrase don't touch it.",
+  ];
+  const riskList = () => {
+    const box = el("div", "forward-risks");
+    box.append(el("strong", "", "More risk: Torus can't protect this site"));
+    const list = el("ul");
+    for (const risk of forwardRisks) list.append(el("li", "", risk));
+    box.append(list);
+    return box;
+  };
+  if (site.forward) {
+    const port = el("input");
+    port.type = "number";
+    port.min = "1";
+    port.max = "65535";
+    port.value = String(site.forward.port);
+    port.addEventListener("change", () => {
+      const typed = Math.round(Number(port.value));
+      site.forward = { port: Math.min(65535, Math.max(1, Number.isFinite(typed) ? typed : 1)) };
+      refresh();
+    });
+    const off = el("button", "", "Stop passing visitors to the app");
+    off.addEventListener("click", () => {
+      site.forward = null;
+      refresh();
+    });
+    siteHost.append(
+      el("h3", "", "Passed to an app on this computer"),
+      riskList(),
+      field("The app's port on 127.0.0.1", port),
+      el("p", "hint", "Visitors to this site's address get whatever that app answers; the pages here aren't shown. The app must already be running. A change takes effect the next time the site goes online. Not available on Windows yet."),
+      off,
+    );
+  } else {
+    const open = el("button", "", "Pass visitors to an app on this computer…");
+    open.addEventListener("click", () => {
+      const port = el("input");
+      port.type = "number";
+      port.min = "1";
+      port.max = "65535";
+      port.value = "3000";
+      const agree = el("button", "danger", "I understand, pass visitors to the app");
+      const cancel = el("button", "", "Cancel");
+      cancel.addEventListener("click", () => refresh());
+      agree.addEventListener("click", () => {
+        const typed = Math.round(Number(port.value));
+        site.forward = { port: Math.min(65535, Math.max(1, Number.isFinite(typed) ? typed : 3000)) };
+        refresh();
+      });
+      open.replaceWith(
+        el("p", "hint", "For a site that already runs as its own web app, such as one with a database or a server of its own: this site's .onion address passes every visitor straight to that app."),
+        riskList(),
+        field("The app's port on 127.0.0.1", port),
+        agree,
+        cancel,
+      );
+    });
+    siteHost.append(open);
+  }
 
   // Moderation: blocked words, and approval of new accounts.
   const mod = (site.moderation ??= { blocked_words: [] });

@@ -195,6 +195,7 @@ pub fn video_site() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![
             collection(
                 USERS,
@@ -303,6 +304,7 @@ pub fn board() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: Vec::new(),
         pages: vec![page(
             HOME_SLUG,
@@ -399,6 +401,7 @@ pub fn microblog() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![
             collection(
                 USERS,
@@ -487,6 +490,7 @@ pub fn wiki() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![
             collection(
                 USERS,
@@ -601,6 +605,7 @@ pub fn pastebin() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         collections: vec![collection(
             "pastes",
             None,
