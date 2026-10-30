@@ -84,8 +84,20 @@ impl Serving {
     }
 }
 
-async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(Serving, String), String> {
+/// `forward` is the port of the app on this computer that visitors are
+/// passed to instead of being served the site's pages.
+async fn start(target: Target, live: Live, forward: Option<u16>, kept: &mut Option<Kept>) -> Result<(Serving, String), String> {
+    // Windows keeps a sandboxed process from reaching this computer's own
+    // addresses, so the host could never reach the app there.
+    if cfg!(windows) && forward.is_some() {
+        return Err("Passing visitors to an app on this computer is not available on Windows yet.".into());
+    }
     match target {
+        // The app already has a local address of its own; nothing to serve.
+        Target::Loopback if forward.is_some() => {
+            let address = format!("http://127.0.0.1:{}", forward.unwrap_or_default());
+            Ok((Serving::Loopback(Task(tokio::spawn(std::future::pending()))), address))
+        }
         Target::Loopback => {
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
             let bound = listener.local_addr().map_err(|e| e.to_string())?;
@@ -100,7 +112,11 @@ async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(S
                 .map_err(|_| "the onion key is damaged".to_owned())?;
             unpack(&state_dir, &cache_dir, file, kept_key, kept)?;
             let tor = Tor::connect(&state_dir, &cache_dir).await.map_err(|e| e.to_string())?;
-            let onion = tor.launch("site", &identity, live).map_err(|e| e.to_string())?;
+            let onion = match forward {
+                Some(port) => tor.launch_forward("site", &identity, port),
+                None => tor.launch("site", &identity, live),
+            }
+            .map_err(|e| e.to_string())?;
             let address = onion.address().to_owned();
             Ok((Serving::Onion { onion, _tor: tor, _keeping: keep_periodically(kept) }, address))
         }
@@ -192,6 +208,8 @@ where
 {
 
     let Ok(Some(Command::Start { target, site, records })) = read_frame(&mut stdin).await else { return 2 };
+    // Fixed for as long as the site is online: switching takes a restart.
+    let forward = site.forward.map(|f| f.port);
     let live = match open(site, records) {
         Ok(live) => {
             // Where the editor started a converter beside this host, videos
@@ -211,7 +229,7 @@ where
     live.bank_with(std::sync::Arc::new(Piped(bank)));
     let mut waiting: std::collections::HashMap<u64, oneshot::Sender<Told>> = Default::default();
     let mut next_question = 0u64;
-    let serving = match start(target, live.clone(), kept).await {
+    let serving = match start(target, live.clone(), forward, kept).await {
         Ok((serving, address)) => {
             if write_frame(&mut stdout, &Event::Ready { address }).await.is_err() {
                 return 0;

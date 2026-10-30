@@ -14,6 +14,7 @@ use tor_rtcompat::PreferredRuntime;
 use torus_core::{Align, Block, Page, Site, Theme};
 use torus_runtime::Live;
 use torus_tor::{new_identity, Tor};
+use tokio::net::TcpListener;
 
 fn site() -> Site {
     let text = |t: &str| Block::Text { text: t.into(), align: Align::Left };
@@ -25,6 +26,7 @@ fn site() -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         pages: vec![
             Page {
                 slug: "index".into(),
@@ -167,6 +169,69 @@ async fn a_published_site_survives_a_visit_over_tor() {
         assert!(!response.to_ascii_lowercase().contains("\r\ndate:"));
     }
     println!("all checks passed over Tor");
+
+    drop(onion);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in for an app with a server of its own: answers every connection
+/// with one fixed page.
+async fn app() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else { continue };
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let first = String::from_utf8_lossy(&request[..n]).lines().next().unwrap_or_default().to_owned();
+                let body = format!("hello from the app, you asked for {first}");
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (port, task)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "connects to the real Tor network and takes a few minutes"]
+async fn a_forwarded_site_reaches_the_local_app_over_tor() {
+    let dir = std::env::temp_dir().join(format!("torus-tor-forward-test-{}", std::process::id()));
+    let (port, app) = app().await;
+
+    let identity = new_identity().unwrap();
+    let tor = Tor::connect(&dir.join("state"), &dir.join("cache")).await.unwrap();
+    let onion = tor.launch_forward("forward", &identity, port).unwrap();
+    let address = onion.address().to_owned();
+    println!("address: {address}, forwarding to port {port}");
+
+    let config = TorClientConfigBuilder::from_directories(dir.join("visitor-state"), dir.join("visitor-cache"))
+        .build()
+        .unwrap();
+    let visitor = TorClient::create_bootstrapped(config).await.unwrap();
+
+    let mut reply = None;
+    for attempt in 1..=8 {
+        reply = visit(&visitor, &address, &get("/title/1")).await;
+        if reply.is_some() {
+            break;
+        }
+        println!("attempt {attempt} failed; service state {}", onion.state());
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let reply = reply.expect("the app was never reachable over Tor");
+    println!("{reply}");
+    assert!(reply.starts_with("HTTP/1.1 200"));
+    assert!(reply.ends_with("hello from the app, you asked for GET /title/1 HTTP/1.1"), "the request or reply was changed on the way");
+
+    // With the app gone, visitors are turned away rather than left waiting.
+    app.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let gone = tokio::time::timeout(Duration::from_secs(90), visit(&visitor, &address, &get("/"))).await;
+    assert!(matches!(gone, Ok(None)), "a visitor reached an app that is not running: {gone:?}");
+    println!("forwarding checks passed over Tor");
 
     drop(onion);
     let _ = std::fs::remove_dir_all(&dir);

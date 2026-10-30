@@ -410,3 +410,31 @@ h2:first-child {
 .wallet button {
   margin: 0.25rem 0.25rem 0.25rem 0;
 }
+
+/* Shown wherever a site passes visitors to an app Torus cannot protect. */
+.forward-risks {
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  user-select: text;
+}
+
+.forward-risks strong {
+  color: var(--warn);
+}
+
+.forward-risks ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.forward-risks li {
+  margin: 4px 0;
+}
+
+button.danger {
+  border-color: var(--warn);
+  color: var(--warn);
+}

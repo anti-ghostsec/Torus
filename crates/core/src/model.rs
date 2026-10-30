@@ -37,6 +37,19 @@ pub struct Site {
     /// wait for approval.
     #[serde(default)]
     pub moderation: Moderation,
+    /// When set, the site's address is passed straight to an app already
+    /// running on this computer, and none of the pages here are served.
+    #[serde(default)]
+    pub forward: Option<Forward>,
+}
+
+/// An app on this computer that a site's visitors are passed to as they
+/// are, such as a web app with a server of its own. Torus neither builds
+/// nor checks what it serves, so none of the leak checks apply to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forward {
+    /// The app's port on 127.0.0.1.
+    pub port: u16,
 }
 
 /// The owner's standing rules for what visitors may add.

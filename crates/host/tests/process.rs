@@ -19,6 +19,7 @@ fn site(text: &str) -> Site {
         seal_key: None,
         limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         pages: vec![Page {
             slug: "index".into(),
             title: "Home".into(),

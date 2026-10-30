@@ -1439,6 +1439,7 @@ mod tests {
             seal_key: None,
             limits: Default::default(),
         moderation: Default::default(),
+        forward: None,
         }
     }
 

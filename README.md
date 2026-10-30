@@ -16,6 +16,12 @@ Pages are plain HTML and CSS, with no scripts and no third-party requests. A bui
 
 You can also mine a **vanity onion address** that starts with letters you choose.
 
+### Passing visitors to an app you run yourself
+
+A site can instead pass its visitors straight to a web app already running on your computer, such as one with its own server and database. Turn it on under the site's settings and give the app's port on `127.0.0.1`. Torus still provides the onion address, its key in the vault, and Tor.
+
+**This carries more risk than a site Torus builds.** Torus doesn't build or check that app's pages, and the app runs outside the sandbox and the vault. It can leak scripts, outside requests, or details about your computer to visitors. Any sites it contacts itself see your real IP address unless it goes through Tor. The editor shows these risks before you can turn it on, and keeps showing them while it's on. This isn't available on Windows yet, because Windows keeps sandboxed programs from reaching the computer's own addresses.
+
 ## How it keeps you safe
 
 - **Everything is in one encrypted vault.** Sites, keys, visitor data and the wallet are encrypted with Argon2id and XChaCha20-Poly1305. Nothing is readable on disk without your passphrase.
