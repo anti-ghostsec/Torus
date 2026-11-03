@@ -160,9 +160,22 @@ fn keep_periodically(kept: &Option<Kept>) -> Option<Task> {
     })
 }
 
-/// Passes one request on to the relay's node.
-async fn fetch(serving: &Serving, route: &str, body: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+/// Passes one request on to the relay's node, or to `other`: another node,
+/// which must be an onion service, so asking it never leaves Tor's onion
+/// network for the open internet.
+async fn fetch(serving: &Serving, other: Option<&str>, route: &str, body: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let Serving::Relay { tor, node, .. } = serving else { return Err("this host is not a relay".into()) };
+    let other = match other {
+        None => None,
+        Some(text) => {
+            let parsed = Node::parse(text).ok_or_else(|| "that is not a node's address".to_owned())?;
+            if !parsed.host.ends_with(".onion") {
+                return Err("a second node must be an onion service".into());
+            }
+            Some(parsed)
+        }
+    };
+    let node = other.as_ref().unwrap_or(node);
     let stream = tor.open(&node.host, node.port).await.map_err(|e| e.to_string())?;
     torus_host_api::node::post(stream, node, route, body, limit).await
 }
@@ -265,8 +278,8 @@ where
                         continue;
                     }
                     Some(Command::Ask { seq, question }) => match *question {
-                        Command::Fetch { route, body, limit } => {
-                            let body = fetch(&serving, &route, &body, limit).await.map(HexBytes);
+                        Command::Fetch { route, body, limit, node } => {
+                            let body = fetch(&serving, node.as_deref(), &route, &body, limit).await.map(HexBytes);
                             Event::Answer { seq, answer: Box::new(Event::Fetched { body }) }
                         }
                         question => match answer(&live, question) {

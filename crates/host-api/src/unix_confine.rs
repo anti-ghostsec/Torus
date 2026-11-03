@@ -44,6 +44,13 @@ const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
 const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+/// Version 4: TCP binding and connecting.
+const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
+/// Version 6: abstract UNIX sockets and signals, both kept to processes
+/// confined the same way.
+const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+const SCOPE_SIGNAL: u64 = 1 << 1;
 
 const EXECUTE: u64 = 1 << 0;
 const WRITE_FILE: u64 = 1 << 1;
@@ -80,16 +87,22 @@ fn handled_rights(abi: i64) -> u64 {
     rights
 }
 
-/// Limits the files this process can open. `false` where the kernel has no
-/// Landlock or refuses it.
-fn landlock(read_write: &[PathBuf], read_run: &[PathBuf]) -> bool {
+/// Limits the files this process can open. Where the kernel can, it also
+/// keeps it from signalling or reaching, through abstract UNIX sockets,
+/// any process outside its confinement (the editor, the desktop session's
+/// services), and an `offline` one from any TCP at all. `false` where the
+/// kernel has no Landlock or refuses it.
+fn landlock(read_write: &[PathBuf], read_run: &[PathBuf], offline: bool) -> bool {
     unsafe {
         let abi = libc::syscall(SYS_LANDLOCK_CREATE_RULESET, std::ptr::null::<RulesetAttr>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION);
         if abi < 1 {
             return false;
         }
         let handled = handled_rights(abi);
-        let attr = RulesetAttr { handled_access_fs: handled, handled_access_net: 0, scoped: 0 };
+        // Handled with no rule allowing it: refused outright.
+        let net = if offline && abi >= 4 { NET_BIND_TCP | NET_CONNECT_TCP } else { 0 };
+        let scoped = if abi >= 6 { SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL } else { 0 };
+        let attr = RulesetAttr { handled_access_fs: handled, handled_access_net: net, scoped };
         let ruleset = libc::syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const RulesetAttr, size_of::<RulesetAttr>(), 0u32);
         if ruleset < 0 {
             return false;
@@ -281,6 +294,17 @@ fn seccomp(offline: bool) -> bool {
     unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2 /* SECCOMP_MODE_FILTER */, &prog as *const SockFprog) == 0 }
 }
 
+/// The lowest processor priority, and the lowest ordinary disk priority.
+/// Not the disk's idle class, which a busy disk could starve for good.
+fn lower_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+    const IOPRIO_CLASS_BEST_EFFORT: libc::c_int = 2;
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, (IOPRIO_CLASS_BEST_EFFORT << 13) | 7);
+    }
+}
+
 fn lines(variable: &str) -> Vec<PathBuf> {
     std::env::var_os(variable)
         .map(|all| all.as_bytes().split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(|l| PathBuf::from(OsStr::from_bytes(l))).collect())
@@ -299,7 +323,14 @@ pub fn confine_from_surroundings() -> Option<Isolation> {
     unsafe {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
-    let files = landlock(&read_write, &read_run);
+    if offline {
+        // Only the converter is started offline. A visitor's upload should
+        // never make the computer slow for its owner: it, and the encoder it
+        // starts, give way on the processor and the disk to everything else.
+        // Before the system-call filter, which refuses these.
+        lower_priority();
+    }
+    let files = landlock(&read_write, &read_run, offline);
     let syscalls = seccomp(offline);
     Some(Isolation { files, syscalls })
 }
@@ -357,5 +388,55 @@ pub unsafe fn keep_only(ends: &[RawFd], die_with_parent: bool) -> std::io::Resul
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where the kernel has Landlock version 6, a confined process cannot
+    /// signal one outside its confinement, such as the editor that started it.
+    #[test]
+    fn a_confined_process_cannot_signal_outside() {
+        let abi = unsafe { libc::syscall(SYS_LANDLOCK_CREATE_RULESET, std::ptr::null::<RulesetAttr>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION) };
+        if abi < 6 {
+            eprintln!("Landlock version {abi}: signal scoping not available here");
+            return;
+        }
+        unsafe {
+            let parent = libc::getpid();
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                // Nothing that allocates between fork and exit.
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let confined = landlock(&[], &[], true);
+                let refused = libc::kill(parent, 0) != 0 && *libc::__errno_location() == libc::EPERM;
+                let own = libc::kill(libc::getpid(), 0) == 0;
+                libc::_exit(if confined && refused && own { 0 } else { 1 });
+            }
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the confined child could signal its parent");
+        }
+    }
+
+    #[test]
+    fn lowered_priority_is_the_lowest() {
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                lower_priority();
+                *libc::__errno_location() = 0;
+                let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+                let io = libc::syscall(libc::SYS_ioprio_get, 1, 0);
+                libc::_exit(if nice == 19 && io == (2 << 13) | 7 { 0 } else { 1 });
+            }
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the priority was not lowered");
+        }
     }
 }

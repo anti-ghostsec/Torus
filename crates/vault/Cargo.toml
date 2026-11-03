@@ -10,6 +10,7 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = { version = "0.2", features = ["std"] }
 zeroize = "1"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Memory"] }

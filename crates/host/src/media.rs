@@ -176,7 +176,9 @@ fn serve_one(from: &mut File, to: &mut File, program: &Path, kind: u8, pixels: u
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        launch.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        // CREATE_NO_WINDOW, and BELOW_NORMAL_PRIORITY_CLASS: a visitor's
+        // upload gives way on the processor to everything the owner runs.
+        launch.creation_flags(0x0800_0000 | 0x0000_4000);
     }
     let child = arguments(kind, pixels).and_then(|arguments| launch.args(arguments).spawn().ok());
     let mut piece = Vec::new();

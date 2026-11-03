@@ -1249,46 +1249,77 @@ fn quote_line(line: &str) -> Option<&str> {
 /// everything else escaped. Marks that are not closed stay as typed.
 fn inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        let after = &rest[c.len_utf8()..];
+    // Where each closing mark is next found, kept between searches: a line
+    // full of marks that never close is then read once, not once per mark.
+    let (mut tick, mut stars, mut star, mut middle, mut close) =
+        (Next::new("`"), Next::new("**"), Next::new("*"), Next::new("]("), Next::new(")"));
+    let mut at = 0;
+    while let Some(c) = text[at..].chars().next() {
+        let from = at + c.len_utf8();
+        let after = &text[from..];
         let taken = match c {
-            '`' => after.find('`').map(|end| {
-                let _ = write!(out, "<code>{}</code>", escape(&after[..end]));
-                1 + end + 1
+            '`' => tick.find(text, from).map(|end| {
+                let _ = write!(out, "<code>{}</code>", escape(&text[from..end]));
+                end + 1
             }),
-            '*' if after.starts_with('*') => after[1..].find("**").filter(|&end| end > 0).map(|end| {
-                let _ = write!(out, "<strong>{}</strong>", inline(&after[1..1 + end]));
-                2 + end + 2
+            '*' if after.starts_with('*') => stars.find(text, from + 1).filter(|&end| end > from + 1).map(|end| {
+                let _ = write!(out, "<strong>{}</strong>", inline(&text[from + 1..end]));
+                end + 2
             }),
-            '*' => after.find('*').filter(|&end| end > 0 && !after.starts_with(' ')).map(|end| {
-                let _ = write!(out, "<em>{}</em>", inline(&after[..end]));
-                1 + end + 1
+            '*' => star.find(text, from).filter(|&end| end > from && !after.starts_with(' ')).map(|end| {
+                let _ = write!(out, "<em>{}</em>", inline(&text[from..end]));
+                end + 1
             }),
-            '[' => after.find("](").and_then(|middle| {
-                let label = &after[..middle];
-                let target_and_rest = &after[middle + 2..];
-                let end = target_and_rest.find(')')?;
-                let target = target_and_rest[..end].trim();
+            '[' => middle.find(text, from).and_then(|mid| {
+                let label = &text[from..mid];
+                let end = close.find(text, mid + 2)?;
+                let target = text[mid + 2..end].trim();
                 if label.is_empty() || label.contains('[') || !safe_target(target) {
                     return None;
                 }
                 let outside = !target.starts_with('/') && !target.starts_with('#');
                 let rel = if outside { " rel=\"noreferrer noopener\"" } else { "" };
                 let _ = write!(out, "<a href=\"{}\"{rel}>{}</a>", escape(target), inline(label));
-                Some(1 + middle + 2 + end + 1)
+                Some(end + 1)
             }),
             _ => None,
         };
         match taken {
-            Some(len) => rest = &rest[len..],
+            Some(next) => at = next,
             None => {
-                out.push_str(&escape(&rest[..c.len_utf8()]));
-                rest = after;
+                out.push_str(&escape(&text[at..from]));
+                at = from;
             }
         }
     }
     out
+}
+
+/// The next place a mark is found at or after a point, remembered so that
+/// asking again from further on does not search the same text again.
+struct Next {
+    mark: &'static str,
+    /// The last answer: where it was found, or `None` for nowhere after
+    /// `searched_from`.
+    found: Option<Option<usize>>,
+    searched_from: usize,
+}
+
+impl Next {
+    fn new(mark: &'static str) -> Self {
+        Self { mark, found: None, searched_from: 0 }
+    }
+
+    fn find(&mut self, text: &str, from: usize) -> Option<usize> {
+        match self.found {
+            Some(None) if from >= self.searched_from => return None,
+            Some(Some(at)) if at >= from && from >= self.searched_from => return Some(at),
+            _ => {}
+        }
+        let at = text[from..].find(self.mark).map(|i| from + i);
+        (self.found, self.searched_from) = (Some(at), from);
+        at
+    }
 }
 
 /// An address on this site, or an ordinary web address. Never a script or
@@ -1407,6 +1438,27 @@ fn style(theme: &Theme, root: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_marks() {
+        assert_eq!(inline("a `x<y` b"), "a <code>x&lt;y</code> b");
+        assert_eq!(inline("**bold** and *it* and **x*y*z**"), "<strong>bold</strong> and <em>it</em> and <strong>x<em>y</em>z</strong>");
+        assert_eq!(inline("[a](/b) [[c](/d) [e](javascript:x)"), "<a href=\"/b\">a</a> [<a href=\"/d\">c</a> [e](javascript:x)");
+        assert_eq!(inline("* not* **"), "* not* **");
+        assert_eq!(inline("é`ü`*ö*"), "é<code>ü</code><em>ö</em>");
+    }
+
+    /// A line of marks that never close is read in one pass, not one pass
+    /// per mark.
+    #[test]
+    fn unclosed_marks_take_linear_time() {
+        for line in ["[".repeat(200_000), "[a](".repeat(50_000), format!("`{}", "x".repeat(200_000)), format!("{}*", "[x](/y".repeat(30_000))] {
+            let started = std::time::Instant::now();
+            let html = inline(&line);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+            assert!(!html.contains("<a") && !html.contains("<code"));
+        }
+    }
 
     #[test]
     fn view_counts_are_said_roughly() {

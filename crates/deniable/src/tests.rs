@@ -337,3 +337,55 @@ fn a_volume_can_be_opened_with_a_key_instead_of_a_password() {
     let id = store.unlock_key(&key).unwrap();
     assert_eq!(read_all(&mut store, id), b"keyed");
 }
+
+/// A save of only the hidden volume still saves the decoy below it, so
+/// comparing copies of the disk with the decoy password always finds a
+/// decoy save to account for the changed blocks.
+#[test]
+fn saving_the_hidden_volume_saves_the_decoy_too() {
+    let mut store = fresh(512);
+    let decoy = store.create(b"decoy", &[]).unwrap();
+    let hidden = store.create(b"hidden", &[decoy]).unwrap();
+    store.flush().unwrap();
+    let before = store.volume(decoy).unwrap().gen;
+    store.write(hidden, 0, b"only the hidden volume changed").unwrap();
+    store.flush().unwrap();
+    assert!(store.volume(decoy).unwrap().gen > before, "the decoy's superblock stayed as it was");
+    // Nothing changed: nothing is written.
+    let after = store.volume(decoy).unwrap().gen;
+    store.flush().unwrap();
+    assert_eq!(store.volume(decoy).unwrap().gen, after);
+}
+
+/// The number of cover writes is drawn at random, not fixed by how much
+/// was written.
+#[test]
+fn the_cover_write_count_varies() {
+    struct Counting(MemDevice, u64);
+    impl BlockDevice for Counting {
+        fn blocks(&self) -> u64 {
+            self.0.blocks()
+        }
+        fn read(&mut self, index: u64, buf: &mut [u8; BLOCK]) -> io::Result<()> {
+            self.0.read(index, buf)
+        }
+        fn write(&mut self, index: u64, buf: &[u8; BLOCK]) -> io::Result<()> {
+            self.1 += 1;
+            self.0.write(index, buf)
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            self.0.sync()
+        }
+    }
+    let mut counts = HashSet::new();
+    let mut store = Store::format(Counting(MemDevice::new(1024), 0), FAST).unwrap();
+    let id = store.create(b"pw", &[]).unwrap();
+    store.flush().unwrap();
+    for round in 0..12u8 {
+        let start = store.dev.1;
+        store.write(id, 0, &[round; 100]).unwrap();
+        store.flush().unwrap();
+        counts.insert(store.dev.1 - start);
+    }
+    assert!(counts.len() > 1, "every save wrote the same number of blocks");
+}

@@ -500,6 +500,14 @@ impl Wallet {
         }
     }
 
+    /// The hash of block `number`, as the node the wallet read it from gave
+    /// it, if it is among the last blocks read. One block's hash stands for
+    /// the whole chain up to it: a second node that agrees on it agrees on
+    /// every payment found in those blocks.
+    pub fn hash_at(&self, number: usize) -> Option<String> {
+        self.state.recent.get(&number).cloned()
+    }
+
     /// Whether the wallet still has the output a payment arrived in.
     pub fn owns(&self, id: &str) -> bool {
         self.state.outputs.iter().any(|o| o.id() == id)

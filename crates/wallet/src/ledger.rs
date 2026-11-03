@@ -221,6 +221,12 @@ impl Ledger {
         }
     }
 
+    /// Whether [`Ledger::confirm`] at block `tip` would credit anything: the
+    /// moment to make sure the chain read is the real one.
+    pub fn would_confirm(&self, tip: usize) -> bool {
+        self.pending.iter().any(|arrival| arrival.block + CONFIRMATIONS <= tip + 1)
+    }
+
     /// Credits what has been confirmed by block `tip`. `still_owned` says
     /// whether the wallet still has an output, which it would not if the
     /// chain had been reorganised since it was seen.
@@ -397,11 +403,15 @@ mod tests {
 
         ledger.arrived(vec![arrival("a", slot, 5 * PER_XMR, 100)]);
         ledger.arrived(vec![arrival("a", slot, 5 * PER_XMR, 100)]);
+        // Other nodes are asked about the chain only when a credit is due.
+        assert!(!ledger.would_confirm(108));
+        assert!(ledger.would_confirm(109));
         ledger.confirm(105, |_| true);
         assert_eq!(ledger.sites["blog"].balance(&alice), 0);
         assert_eq!(ledger.arriving("blog", &alice), 5 * PER_XMR);
         ledger.confirm(109, |_| true);
         assert_eq!(ledger.sites["blog"].balance(&alice), 5 * PER_XMR, "credited once, after ten blocks");
+        assert!(!ledger.would_confirm(1000), "nothing left to credit");
         assert_eq!(ledger.arriving("blog", &alice), 0);
         ledger.arrived(vec![arrival("a", slot, 5 * PER_XMR, 100)]);
         ledger.confirm(200, |_| true);

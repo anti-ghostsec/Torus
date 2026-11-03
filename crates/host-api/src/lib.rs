@@ -118,12 +118,17 @@ pub enum Command {
     /// Make an account a moderator, or an ordinary account again.
     Moderator { id: String, on: bool },
     /// For a relay: sends `body` to the node at `route` and returns what it
-    /// answers, refusing an answer larger than `limit`.
+    /// answers, refusing an answer larger than `limit`. With `node`, to that
+    /// node (an onion service) instead of the relay's own, through the same
+    /// Tor connection: for asking a second node whether the first tells the
+    /// truth about the chain.
     Fetch {
         route: String,
         #[serde(with = "hex::serde")]
         body: Vec<u8>,
         limit: usize,
+        #[serde(default)]
+        node: Option<String>,
     },
     /// The wallet's answer to the host's `Bank` question with this number.
     Banked { seq: u64, told: torus_core::money::Told },
@@ -719,7 +724,12 @@ impl Host {
 
     /// For a relay: one request to the node, and its answer.
     pub async fn fetch(&self, route: &str, body: Vec<u8>, limit: usize) -> Result<Vec<u8>, String> {
-        let command = Command::Fetch { route: route.to_owned(), body, limit };
+        self.fetch_from(None, route, body, limit).await
+    }
+
+    /// Like [`Host::fetch`], to another node than the relay's own.
+    pub async fn fetch_from(&self, node: Option<&str>, route: &str, body: Vec<u8>, limit: usize) -> Result<Vec<u8>, String> {
+        let command = Command::Fetch { route: route.to_owned(), body, limit, node: node.map(str::to_owned) };
         match self.ask_within(command, FETCH_TIMEOUT).await? {
             Event::Fetched { body } => body.map(|b| b.0),
             _ => Err(GONE.to_owned()),
@@ -874,11 +884,11 @@ mod tests {
     #[tokio::test]
     async fn relay_and_wallet_messages_cross_the_pipe() {
         let (mut a, mut b) = tokio::io::duplex(1 << 16);
-        let fetch = Command::Ask { seq: 3, question: Box::new(Command::Fetch { route: "json_rpc".into(), body: vec![0, 1, 255], limit: 9 }) };
+        let fetch = Command::Ask { seq: 3, question: Box::new(Command::Fetch { route: "json_rpc".into(), body: vec![0, 1, 255], limit: 9, node: None }) };
         write_frame(&mut a, &fetch).await.unwrap();
         match read_frame::<_, Command>(&mut b).await.unwrap() {
             Some(Command::Ask { seq: 3, question }) => match *question {
-                Command::Fetch { route, body, limit } => assert_eq!((route.as_str(), body, limit), ("json_rpc", vec![0, 1, 255], 9)),
+                Command::Fetch { route, body, limit, .. } => assert_eq!((route.as_str(), body, limit), ("json_rpc", vec![0, 1, 255], 9)),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),

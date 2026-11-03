@@ -78,6 +78,10 @@ const MAX_CONNECTIONS: usize = 256;
 const MAX_UPLOADS: usize = 3;
 /// Pictures being decoded at once. Decoding is the costliest thing a request can ask for.
 const MAX_DECODES: usize = 2;
+/// How many pages, feeds and puzzle pictures are made at once. They are
+/// made on threads of their own, so a slow one never holds up the threads
+/// that move visitors' bytes; the rest wait their turn without a thread.
+const MAX_RENDERS: usize = 2;
 /// How long a visitor may go without sending the next piece of a form.
 const BODY_IDLE: Duration = Duration::from_secs(120);
 /// How long a connection may sit with nothing moving either way while it
@@ -157,6 +161,10 @@ struct Inner {
     connections: Arc<Semaphore>,
     uploads: Semaphore,
     decodes: Semaphore,
+    renders: Semaphore,
+    /// Bytes set aside for files still arriving, so that uploads at the
+    /// same moment cannot each fit and together pass the owner's limit.
+    reserved: AtomicU64,
     /// The one `Host` a request may name, when the site is served on this
     /// computer: a web page elsewhere cannot then reach it by pointing a
     /// name of its own at this computer (DNS rebinding).
@@ -185,6 +193,8 @@ impl Live {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             uploads: Semaphore::new(MAX_UPLOADS),
             decodes: Semaphore::new(MAX_DECODES),
+            renders: Semaphore::new(MAX_RENDERS),
+            reserved: AtomicU64::new(0),
             only_host: OnceLock::new(),
             bank: OnceLock::new(),
         }))
@@ -290,6 +300,18 @@ impl Live {
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.0.store.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets aside room for a file of up to `bytes` that is arriving, if the
+    /// site has that much room besides what is already set aside.
+    fn reserve(&self, site: &Site, bytes: u64) -> Option<Reserved> {
+        // Taken and checked under the store's lock, so two cannot both fit.
+        let store = self.store();
+        if !store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::Relaxed))) {
+            return None;
+        }
+        self.0.reserved.fetch_add(bytes, Ordering::Relaxed);
+        Some(Reserved { live: self.clone(), bytes })
     }
 }
 
@@ -529,14 +551,18 @@ async fn route(
         Method::GET | Method::HEAD => match (path.strip_prefix(FILE_PATH), path.strip_prefix(PROGRESS_PATH)) {
             (Some(id), _) => file(live, id, req.headers().get(RANGE), head),
             (_, Some(name)) => progress(live, name, req.uri().query(), head),
-            _ if path.starts_with(torus_core::PUZZLE_PATH) => puzzle_picture(live, &path, head),
-            _ if path.starts_with(torus_core::FEED_PATH) => feed(live, &site, &path, req.headers().get(hyper::header::HOST), head),
+            _ if path.starts_with(torus_core::PUZZLE_PATH) => rendered(live, move |live| puzzle_picture(live, &path, head)).await,
+            _ if path.starts_with(torus_core::FEED_PATH) => {
+                let (site, host) = (site.clone(), req.headers().get(hyper::header::HOST).cloned());
+                rendered(live, move |live| feed(live, &site, &path, host.as_ref(), head)).await
+            }
             _ => {
                 let mut visit = visit(viewer, req.uri().query());
                 if let Some((shown, _)) = bank::find_page(site, &path) {
                     (visit.purse, visit.site_address) = bank::look_up(live, shown, visit.viewer.as_ref()).await;
                 }
-                page(live, &site, &path, &visit, head)
+                let site = site.clone();
+                rendered(live, move |live| page(live, &site, &path, &visit, head)).await
             }
         },
         Method::POST if site.accounts && path.starts_with(torus_core::money::WALLET_PATH) => {
@@ -604,6 +630,18 @@ fn progress(live: &Live, name: &str, query: Option<&str>, head: bool) -> Reply {
     let mut res = build(StatusCode::OK, HTML, render_progress(name, arriving, waited).into(), head);
     res.headers_mut().insert("content-security-policy", HeaderValue::from_static(PROGRESS_CSP));
     res
+}
+
+/// Makes a reply on a thread of its own, a few at a time: making one holds
+/// the store's lock, and can take a while on a big site.
+async fn rendered(live: &Live, make: impl FnOnce(&Live) -> Reply + Send + 'static) -> Reply {
+    let Ok(_turn) = live.0.renders.acquire().await else {
+        return plain(StatusCode::SERVICE_UNAVAILABLE, "Busy, try again.\n", false);
+    };
+    let live = live.clone();
+    tokio::task::spawn_blocking(move || make(&live))
+        .await
+        .unwrap_or_else(|_| plain(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.\n", false))
 }
 
 fn page(live: &Live, site: &Site, path: &str, visit: &Visit, head: bool) -> Reply {
@@ -694,12 +732,25 @@ fn feed(live: &Live, site: &Site, path: &str, host: Option<&HeaderValue>, head: 
     let page = site.pages.iter().find(|p| p.template.as_deref() == Some(collection.name.as_str()));
     let title_field = collection.fields.iter().find(|f| f.kind == FieldKind::Text);
     let body_field = collection.fields.iter().find(|f| !f.kind.is_file() && f.kind != FieldKind::Text);
-    let mut newest: Vec<Record> = Vec::new();
-    live.store().visit(&collection.name, &mut |record| {
+    // Only the newest are copied: first their places in the order, then them.
+    let store = live.store();
+    let mut seqs: Vec<_> = Vec::new();
+    store.visit(&collection.name, &mut |record| {
         if !record.held {
-            newest.push(record.clone());
+            seqs.push(record.seq);
         }
     });
+    seqs.sort_unstable_by(|a, b| b.cmp(a));
+    let oldest_shown = seqs.get(FEED_ITEMS.min(seqs.len()).saturating_sub(1)).copied();
+    let mut newest: Vec<Record> = Vec::new();
+    if let Some(oldest_shown) = oldest_shown {
+        store.visit(&collection.name, &mut |record| {
+            if !record.held && record.seq >= oldest_shown {
+                newest.push(record.clone());
+            }
+        });
+    }
+    drop(store);
     newest.sort_by(|a, b| b.seq.cmp(&a.seq));
     newest.truncate(FEED_ITEMS);
     let mut xml = format!(
@@ -831,6 +882,20 @@ fn file(live: &Live, id: &str, range: Option<&HeaderValue>, head: bool) -> Reply
 struct Arrived {
     target: Target,
     files: Vec<(String, Staged, &'static str)>,
+    /// Room held for these files until the record is added or refused.
+    reserved: Vec<Reserved>,
+}
+
+/// Room set aside for a file still arriving, given back when dropped.
+struct Reserved {
+    live: Live,
+    bytes: u64,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.live.0.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 impl Arrived {
@@ -875,7 +940,7 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
     // can be, so room is asked for that much and not for the largest file
     // the site would ever take.
     let announced = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
-    let mut submission = Submission { texts: Vec::new(), arrived: Arrived { target: target.clone(), files: Vec::new() } };
+    let mut submission = Submission { texts: Vec::new(), arrived: Arrived { target: target.clone(), files: Vec::new(), reserved: Vec::new() } };
     let too_large = || plain(StatusCode::PAYLOAD_TOO_LARGE, "That submission is too large.\n", false);
 
     if content_type.starts_with("application/x-www-form-urlencoded") {
@@ -980,9 +1045,8 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 if picture.is_empty() {
                     continue;
                 }
-                if !live.store().has_room_for(&site, needed) {
-                    return Err(plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false));
-                }
+                let room = live.reserve(&site, needed).ok_or_else(|| plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false))?;
+                submission.arrived.reserved.push(room);
                 // Decoding is the costly step, so it runs off the request
                 // threads, and only a few at a time.
                 let _turn = live.0.decodes.acquire().await.map_err(|_| unavailable())?;
@@ -1005,9 +1069,8 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                     continue;
                 }
                 let content_type = blobs::video_type(&start).ok_or_else(|| bad("That is not an MP4 or WebM video.\n"))?;
-                if !live.store().has_room_for(&site, needed) {
-                    return Err(plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false));
-                }
+                let room = live.reserve(&site, needed).ok_or_else(|| plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false))?;
+                submission.arrived.reserved.push(room);
                 let backlog = {
                     let store = live.store();
                     store.hold_videos && store.unconverted().len() >= MAX_WAITING_VIDEOS
@@ -1583,4 +1646,26 @@ fn headers(mut res: Reply, status: StatusCode, content_type: &str, length: u64) 
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     res
+}
+
+#[cfg(test)]
+mod room {
+    use super::*;
+
+    /// Files arriving at the same moment cannot each fit and together pass
+    /// the owner's limit: room is set aside for each until it is done.
+    #[test]
+    fn room_for_arriving_files_is_set_aside() {
+        let mut site = torus_core::starters::by_name("board").expect("a starter");
+        site.limits.storage_mb = 1;
+        let live = Live::new(site.clone());
+        let whole = site.limits.storage_bytes();
+        let first = live.reserve(&site, whole / 2).expect("room for half");
+        let second = live.reserve(&site, whole / 2).expect("room for the other half");
+        assert!(live.reserve(&site, 1).is_none(), "two halves and a byte fit in one limit");
+        drop(first);
+        assert!(live.reserve(&site, whole / 2).is_some(), "room given back was not reusable");
+        drop(second);
+        assert_eq!(live.0.reserved.load(Ordering::Relaxed), 0);
+    }
 }

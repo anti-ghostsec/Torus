@@ -120,6 +120,11 @@ impl Vault {
 
     /// Replaces the vault's contents. The old file stays intact until the new
     /// one is completely written.
+    /// Where the vault file is now, after it was renamed on disk.
+    pub fn moved_to(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     pub fn save(&self, contents: &[u8]) -> Result<(), Error> {
         let mut nonce = [0u8; NONCE_LEN];
         random(&mut nonce)?;

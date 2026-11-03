@@ -134,7 +134,28 @@ pub struct Restore {
 /// Saves the wallet into the vault.
 pub type Keep = Arc<dyn Fn(StoredMoney) -> Result<(), String> + Send + Sync>;
 /// Starts the relay to a node and returns a way to reach it.
-pub type Reach = Arc<dyn Fn(String, Zeroizing<Vec<u8>>) -> Pin<Box<dyn Future<Output = Result<Fetcher, String>> + Send>> + Send + Sync>;
+pub type Reach = Arc<dyn Fn(String, Zeroizing<Vec<u8>>) -> Pin<Box<dyn Future<Output = Result<Route, String>> + Send>> + Send + Sync>;
+
+/// The way to the node in use, and through the same relay to any other.
+pub struct Route {
+    pub node: Fetcher,
+    pub other: Arc<dyn Fn(String) -> Fetcher + Send + Sync>,
+}
+
+/// Other nodes asked about the chain before a payment is credited, and
+/// how many of them must agree with the node in use.
+const WITNESSES: usize = 2;
+/// Nodes tried in all, so that one or two that do not answer leave enough.
+const WITNESS_TRIES: usize = 5;
+
+/// What other nodes said about the chain the wallet read.
+enum Witnessed {
+    Agreed,
+    /// One of them reported another chain: the node in use cannot be trusted.
+    Disagreed,
+    /// Too few of them answered; nothing is decided yet.
+    Unsure,
+}
 
 struct Loaded {
     wallet: tokio::sync::Mutex<Wallet>,
@@ -155,6 +176,8 @@ struct Loaded {
     tor_key: Zeroizing<Vec<u8>>,
     /// The node, once reached.
     daemon: tokio::sync::Mutex<Option<MoneroDaemon<Fetcher>>>,
+    /// The way to other nodes, through the same relay, once it is started.
+    others: Mutex<Option<Arc<dyn Fn(String) -> Fetcher + Send + Sync>>>,
     tip: Mutex<Option<usize>>,
     trouble: Mutex<Option<String>>,
 }
@@ -238,6 +261,7 @@ impl Treasury {
             wanted: std::sync::atomic::AtomicBool::new(wanted),
             tor_key,
             daemon: tokio::sync::Mutex::new(None),
+            others: Mutex::new(None),
             tip: Mutex::new(None),
             trouble: Mutex::new(None),
         };
@@ -386,10 +410,38 @@ impl Treasury {
             return Ok(daemon.clone());
         }
         let node = Self::node_of(loaded);
-        let fetcher = (self.reach)(node, loaded.tor_key.clone()).await?;
-        let reached = MoneroDaemon::new(fetcher).await.map_err(|e| format!("The node did not answer as a Monero node does: {e:?}"))?;
+        let route = (self.reach)(node, loaded.tor_key.clone()).await?;
+        let reached = MoneroDaemon::new(route.node).await.map_err(|e| format!("The node did not answer as a Monero node does: {e:?}"))?;
+        *loaded.others.lock().unwrap_or_else(|e| e.into_inner()) = Some(route.other);
         *daemon = Some(reached.clone());
         Ok(reached)
+    }
+
+    /// Asks other nodes from the list for the hash of block `number`, and
+    /// compares it with `hash`, the one the wallet read. A node could make
+    /// up blocks paying any address it knows; every honest node would
+    /// report another hash for them, and a hash stands for every block
+    /// before it too.
+    async fn witnessed(&self, loaded: &Loaded, number: usize, hash: &str) -> Witnessed {
+        use torus_wallet::monero_wallet::interface::prelude::ProvidesBlockchain;
+        let Some(other) = loaded.others.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Witnessed::Unsure };
+        let in_use = Self::node_of(loaded);
+        let mut asked: Vec<&str> = Vec::new();
+        let mut agreed = 0;
+        for _ in 0..WITNESS_TRIES {
+            let Some(node) = (0..NODES.len() * 2).map(|_| NODES[random_pick()]).find(|n| *n != in_use && !asked.contains(n)) else { break };
+            asked.push(node);
+            let Ok(daemon) = MoneroDaemon::new(other(node.to_owned())).await else { continue };
+            match daemon.block_hash(number).await {
+                Ok(theirs) if hex::encode(theirs) == hash => agreed += 1,
+                Ok(_) => return Witnessed::Disagreed,
+                Err(_) => continue,
+            }
+            if agreed == WITNESSES {
+                return Witnessed::Agreed;
+            }
+        }
+        Witnessed::Unsure
     }
 
     /// Reads the chain some way further. `Ok(true)` if there is more to read.
@@ -430,10 +482,41 @@ impl Treasury {
             .map_err(|e| format!("{e:?}"))?;
         *loaded.tip.lock().unwrap_or_else(|e| e.into_inner()) = Some(tip);
         *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        {
+        let height = wallet.state.height();
+        let due = {
             let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.arrived(arrivals);
-            let height = wallet.state.height();
+            ledger.would_confirm(height)
+        };
+        // Payments are credited only on a chain other nodes agree on.
+        let trusted = match (due, wallet.hash_at(height)) {
+            (false, _) => false,
+            (true, None) => false,
+            (true, Some(hash)) => match self.witnessed(&loaded, height, &hash).await {
+                Witnessed::Agreed => true,
+                Witnessed::Unsure => false,
+                Witnessed::Disagreed => {
+                    drop(wallet);
+                    // The node in use is left for another; reading from the
+                    // next one rewinds whatever the first made up.
+                    if loaded.node.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                        let mut pick = loaded.pick.lock().unwrap_or_else(|e| e.into_inner());
+                        *pick = another_pick(*pick);
+                    }
+                    *loaded.daemon.lock().await = None;
+                    let _ = self.save_books(&loaded);
+                    return Err("Other nodes report a different chain than the node in use, so no payment is credited from it. \
+                        The wallet moves to another node; if you chose this node yourself, choose another."
+                        .into());
+                }
+            },
+        };
+        if due && !trusted {
+            *loaded.trouble.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("Payments wait until other nodes confirm the chain this one reports.".into());
+        }
+        if trusted {
+            let mut ledger = loaded.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.confirm(height, |id| wallet.owns(id));
         }
         if wallet.state.height() != before {
@@ -757,7 +840,10 @@ mod tests {
             *into.lock().unwrap() = Some(stored);
             Ok(())
         });
-        let reach: Reach = Arc::new(move |_, _| Box::pin(async move { Ok(direct(port)) }));
+        // The test chain's only node also stands in for the others asked.
+        let reach: Reach = Arc::new(move |_, _| {
+            Box::pin(async move { Ok(Route { node: direct(port), other: Arc::new(move |_| direct(port)) }) })
+        });
         let make = || {
             let mut treasury = Treasury::new(keep.clone(), reach.clone());
             Arc::get_mut(&mut treasury).unwrap().max_fee = Some(u64::MAX);

@@ -463,19 +463,28 @@ impl<D: BlockDevice> Store<D> {
     }
 
     /// Saves every changed volume, then makes the cover writes.
+    ///
+    /// When any volume changed, every unlocked volume is saved, changed or
+    /// not: otherwise a hidden volume's save would leave the lower ones'
+    /// superblocks as they were while other blocks changed, and comparing
+    /// two copies of the disk with only a lower password would show that
+    /// something else wrote.
     pub fn flush(&mut self) -> Result<()> {
-        let dirty: Vec<usize> = self.volumes.iter().enumerate().filter(|(_, v)| v.as_ref().is_some_and(|v| v.dirty)).map(|(i, _)| i).collect();
-        if dirty.is_empty() {
+        if !self.volumes.iter().flatten().any(|v| v.dirty) {
             return Ok(());
         }
-        for i in dirty {
+        let open: Vec<usize> = self.volumes.iter().enumerate().filter(|(_, v)| v.is_some()).map(|(i, _)| i).collect();
+        for i in open {
             let mut v = self.take(VolumeId(i))?;
             let r = self.save(&mut v);
             self.volumes[i] = Some(v);
             r?;
         }
         let real = std::mem::take(&mut self.writes);
-        let cover = (real.saturating_mul(self.cover_per_write as u64)).max(self.cover_min as u64);
+        // Between the floor and twice it, drawn afresh each time, so the
+        // count says little about how much was really written.
+        let floor = (real.saturating_mul(self.cover_per_write as u64)).max(self.cover_min as u64);
+        let cover = floor + random_u64()? % floor.saturating_add(1);
         self.cover(cover)?;
         self.dev.sync()?;
         Ok(())

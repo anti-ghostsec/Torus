@@ -55,6 +55,11 @@ struct Payload {
     apps: Vec<StoredApp>,
     #[serde(default)]
     next_app: u32,
+    /// Whether this is the main compartment, not the decoy. Kept inside the
+    /// vault because the file names no longer say which is which. A blank
+    /// or decoy vault has none.
+    #[serde(default)]
+    main: bool,
     // Vaults written before multiple sites existed held exactly one.
     #[serde(default, skip_serializing)]
     site: Option<Site>,
@@ -72,6 +77,11 @@ struct Exported {
     seal_secret: Option<Secret>,
     /// Whether the site's encrypted folder follows the sealed part.
     content: bool,
+    /// The digest of that folder's archive, sealed here so it cannot be
+    /// swapped or cut short without the passphrase. Absent in files made
+    /// before it was added.
+    #[serde(default)]
+    content_digest: Option<String>,
 }
 
 /// The most beginnings one search looks for at once.
@@ -166,9 +176,15 @@ struct Session {
     money: Option<StoredMoney>,
     apps: Vec<App>,
     next_app: u32,
+    main: bool,
 }
 
 impl Session {
+    /// An empty compartment, as a new installation has.
+    fn new(vault: Vault, main: bool) -> Self {
+        Self { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: DEFAULT_AUTO_LOCK, saved: Vec::new(), money: None, apps: Vec::new(), next_app: 1, main }
+    }
+
     fn persist(&self) -> Result<(), Failure> {
         let sites = self
             .sites
@@ -200,6 +216,7 @@ impl Session {
                 })
                 .collect(),
             next_app: self.next_app,
+            main: self.main,
             ..Payload::default()
         };
         let mut bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
@@ -284,6 +301,98 @@ impl Failure {
     fn new(cause: impl std::fmt::Display) -> Self {
         Self { message: cause.to_string(), findings: Vec::new() }
     }
+}
+
+/// Where each of the two compartments keeps its files. Neither name says
+/// which is the main one: that is sealed inside each vault, and the main
+/// compartment takes a slot at random. Installations made before this kept
+/// the main one in `project.vault` and `sites/`, the other in `alt.vault`
+/// and `alt-sites/`; those names are still read until the main compartment
+/// is next opened, which moves them.
+#[derive(Clone)]
+struct Layout {
+    data_dir: PathBuf,
+    tor_dir: PathBuf,
+}
+
+impl Layout {
+    const VAULTS: [&str; 2] = ["a.vault", "b.vault"];
+    const SITES: [&str; 2] = ["a-sites", "b-sites"];
+
+    /// Whether the installation still has the names used before.
+    fn legacy(&self) -> bool {
+        self.data_dir.join("project.vault").exists()
+    }
+
+    fn vault(&self, second: bool) -> PathBuf {
+        let names = if self.legacy() { ["project.vault", "alt.vault"] } else { Self::VAULTS };
+        self.data_dir.join(names[usize::from(second)])
+    }
+
+    fn sites(&self, second: bool) -> PathBuf {
+        if self.legacy() {
+            return if second { self.tor_dir.with_file_name("alt-sites") } else { self.tor_dir.clone() };
+        }
+        self.tor_dir.with_file_name(Self::SITES[usize::from(second)])
+    }
+
+    /// Part of each sandbox's name, apart for each compartment.
+    fn tag(&self, second: bool) -> &'static str {
+        match (self.legacy(), second) {
+            (true, false) => "",
+            (true, true) => "-alt",
+            (false, false) => "-a",
+            (false, true) => "-b",
+        }
+    }
+
+    fn every_sites_dir(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.tor_dir.clone(), self.tor_dir.with_file_name("alt-sites")];
+        dirs.extend(Self::SITES.iter().map(|name| self.tor_dir.with_file_name(name)));
+        dirs
+    }
+
+    /// Finishes a move onto the neutral names that was cut short. The
+    /// decoy's vault moves first, so its new name tells the main one's.
+    fn finish_moving(&self) {
+        if !self.legacy() {
+            return;
+        }
+        let Some(decoy) = (0..2).find(|&i| self.data_dir.join(Self::VAULTS[i]).exists()) else {
+            return;
+        };
+        let main = 1 - decoy;
+        let moves = [
+            (self.tor_dir.clone(), self.tor_dir.with_file_name(Self::SITES[main])),
+            (self.tor_dir.with_file_name("alt-sites"), self.tor_dir.with_file_name(Self::SITES[decoy])),
+        ];
+        for (from, to) in moves {
+            if from.exists() && !to.exists() && std::fs::rename(&from, &to).is_err() {
+                return;
+            }
+            let _ = std::fs::create_dir_all(&to);
+        }
+        // Last, as it is what marks the installation as moved.
+        let _ = std::fs::rename(self.data_dir.join("project.vault"), self.data_dir.join(Self::VAULTS[main]));
+    }
+}
+
+fn random_bool() -> Result<bool, Failure> {
+    let mut byte = [0u8; 1];
+    getrandom::getrandom(&mut byte).map_err(Failure::new)?;
+    Ok(byte[0] & 1 == 1)
+}
+
+/// Writes a vault nobody can open, padded like every saved vault, so a
+/// blank decoy is the same size as one in use.
+fn blank_vault(path: &Path) -> Result<(), Failure> {
+    let mut random = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(random.as_mut()).map_err(Failure::new)?;
+    let pass = torus_seal::to_hex(random.as_ref());
+    let mut blank = Zeroizing::new(b"{}".to_vec());
+    torus_vault::pad_json(&mut blank);
+    Vault::create(path, &pass, &blank).map_err(Failure::new)?;
+    Ok(())
 }
 
 /// The single empty site a freshly set-up decoy shows, so that opening it
@@ -399,12 +508,12 @@ fn keep_money(session: Arc<Mutex<Option<Session>>>) -> crate::money::Keep {
 
 /// Starts the relay: a sandboxed host that reaches the node through Tor
 /// and is told nothing secret. Its folder is the open compartment's.
-fn reach_node(tor_dir: &Path, host_program: &Path, prefix: &str, decoy: Arc<AtomicBool>) -> crate::money::Reach {
-    let (tor_dir, program, container) = (tor_dir.to_owned(), host_program.to_owned(), format!("{prefix}-relay"));
+fn reach_node(layout: Layout, host_program: &Path, prefix: &str, second: Arc<AtomicBool>) -> crate::money::Reach {
+    let (program, prefix) = (host_program.to_owned(), prefix.to_owned());
     Arc::new(move |node, tor_key| {
-        let decoy = decoy.load(Ordering::Relaxed);
-        let sites = if decoy { tor_dir.with_file_name("alt-sites") } else { tor_dir.clone() };
-        let (program, container) = (program.clone(), if decoy { format!("{container}-alt") } else { container.clone() });
+        let second = second.load(Ordering::Relaxed);
+        let sites = layout.sites(second);
+        let (program, container) = (program.clone(), format!("{prefix}-relay{}", layout.tag(second)));
         Box::pin(async move {
             if !torus_host_api::sandbox_available() {
                 return Err("This system cannot confine the program that faces the network, so the wallet cannot reach a node here.".to_owned());
@@ -420,10 +529,19 @@ fn reach_node(tor_dir: &Path, host_program: &Path, prefix: &str, decoy: Arc<Atom
             };
             let sandbox = Sandbox { name: &container, folder: &dir };
             let host = Arc::new(Host::start(&program, Some(sandbox), None, target, decoy_site(), None).await?);
-            Ok(torus_wallet::transport::Fetcher::new(move |route, body, limit| {
-                let host = host.clone();
+            let to = host.clone();
+            let node = torus_wallet::transport::Fetcher::new(move |route, body, limit| {
+                let host = to.clone();
                 async move { host.fetch(&route, body, limit).await }
-            }))
+            });
+            let other = Arc::new(move |other: String| {
+                let host = host.clone();
+                torus_wallet::transport::Fetcher::new(move |route, body, limit| {
+                    let (host, other) = (host.clone(), other.clone());
+                    async move { host.fetch_from(Some(&other), &route, body, limit).await }
+                })
+            });
+            Ok(crate::money::Route { node, other })
         })
     })
 }
@@ -437,9 +555,11 @@ pub struct Backend {
     /// Sandboxes are named after this plus the site's number.
     sandbox_prefix: String,
     session: Arc<Mutex<Option<Session>>>,
-    /// Which compartment is open: false is the main one, true the decoy.
-    /// It decides which vault file and which site folders are in use.
-    decoy: Arc<AtomicBool>,
+    /// Which of the two compartments' files are open: the first or the
+    /// second. Which one is the decoy is known only inside each vault.
+    second: Arc<AtomicBool>,
+    /// Whether the compartment open now is the main one.
+    main: AtomicBool,
     /// The open compartment's Monero wallet.
     treasury: Arc<Treasury>,
     /// The local test server, and the site it serves.
@@ -513,7 +633,7 @@ impl Backend {
     /// as while the vault is locked, so it never reaches the other's wallet.
     fn banker(&self, id: u32) -> torus_host_api::Banker {
         let treasury = self.treasury.clone();
-        let (open, ours) = (self.decoy.clone(), self.is_decoy());
+        let (open, ours) = (self.second.clone(), self.second());
         Arc::new(move |ask| {
             let treasury = treasury.clone();
             let open = open.clone();
@@ -527,7 +647,7 @@ impl Backend {
     }
 
     fn key(&self, id: u32) -> SiteKey {
-        (self.is_decoy(), id)
+        (self.second(), id)
     }
 
     pub fn new(data_dir: PathBuf, tor_dir: PathBuf, host_program: PathBuf) -> Self {
@@ -536,22 +656,25 @@ impl Backend {
             let _ = torus_host_api::make_private(&data_dir);
         }
         let session: Arc<Mutex<Option<Session>>> = Arc::default();
-        let decoy: Arc<AtomicBool> = Arc::default();
+        let second: Arc<AtomicBool> = Arc::default();
         let sandbox_prefix = "torus.site".to_owned();
-        let treasury = Treasury::new(keep_money(session.clone()), reach_node(&tor_dir, &host_program, &sandbox_prefix, decoy.clone()));
+        let layout = Layout { data_dir: data_dir.clone(), tor_dir: tor_dir.clone() };
+        let treasury = Treasury::new(keep_money(session.clone()), reach_node(layout, &host_program, &sandbox_prefix, second.clone()));
         let backend = Self {
             data_dir,
             tor_dir,
             host_program,
             sandbox_prefix,
             session,
-            decoy,
+            second,
+            main: AtomicBool::new(false),
             treasury,
             local: Default::default(),
             hosted: Default::default(),
             apps_hosted: Default::default(),
             mining: Mutex::new(None),
         };
+        backend.layout().finish_moving();
         backend.erase_leftovers();
         backend
     }
@@ -560,7 +683,7 @@ impl Backend {
     /// because it was killed or the device lost power. What it had packed
     /// away last is still in its encrypted copy.
     fn erase_leftovers(&self) {
-        let roots = [self.tor_dir.clone(), self.alt_sites_dir()];
+        let roots = self.layout().every_sites_dir();
         let folders: Vec<PathBuf> = roots
             .iter()
             .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
@@ -576,37 +699,25 @@ impl Backend {
         }
     }
 
-    /// Whether the decoy compartment is the one open now.
-    fn is_decoy(&self) -> bool {
-        self.decoy.load(Ordering::Relaxed)
+    /// Which compartment's files are open now: the first or the second.
+    fn second(&self) -> bool {
+        self.second.load(Ordering::Relaxed)
     }
 
-    /// The main vault file, which a confined host must never be able to read.
-    fn vault_path(&self) -> Result<PathBuf, Failure> {
-        std::fs::create_dir_all(&self.data_dir).map_err(Failure::new)?;
-        Ok(self.data_dir.join("project.vault"))
-    }
-
-    /// The decoy vault file. It always exists: on a fresh install it holds
-    /// random bytes under a passphrase nobody knows, so the file never shows
-    /// whether a decoy passphrase has been set.
-    fn alt_vault_path(&self) -> PathBuf {
-        self.data_dir.join("alt.vault")
+    fn layout(&self) -> Layout {
+        Layout { data_dir: self.data_dir.clone(), tor_dir: self.tor_dir.clone() }
     }
 
     /// The vault file for the compartment open now.
     fn active_vault_path(&self) -> Result<PathBuf, Failure> {
-        Ok(if self.is_decoy() { self.alt_vault_path() } else { self.vault_path()? })
+        std::fs::create_dir_all(&self.data_dir).map_err(Failure::new)?;
+        Ok(self.layout().vault(self.second()))
     }
 
-    /// Where the open compartment keeps its sites. The decoy's are kept
-    /// apart from the main ones, so the two never touch.
+    /// Where the open compartment keeps its sites. The two compartments'
+    /// are kept apart, so they never touch.
     fn sites_dir(&self) -> PathBuf {
-        if self.is_decoy() { self.alt_sites_dir() } else { self.tor_dir.clone() }
-    }
-
-    fn alt_sites_dir(&self) -> PathBuf {
-        self.tor_dir.with_file_name("alt-sites")
+        self.layout().sites(self.second())
     }
 
     /// Where a site's Tor bookkeeping is kept encrypted between runs: in
@@ -615,7 +726,7 @@ impl Backend {
         let kept = self.site_dir(id)?.join("tor-state.bin");
         // Copies made by the first release, which packed them here itself.
         let earlier = self.data_dir.join("tor").join(format!("site-{id}.bin"));
-        if earlier.is_file() && !kept.exists() {
+        if self.main.load(Ordering::Relaxed) && earlier.is_file() && !kept.exists() {
             std::fs::create_dir_all(self.site_dir(id)?).map_err(Failure::new)?;
             std::fs::rename(&earlier, &kept).map_err(Failure::new)?;
         }
@@ -638,7 +749,8 @@ impl Backend {
     }
 
     pub fn vault_exists(&self) -> Result<bool, Failure> {
-        Ok(self.vault_path()?.exists())
+        self.layout().finish_moving();
+        Ok(torus_vault::backup::VAULT_FILES.iter().any(|name| self.data_dir.join(name).exists()))
     }
 
     /// Writes a backup of the whole installation to `file`: the vault and
@@ -686,10 +798,18 @@ impl Backend {
                 records_key: if content { entry.records_key.as_ref().map(|key| Zeroizing::new(key.to_vec())) } else { None },
                 seal_secret: if content { entry.seal_secret.as_ref().map(|key| Zeroizing::new(key.to_vec())) } else { None },
                 content: content && entry.records_key.is_some(),
+                content_digest: None,
             })
         })?;
         let dir = self.site_dir(id)?;
+        let mut exported = exported;
         tokio::task::spawn_blocking(move || -> Result<(), Failure> {
+            // The site is offline, so its folder stays as it is between the
+            // two passes: one to seal its digest, one to write it.
+            if exported.content {
+                let digest = torus_vault::backup::digest_only(&dir, &torus_vault::backup::site_file).map_err(Failure::new)?;
+                exported.content_digest = Some(torus_seal::to_hex(&digest));
+            }
             let mut header = Zeroizing::new(serde_json::to_vec(&exported).map_err(Failure::new)?);
             torus_vault::pad_json(&mut header);
             let sealed = torus_vault::seal(&passphrase, &header).map_err(Failure::new)?;
@@ -701,7 +821,10 @@ impl Backend {
                 if exported.content {
                     // Already encrypted with the site's own key, which is in the
                     // sealed part. Tor's bookkeeping stays: it is rebuilt.
-                    torus_vault::backup::export_only(&dir, &mut out, &|rel| rel != "tor-state.bin")?;
+                    let digest = torus_vault::backup::export_only(&dir, &mut out, &torus_vault::backup::site_file)?;
+                    if exported.content_digest.as_deref() != Some(torus_seal::to_hex(&digest).as_str()) {
+                        return Err(std::io::Error::other("the site changed while it was being exported"));
+                    }
                 }
                 out.flush()
             })();
@@ -754,9 +877,16 @@ impl Backend {
         let unpacked = if exported.content {
             let dir = dir.clone();
             let mut input = input;
+            let sealed = exported.content_digest.clone();
             tokio::task::spawn_blocking(move || {
                 let _ = folder::erase(&dir);
-                torus_vault::backup::unpack(&dir, &mut input)
+                let digest = torus_vault::backup::unpack(&dir, &mut input, &torus_vault::backup::site_file)?;
+                // What follows the sealed part must be what was sealed with it.
+                match (sealed, digest) {
+                    (None, _) => Ok(()),
+                    (Some(sealed), Some(digest)) if sealed == torus_seal::to_hex(&digest) => Ok(()),
+                    _ => Err(std::io::Error::other("its content is not what the file was sealed with")),
+                }
             })
             .await
             .map_err(Failure::new)?
@@ -803,17 +933,22 @@ impl Backend {
         if passphrase.chars().count() < MIN_PASSPHRASE {
             return Err(Failure::new(format!("Use a passphrase of at least {MIN_PASSPHRASE} characters.")));
         }
-        let path = self.vault_path()?;
-        if path.exists() {
+        if self.vault_exists()? {
             return Err(Failure::new("A vault already exists."));
         }
-        let vault = Vault::create(&path, &passphrase, b"{}").map_err(Failure::new)?;
+        std::fs::create_dir_all(&self.data_dir).map_err(Failure::new)?;
+        // The main compartment takes a slot at random, so the names on
+        // disk never say which of the two is the real one.
+        let second = random_bool()?;
+        let vault = Vault::create(&self.layout().vault(second), &passphrase, b"{}").map_err(Failure::new)?;
         // A decoy vault is made at the same moment, sealed under a random
         // passphrase nobody holds. It exists whether or not the owner ever
         // sets a decoy passphrase, so its presence reveals nothing.
-        self.make_blank_alt()?;
-        self.decoy.store(false, Ordering::Relaxed);
-        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: DEFAULT_AUTO_LOCK, saved: Vec::new(), money: None, apps: Vec::new(), next_app: 1 };
+        self.make_blank(!second)?;
+        std::fs::create_dir_all(self.layout().sites(second)).map_err(Failure::new)?;
+        self.second.store(second, Ordering::Relaxed);
+        self.main.store(true, Ordering::Relaxed);
+        let mut session = Session::new(vault, true);
         session.add(site);
         session.persist()?;
         let listed = session.listed();
@@ -825,44 +960,43 @@ impl Backend {
         Ok(listed)
     }
 
-    /// Writes the decoy vault as an unopenable blank: a random passphrase,
-    /// empty contents. Used when an installation is created, and to clear a
-    /// decoy passphrase the owner no longer wants.
-    fn make_blank_alt(&self) -> Result<(), Failure> {
-        let mut random = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(random.as_mut()).map_err(Failure::new)?;
-        let pass = torus_seal::to_hex(random.as_ref());
-        // Padded like every saved vault, so a blank decoy is the same size
-        // as one in use and its size never shows whether one is set.
-        let mut blank = Zeroizing::new(b"{}".to_vec());
-        torus_vault::pad_json(&mut blank);
-        Vault::create(&self.alt_vault_path(), &pass, &blank).map_err(Failure::new)?;
-        let _ = folder::erase(&self.alt_sites_dir());
+    /// Writes one compartment's vault as an unopenable blank: a random
+    /// passphrase, empty contents. Used when an installation is created, and
+    /// to clear a decoy passphrase the owner no longer wants.
+    fn make_blank(&self, second: bool) -> Result<(), Failure> {
+        let (vault, sites) = (self.layout().vault(second), self.layout().sites(second));
+        blank_vault(&vault)?;
+        let _ = folder::erase(&sites);
         // The folder exists in use, so it exists blank too.
-        std::fs::create_dir_all(self.alt_sites_dir()).map_err(Failure::new)?;
+        std::fs::create_dir_all(&sites).map_err(Failure::new)?;
         Ok(())
     }
 
     pub fn unlock(&self, passphrase: String) -> Result<Vec<Listed>, Failure> {
         let passphrase = Zeroizing::new(passphrase);
+        let layout = self.layout();
+        layout.finish_moving();
         // Both compartments are always tried, in the same order and at the
         // same cost, so the time taken never shows which one (if either)
         // the passphrase opened, nor whether a decoy passphrase exists.
-        let main = Vault::open(&self.vault_path()?, &passphrase);
-        let alt = Vault::open(&self.alt_vault_path(), &passphrase);
-        let (decoy, opened) = match (main, alt) {
-            (Ok(main), _) => (false, Ok(main)),
-            (Err(_), Ok(alt)) => (true, Ok(alt)),
+        let first = Vault::open(&layout.vault(false), &passphrase);
+        let other = Vault::open(&layout.vault(true), &passphrase);
+        let (second, opened) = match (first, other) {
+            (Ok(first), _) => (false, Ok(first)),
+            (Err(_), Ok(other)) => (true, Ok(other)),
             (Err(e), Err(_)) => (false, Err(e)),
         };
         let (mut vault, bytes) = opened.map_err(Failure::new)?;
-        self.decoy.store(decoy, Ordering::Relaxed);
+        self.second.store(second, Ordering::Relaxed);
         let active = self.active_vault_path()?;
         // A vault made with weaker settings than today's is made again with them.
         if vault.weaker_than_default() {
             vault = Vault::create(&active, &passphrase, &bytes).map_err(Failure::new)?;
         }
         let mut payload: Payload = serde_json::from_slice(&bytes).map_err(Failure::new)?;
+        // Under the names used before, the first slot was always the main one.
+        let main = payload.main || (layout.legacy() && !second);
+        self.main.store(main, Ordering::Relaxed);
         if let Some(site) = payload.site.take() {
             payload.sites.push(Stored {
                 id: 1,
@@ -888,32 +1022,87 @@ impl Backend {
         let next_id = sites.iter().map(|e| e.id + 1).max().unwrap_or(1).max(payload.next_id);
         let saved = payload.saved.into_iter().map(identity_from).collect::<Result<Vec<_>, _>>()?;
         let money = payload.money.take();
-        if let Err(e) = self.treasury.load(money.as_ref()) {
-            return Err(Failure::new(e));
-        }
         let mut apps = Vec::new();
         for stored in std::mem::take(&mut payload.apps) {
             let StoredApp { id, name, port, identity, tor_key } = stored;
             apps.push(App { id, name, port, identity: identity_from(identity)?, tor_key });
         }
         let next_app = apps.iter().map(|a| a.id + 1).max().unwrap_or(1).max(payload.next_app);
-        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money, apps, next_app };
+        let mut session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money: money.clone(), apps, next_app, main };
+        if main && layout.legacy() {
+            // Best effort: under the old names it simply stays as it was.
+            let _ = self.move_to_neutral_names(&mut session);
+        }
+        if let Err(e) = self.treasury.load(money.as_ref()) {
+            return Err(Failure::new(e));
+        }
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
         self.treasury.ensure().map_err(Failure::new)?;
         Ok(listed)
     }
 
+    /// Moves an installation made before the neutral names onto them, with
+    /// the main compartment in a slot taken at random. Only from the main
+    /// compartment, which can seal its role into its vault first, and only
+    /// while nothing is online, since every folder changes name.
+    fn move_to_neutral_names(&self, session: &mut Session) -> Result<(), Failure> {
+        let quiet = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.apps_hosted.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.local.try_lock().is_ok_and(|local| local.is_none());
+        if !quiet {
+            return Ok(());
+        }
+        session.persist()?;
+        let layout = self.layout();
+        let second = random_bool()?;
+        // The decoy's vault goes first: once it has its new name, it says
+        // which slot is whose, so a move cut short is finished on next start.
+        let old_alt = layout.data_dir.join("alt.vault");
+        let decoy = layout.data_dir.join(Layout::VAULTS[usize::from(!second)]);
+        if old_alt.exists() {
+            std::fs::rename(&old_alt, &decoy).map_err(Failure::new)?;
+        } else {
+            blank_vault(&decoy)?;
+        }
+        layout.finish_moving();
+        if layout.legacy() {
+            // A folder could not be renamed: the main vault keeps its old
+            // name, and the move is finished on a later start.
+            return Err(Failure::new("The files could not all be renamed yet."));
+        }
+        self.second.store(second, Ordering::Relaxed);
+        session.vault.moved_to(layout.vault(second));
+        // Windows keeps a sandbox profile per name; the old names' go.
+        let programs = [self.host_program.as_path()];
+        for dir in [layout.sites(false), layout.sites(true)] {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                for tag in ["", "-alt"] {
+                    if let Some(id) = name.strip_prefix("site-") {
+                        torus_host_api::remove_container(&format!("{}{tag}-{id}", self.sandbox_prefix), &programs);
+                    } else if let Some(id) = name.strip_prefix("app-") {
+                        torus_host_api::remove_container(&format!("{}{tag}-app-{id}", self.sandbox_prefix), &programs);
+                    } else if name == "relay" {
+                        torus_host_api::remove_container(&format!("{}-relay{tag}", self.sandbox_prefix), &programs);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Forgets the vault's key and everything decrypted with it.
     pub fn lock(&self) {
         self.treasury.unload();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.decoy.store(false, Ordering::Relaxed);
+        self.second.store(false, Ordering::Relaxed);
+        self.main.store(false, Ordering::Relaxed);
     }
 
     /// Whether the compartment open now is the decoy one.
     pub fn in_decoy(&self) -> bool {
-        self.is_decoy()
+        self.session.lock().unwrap_or_else(|e| e.into_inner()).is_some() && !self.main.load(Ordering::Relaxed)
     }
 
     /// Sets the decoy passphrase: a second passphrase that opens a separate,
@@ -924,28 +1113,31 @@ impl Backend {
     /// Setting it takes every site offline first, because it rewrites the
     /// decoy compartment's files.
     pub async fn set_decoy(&self, passphrase: String) -> Result<(), Failure> {
-        if self.is_decoy() {
+        if self.in_decoy() || self.session.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             return Err(Failure::new("The decoy passphrase can only be changed from your real passphrase."));
         }
+        let decoy = !self.second();
         let passphrase = Zeroizing::new(passphrase);
         if passphrase.is_empty() {
             self.shutdown_hosts().await;
-            return self.make_blank_alt();
+            return self.make_blank(decoy);
         }
         if passphrase.chars().count() < MIN_PASSPHRASE {
             return Err(Failure::new(format!("Use a passphrase of at least {MIN_PASSPHRASE} characters.")));
         }
         // It must not open the real compartment, or the decoy would be no cover.
-        if Vault::open(&self.vault_path()?, &passphrase).is_ok() {
+        if Vault::open(&self.active_vault_path()?, &passphrase).is_ok() {
             return Err(Failure::new("That is your real passphrase. The decoy must be different."));
         }
         self.shutdown_hosts().await;
-        let alt = Vault::create(&self.alt_vault_path(), &passphrase, b"{}").map_err(Failure::new)?;
+        let alt = Vault::create(&self.layout().vault(decoy), &passphrase, b"{}").map_err(Failure::new)?;
         // A blank install behind it: one empty starter site, so the decoy
         // looks like any new installation.
-        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: DEFAULT_AUTO_LOCK, saved: Vec::new(), money: None, apps: Vec::new(), next_app: 1 };
+        let mut session = Session::new(alt, false);
         session.add(crate::backend::decoy_site());
-        let _ = folder::erase(&self.alt_sites_dir());
+        let sites = self.layout().sites(decoy);
+        let _ = folder::erase(&sites);
+        std::fs::create_dir_all(&sites).map_err(Failure::new)?;
         session.persist()
     }
 
@@ -1069,8 +1261,8 @@ impl Backend {
     /// main ones, as the relay's are, so no sandbox is ever granted both
     /// compartments' folders.
     fn container(&self, id: u32) -> Option<String> {
-        let alt = if self.is_decoy() { "-alt" } else { "" };
-        torus_host_api::sandbox_available().then(|| format!("{}{alt}-{id}", self.sandbox_prefix))
+        let tag = self.layout().tag(self.second());
+        torus_host_api::sandbox_available().then(|| format!("{}{tag}-{id}", self.sandbox_prefix))
     }
 
     /// The one folder a site's host may keep files in: Tor's bookkeeping
@@ -1123,7 +1315,7 @@ impl Backend {
         // Trust nothing: ask the running host to open the vault. If it can,
         // its files are not confined.
         let host = online.host.as_ref().expect("set above");
-        let readable = host.can_read(&self.vault_path()?).await.map_err(Failure::new)?;
+        let readable = host.can_read(&self.active_vault_path()?).await.map_err(Failure::new)?;
         if readable {
             // Android systems older than Landlock cannot confine files; the
             // host there is still confined in every other way, and what it
@@ -1209,7 +1401,7 @@ impl Backend {
     /// The open compartment's sites currently on Tor. A site still being
     /// started is left out, and so is every site of the other compartment.
     pub fn onion_status(&self) -> Vec<OnionStatus> {
-        let decoy = self.is_decoy();
+        let decoy = self.second();
         let slots: Vec<(u32, Slot)> = self
             .hosted
             .lock()
@@ -1276,7 +1468,7 @@ impl Backend {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).max(1);
         let mining = Mining {
             site: id,
-            decoy: self.is_decoy(),
+            decoy: self.second(),
             prefixes,
             stop: Arc::default(),
             tried: Arc::default(),
@@ -1306,7 +1498,7 @@ impl Backend {
     pub fn mine_status(&self) -> Option<MineStatus> {
         self.with_session(|_| Ok(())).ok()?;
         let mining = self.mining.lock().unwrap_or_else(|e| e.into_inner());
-        let mining = mining.as_ref().filter(|m| m.decoy == self.is_decoy())?;
+        let mining = mining.as_ref().filter(|m| m.decoy == self.second())?;
         let tried = mining.tried.load(Ordering::Relaxed);
         let seconds = mining.started.elapsed().as_secs_f64().max(0.001);
         let found = mining.found.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(torus_onion_key::address);
@@ -1324,7 +1516,7 @@ impl Backend {
     /// Stops the search, and forgets any address it found but was not used.
     pub fn mine_stop(&self) {
         let mut mining = self.mining.lock().unwrap_or_else(|e| e.into_inner());
-        if mining.as_ref().is_some_and(|m| m.decoy == self.is_decoy()) {
+        if mining.as_ref().is_some_and(|m| m.decoy == self.second()) {
             *mining = None;
         }
     }
@@ -1332,7 +1524,7 @@ impl Backend {
     /// The address the search found for site `id`, taken out of the search.
     fn take_found(&self, id: Option<u32>) -> Result<Identity, Failure> {
         let mut mining = self.mining.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = mining.as_ref().filter(|m| m.decoy == self.is_decoy() && id.is_none_or(|id| m.site == id));
+        let ours = mining.as_ref().filter(|m| m.decoy == self.second() && id.is_none_or(|id| m.site == id));
         let ours = ours.ok_or_else(|| Failure::new("No address has been found for this site."))?;
         let found = ours.found.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let found = found.ok_or_else(|| Failure::new("No address has been found yet."))?;
@@ -1586,7 +1778,7 @@ impl Backend {
     }
 
     fn app_key(&self, id: u32) -> SiteKey {
-        (self.is_decoy(), id)
+        (self.second(), id)
     }
 
     fn app_dir(&self, id: u32) -> PathBuf {
@@ -1594,8 +1786,8 @@ impl Backend {
     }
 
     fn app_container(&self, id: u32) -> Option<String> {
-        let alt = if self.is_decoy() { "-alt" } else { "" };
-        torus_host_api::sandbox_available().then(|| format!("{}{alt}-app-{id}", self.sandbox_prefix))
+        let tag = self.layout().tag(self.second());
+        torus_host_api::sandbox_available().then(|| format!("{}{tag}-app-{id}", self.sandbox_prefix))
     }
 
     /// Puts an app online at its address, through a confined host that
@@ -1634,7 +1826,7 @@ impl Backend {
         let online = Hosted { host: Some(host), files_confined: true };
         let host = online.host.as_ref().expect("set above");
         // The same checks as for a site: confined, and at the key's address.
-        if host.can_read(&self.vault_path()?).await.map_err(Failure::new)? {
+        if host.can_read(&self.active_vault_path()?).await.map_err(Failure::new)? {
             online.retire().await;
             return Err(Failure::new("The sandbox check failed: the host process could read the vault. The app was not published."));
         }
@@ -1657,7 +1849,7 @@ impl Backend {
 
     /// The open compartment's apps that are online, as for sites.
     pub fn app_status(&self) -> Vec<OnionStatus> {
-        let decoy = self.is_decoy();
+        let decoy = self.second();
         let slots: Vec<(u32, Slot)> = self
             .apps_hosted
             .lock()
@@ -1838,9 +2030,11 @@ mod tests {
         let address = torus_onion_key::address(&key);
 
         // Nothing readable reaches the disk.
-        let on_disk = std::fs::read(dir.join("data").join("project.vault")).unwrap();
-        for secret in [b"Alpha".as_slice(), b"Beta".as_slice(), &key[..16]] {
-            assert!(!on_disk.windows(secret.len()).any(|w| w == secret));
+        for name in Layout::VAULTS {
+            let on_disk = std::fs::read(dir.join("data").join(name)).unwrap();
+            for secret in [b"Alpha".as_slice(), b"Beta".as_slice(), &key[..16]] {
+                assert!(!on_disk.windows(secret.len()).any(|w| w == secret));
+            }
         }
 
         let (again, _) = backend("vault-reopen");
@@ -1932,8 +2126,16 @@ mod tests {
         let (backend, dir) = backend("decoy");
         backend.create_vault("the real passphrase here".into(), site("Secret", "hidden")).unwrap();
         backend.add_site(site("Also secret", "hidden too")).unwrap();
-        // The decoy file exists from the start, before any decoy is set.
-        assert!(dir.join("data/alt.vault").exists(), "no decoy vault was made");
+        // Both files exist from the start, before any decoy is set, under
+        // names that say nothing of which is which.
+        for name in Layout::VAULTS {
+            assert!(dir.join("data").join(name).exists(), "{name} was not made");
+        }
+        for name in ["project.vault", "alt.vault"] {
+            assert!(!dir.join("data").join(name).exists(), "{name} gives the compartments away");
+        }
+        let sizes: Vec<u64> = Layout::VAULTS.iter().map(|n| std::fs::metadata(dir.join("data").join(n)).unwrap().len()).collect();
+        assert_eq!(sizes[0], sizes[1], "the blank decoy's size gives it away");
 
         // A wrong passphrase opens nothing.
         assert!(backend.unlock("not either passphrase".into()).is_err());
@@ -1952,6 +2154,76 @@ mod tests {
         assert!(!backend.in_decoy());
         assert!(real.iter().any(|s| s.site.title == "Secret") && real.iter().any(|s| s.site.title == "Also secret"));
         assert!(!real.iter().any(|s| s.site.title == "Decoy note"), "a decoy site leaked into the real compartment");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An installation under the old names, which said which compartment
+    /// was the main one, moves onto the neutral names when its main
+    /// compartment is opened, keeping both compartments and their folders.
+    #[tokio::test]
+    async fn an_old_installation_moves_onto_neutral_names() {
+        let (backend, dir) = backend("legacy");
+        backend.create_vault("the real passphrase here".into(), site("Secret", "hidden")).unwrap();
+        backend.set_decoy("the decoy passphrase ok".into()).await.unwrap();
+        let main_slot = backend.second();
+        backend.lock();
+        // Put it back as the first releases kept it: the main vault under
+        // project.vault without a role inside, the decoy under alt.vault.
+        let data = dir.join("data");
+        let (main_vault, decoy_vault) = (data.join(Layout::VAULTS[usize::from(main_slot)]), data.join(Layout::VAULTS[usize::from(!main_slot)]));
+        let (_, bytes) = Vault::open(&main_vault, "the real passphrase here").unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        payload.as_object_mut().unwrap().remove("main");
+        Vault::create(&data.join("project.vault"), "the real passphrase here", &serde_json::to_vec(&payload).unwrap()).unwrap();
+        std::fs::remove_file(&main_vault).unwrap();
+        std::fs::rename(&decoy_vault, data.join("alt.vault")).unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("a-sites"));
+        let _ = std::fs::remove_dir_all(dir.join("b-sites"));
+        std::fs::create_dir_all(dir.join("tor/site-1")).unwrap();
+        std::fs::write(dir.join("tor/site-1/records.bin"), b"main records").unwrap();
+        std::fs::create_dir_all(dir.join("alt-sites")).unwrap();
+
+        // The decoy opens under the old names, and moves nothing.
+        backend.unlock("the decoy passphrase ok".into()).unwrap();
+        assert!(backend.in_decoy());
+        assert!(data.join("project.vault").exists());
+        backend.lock();
+
+        let real = backend.unlock("the real passphrase here".into()).unwrap();
+        assert!(!backend.in_decoy());
+        assert!(real.iter().any(|s| s.site.title == "Secret"));
+        for name in ["project.vault", "alt.vault"] {
+            assert!(!data.join(name).exists(), "{name} is still there");
+        }
+        assert!(!dir.join("tor").exists() && !dir.join("alt-sites").exists());
+        let main = Layout::SITES[usize::from(backend.second())];
+        assert_eq!(std::fs::read(dir.join(main).join("site-1/records.bin")).unwrap(), b"main records");
+        // Saving goes to the moved file, and both passphrases still work.
+        backend.add_site(site("After the move", "x")).unwrap();
+        backend.lock();
+        assert!(backend.unlock("the decoy passphrase ok".into()).is_ok() && backend.in_decoy());
+        let real = backend.unlock("the real passphrase here".into()).unwrap();
+        assert!(!backend.in_decoy() && real.iter().any(|s| s.site.title == "After the move"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A move onto the neutral names cut short after the decoy's vault was
+    /// renamed is finished on the next start.
+    #[test]
+    fn a_move_cut_short_is_finished_on_start() {
+        let dir = std::env::temp_dir().join(format!("torus-backend-test-{}-cut-short", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(dir.join("tor/site-3")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("project.vault"), b"main").unwrap();
+        std::fs::write(data.join("a.vault"), b"decoy").unwrap();
+        let layout = Layout { data_dir: data.clone(), tor_dir: dir.join("tor") };
+        assert!(layout.legacy());
+        layout.finish_moving();
+        assert!(!layout.legacy());
+        assert_eq!(std::fs::read(data.join("b.vault")).unwrap(), b"main");
+        assert!(dir.join("b-sites/site-3").is_dir() && dir.join("a-sites").is_dir());
         let _ = std::fs::remove_dir_all(dir);
     }
 
