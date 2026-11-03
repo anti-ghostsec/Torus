@@ -24,8 +24,11 @@ const metadata = JSON.parse(
 const release = join(metadata.target_directory, ...(triple === host ? [] : [triple]), "release");
 const name = `Torus_${version}_linux_portable`;
 const out = join(metadata.target_directory, "portable");
-const folder = join(out, "Torus");
-rmSync(out, { recursive: true, force: true });
+// Staged apart from the other platforms' builds, which share `out`.
+const stage = join(out, "linux");
+const folder = join(stage, "Torus");
+rmSync(stage, { recursive: true, force: true });
+for (const old of [`${name}.zip`, `${name}.tar.gz`]) rmSync(join(out, old), { force: true });
 mkdirSync(join(folder, "licenses"), { recursive: true });
 
 const binaries = join(root, "app", "src-tauri", "binaries");
@@ -60,8 +63,8 @@ writeFileSync(
   ].join("\n"),
 );
 
-execFileSync("tar", ["-czf", `${name}.tar.gz`, "Torus"], { cwd: out, stdio: "inherit" });
+execFileSync("tar", ["-czf", join(out, `${name}.tar.gz`), "Torus"], { cwd: stage, stdio: "inherit" });
 try {
-  execFileSync("zip", ["-r", "-9", `${name}.zip`, "Torus"], { cwd: out, stdio: "inherit" });
+  execFileSync("zip", ["-r", "-9", join(out, `${name}.zip`), "Torus"], { cwd: stage, stdio: "inherit" });
 } catch {}
 console.log(`Built ${join(out, `${name}.tar.gz`)}`);
