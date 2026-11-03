@@ -17,6 +17,8 @@ PREFIX=$WORK/prefix
 FFMPEG_VERSION=7.1.1
 OPUS_VERSION=1.5.2
 VPX_TAG=v1.15.2
+ZLIB_VERSION=1.3.1
+ZLIB_SHA256=9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
 JOBS=$(nproc)
 mkdir -p "$WORK" "$OUT" "$PREFIX"
 cd "$WORK"
@@ -60,6 +62,17 @@ fetch "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz" opus.
 rm -rf opus && mkdir opus && tar -xzf opus.tar.gz -C opus --strip-components=1
 (cd opus && ./configure --host=$HOST --prefix="$PREFIX" --disable-shared --enable-static \
   --disable-doc --disable-extra-programs --with-pic >/dev/null && make -j"$JOBS" >/dev/null && make install >/dev/null)
+
+# zlib, for the PNG encoder. Built here for every target: the cross
+# toolchains have none of their own. Only its compression core, compiled
+# directly, as its own build scripts differ between targets; FFmpeg never
+# uses its gzip file functions.
+fetch "https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.gz" zlib.tar.gz
+echo "$ZLIB_SHA256  zlib.tar.gz" | sha256sum -c --quiet -
+rm -rf zlib && mkdir zlib && tar -xzf zlib.tar.gz -C zlib --strip-components=1
+(cd zlib && for c in adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil; do
+   $CC -O2 -fPIC -c "$c.c" || exit 1; done && $AR rcs libz.a ./*.o && $RANLIB libz.a \
+  && mkdir -p "$PREFIX/lib" "$PREFIX/include" && cp libz.a "$PREFIX/lib/" && cp zlib.h zconf.h "$PREFIX/include/")
 
 # libvpx (VP8/VP9)
 if [ ! -d libvpx ]; then
