@@ -281,8 +281,10 @@ struct Engine(std::path::PathBuf);
 
 /// Where everything this app keeps lives. On a computer that is one folder,
 /// `TorusData`, beside the program itself, so the app is portable and
-/// leaves nothing in the user's profile or anywhere else. On Android, the
-/// app's private storage, which only it can reach.
+/// leaves nothing in the user's profile or anywhere else. Run as an
+/// AppImage, the program sits in a read-only image mounted only while it
+/// runs, so the folder goes beside the `.AppImage` file instead. On Android,
+/// the app's private storage, which only it can reach.
 fn data_root(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     #[cfg(mobile)]
     {
@@ -291,7 +293,14 @@ fn data_root(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error:
     #[cfg(desktop)]
     {
         let _ = app;
-        let program = std::env::current_exe()?;
+        let mut program = std::env::current_exe()?;
+        // The AppImage runtime sets both; trust APPIMAGE only when this
+        // program really is inside the mounted image it names.
+        if let (Some(image), Some(mounted)) = (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR")) {
+            if program.starts_with(&mounted) {
+                program = image.into();
+            }
+        }
         let beside = program.parent().ok_or("the program has no folder")?;
         let root = beside.join("TorusData");
         std::fs::create_dir_all(&root)

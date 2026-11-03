@@ -53,6 +53,9 @@ writeFileSync(
   [
     "Torus, portable.",
     "",
+    "Needs WebKitGTK 4.1 (Debian and Ubuntu: sudo apt install libwebkit2gtk-4.1-0).",
+    "The AppImage download carries it and needs nothing installed.",
+    "",
     "Run ./torus. Nothing is installed: everything Torus keeps, encrypted, is in the",
     "TorusData folder it makes beside itself. Move the whole Torus folder to take your",
     "sites with you; delete it to remove every trace of them.",

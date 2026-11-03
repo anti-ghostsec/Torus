@@ -1,6 +1,6 @@
-# Builds the portable Linux app, portable Windows app and the Android app and
-# publishes them as a GitHub release. Runs when a version tag (v1.2.3) is pushed,
-# or by hand.
+# Builds the Linux AppImage, the portable Linux and Windows apps and the
+# Android app and publishes them as a GitHub release. Runs when a version tag
+# (v1.2.3) is pushed, or by hand.
 #
 # To sign the Android app with your own key, add these repository secrets:
 #   ANDROID_KEYSTORE_BASE64  the keystore file, base64-encoded
@@ -82,6 +82,14 @@ jobs:
         working-directory: app
         run: npm run portable:linux
 
+      # One file carrying the WebKitGTK libraries the window needs, so
+      # nothing has to be installed first.
+      - name: Linux (AppImage)
+        working-directory: app
+        run: |
+          node scripts/prepare-bundle.mjs
+          npx tauri build --bundles appimage --config src-tauri/tauri.linux.conf.json
+
       - name: Windows (portable)
         working-directory: app
         run: npm run portable:windows
@@ -120,10 +128,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp target/portable/Torus_*_linux_portable.tar.gz "Torus_${TAG#v}_linux_portable.tar.gz"
+          cp target/release/bundle/appimage/Torus_*.AppImage "Torus_${TAG#v}_x86_64.AppImage"
           cp target/portable/Torus_*_windows_portable.zip "Torus_${TAG#v}_windows_portable.zip"
-          sha256sum "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
+          sha256sum "Torus_${TAG#v}_x86_64.AppImage" "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" > SHA256SUMS.txt
           cat > notes.md <<'NOTES'
-          **Linux (portable):** unpack `Torus_*_linux_portable.tar.gz` and run `Torus/torus`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus/TorusData`. Sites are confined using Linux Landlock and seccomp sandboxing.
+          **Linux (AppImage, nothing to install):** download `Torus_*_x86_64.AppImage`, make it executable (`chmod +x`, or Properties → Permissions) and run it. Everything Torus keeps, encrypted, is in a `TorusData` folder beside the file, so keep it in a folder of its own. Needs a Linux from 2024 or later (Ubuntu 24.04, Debian 13, Fedora 40, Mint 22). Without FUSE, run it with `--appimage-extract-and-run`.
+
+          **Linux (portable):** for systems that already have WebKitGTK (Debian and Ubuntu: `sudo apt install libwebkit2gtk-4.1-0`). Unpack `Torus_*_linux_portable.tar.gz` and run `Torus/torus`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus/TorusData`. Sites are confined using Linux Landlock and seccomp sandboxing.
 
           **Windows (portable):** unzip `Torus_*_windows_portable.zip` anywhere on an NTFS drive and run `Torus\torus.exe`. Nothing is installed and nothing is written outside that folder: everything Torus keeps, encrypted, is in `Torus\TorusData`. It is not code-signed, so Windows SmartScreen warns the first time: choose "More info", then "Run anyway".
 
@@ -132,4 +143,4 @@ jobs:
           Every site's host runs in a sandbox, every uploaded video is encoded afresh before anyone can watch it (up to 10 GB), and nothing is left readable on disk without the passphrase. Check downloads against `SHA256SUMS.txt`.
           NOTES
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "Torus $TAG" --notes-file notes.md --target "$GITHUB_SHA"
-          gh release upload "$TAG" "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
+          gh release upload "$TAG" "Torus_${TAG#v}_x86_64.AppImage" "Torus_${TAG#v}_linux_portable.tar.gz" "Torus_${TAG#v}_windows_portable.zip" "Torus_${TAG#v}_arm64.apk" SHA256SUMS.txt --clobber
