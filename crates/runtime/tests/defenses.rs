@@ -125,3 +125,81 @@ async fn views_are_counted_without_anything_about_the_viewer() {
     assert!(live.remove("pastes", &id));
     assert_eq!(get(addr, &place, None).await.status, 404);
 }
+
+#[tokio::test]
+async fn junk_sent_at_a_puzzle_form_does_not_use_up_everyones_budget() {
+    let mut site = pastebin();
+    site.moderation.puzzle_collections = vec!["pastes".into()];
+    let (addr, live) = start(site).await;
+    // Far more wrong answers than the shared per-minute budget allows posts.
+    for _ in 0..40 {
+        let id = puzzle_id(&get(addr, "/", None).await.text());
+        let sent = post(addr, "/_form/pastes", None, &[("text", "spam"), ("_puzzle", &id), ("_answer", "WRONG1")]).await;
+        assert_eq!(sent.status, 400);
+    }
+    let id = puzzle_id(&get(addr, "/", None).await.text());
+    let answer = live.puzzle_answer_for_tests(&id).unwrap();
+    let sent = post(addr, "/_form/pastes", None, &[("text", "real"), ("_puzzle", &id), ("_answer", &answer)]).await;
+    assert_eq!(sent.status, 303, "{}", sent.text());
+}
+
+#[tokio::test]
+async fn reloading_a_puzzle_page_in_a_loop_pushes_no_one_elses_puzzle_out() {
+    let mut site = pastebin();
+    site.moderation.puzzle_collections = vec!["pastes".into()];
+    let (addr, live) = start(site).await;
+    let id = puzzle_id(&get(addr, "/", None).await.text());
+    let answer = live.puzzle_answer_for_tests(&id).unwrap();
+    for _ in 0..300 {
+        get(addr, "/", None).await;
+    }
+    let sent = post(addr, "/_form/pastes", None, &[("text", "real"), ("_puzzle", &id), ("_answer", &answer)]).await;
+    assert_eq!(sent.status, 303, "{}", sent.text());
+}
+
+/// A multipart form whose parts are empty but many, with long names.
+fn many_parts(count: usize, name_len: usize) -> Vec<u8> {
+    let boundary = "----torusTestBoundary7MA4YWxk";
+    let mut body = Vec::new();
+    for at in 0..count {
+        let name = format!("{at}{}", "n".repeat(name_len));
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n\r\n").as_bytes());
+    }
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhello\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let extra = format!("Content-Type: multipart/form-data; boundary={boundary}\r\n");
+    request("POST", "/_form/pastes", None, &extra, &body)
+}
+
+#[tokio::test]
+async fn empty_parts_and_their_names_count_against_a_forms_size() {
+    let (addr, live) = start(pastebin()).await;
+    // A few parts the form does not have are read past.
+    let sent = send(addr, many_parts(3, 10)).await;
+    assert_eq!(sent.status, 303, "{}", sent.text());
+    assert_eq!(live.records("pastes").len(), 1);
+    assert!(!live.records("pastes")[0].fields.keys().any(|key| key.contains("nnn")));
+    // Many empty parts are refused, and so are a few with huge names.
+    assert_eq!(send(addr, many_parts(2_000, 1)).await.status, 413);
+    assert_eq!(send(addr, many_parts(10, 100_000)).await.status, 413);
+    assert_eq!(live.records("pastes").len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_body_that_never_arrives_does_not_hold_the_connection() {
+    let (addr, _live) = start(wiki()).await;
+    let foreign = |length: u64| {
+        format!(
+            "POST /_form/articles HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: cross-site\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    };
+    // Claimed large: answered at once, nothing waited for.
+    let began = std::time::Instant::now();
+    assert_eq!(send(addr, foreign(50_000_000)).await.status, 403);
+    assert!(began.elapsed() < std::time::Duration::from_secs(5));
+    // Claimed small and never sent: waited for only briefly.
+    let began = std::time::Instant::now();
+    assert_eq!(send(addr, foreign(1_000)).await.status, 403);
+    assert!(began.elapsed() < std::time::Duration::from_secs(15), "{:?}", began.elapsed());
+}

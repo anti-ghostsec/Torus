@@ -143,12 +143,33 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
+const BPF_JSET_K: u16 = 0x45;
+const SECCOMP_RET_ENOSYS: u32 = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH: Option<u32> = Some(0xC000_003E);
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: Option<u32> = Some(0xC000_00B7);
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(target_arch = "x86")]
+const AUDIT_ARCH: Option<u32> = Some(0x4000_0003);
+#[cfg(target_arch = "arm")]
+const AUDIT_ARCH: Option<u32> = Some(0x4000_0028);
+#[cfg(target_arch = "riscv64")]
+const AUDIT_ARCH: Option<u32> = Some(0xC000_00F3);
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm", target_arch = "riscv64")))]
 const AUDIT_ARCH: Option<u32> = None;
+
+/// The flags of `clone` that make new namespaces: a way around the refusal
+/// of `unshare`, and into the kernel's least-tested code.
+const CLONE_NEW_ANY: u32 = 0x0002_0000 // mount
+    | 0x0200_0000 // cgroup
+    | 0x0400_0000 // uts
+    | 0x0800_0000 // ipc
+    | 0x1000_0000 // user
+    | 0x2000_0000 // pid
+    | 0x4000_0000; // net
+/// Where the first argument's low 32 bits sit in seccomp's data (little-endian).
+const ARG0_LOW: u32 = 16;
 
 /// System calls no confined process needs, and that would help one that has
 /// been taken over to reach beyond its confinement.
@@ -183,6 +204,14 @@ fn refused_calls(offline: bool) -> Vec<libc::c_long> {
         libc::SYS_name_to_handle_at,
         libc::SYS_acct,
         libc::SYS_quotactl,
+        // The newer mount interface, numbered alike on every architecture.
+        428, // open_tree
+        429, // move_mount
+        430, // fsopen
+        431, // fsconfig
+        432, // fsmount
+        433, // fspick
+        442, // mount_setattr
     ];
     if offline {
         calls.extend([libc::SYS_socket, libc::SYS_connect, libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4]);
@@ -190,25 +219,62 @@ fn refused_calls(offline: bool) -> Vec<libc::c_long> {
     calls
 }
 
+/// Where a filter instruction goes when its test holds or fails.
+#[derive(Clone, Copy)]
+enum To {
+    Next,
+    Refuse,
+    NoSuchCall,
+    CloneFlags,
+}
+
 fn seccomp(offline: bool) -> bool {
     let Some(arch) = AUDIT_ARCH else { return false };
     let calls = refused_calls(offline);
-    let count = calls.len();
+    // Written with named targets first, then resolved to the relative jumps
+    // BPF wants: every jump goes forward, to one of the endings at the bottom.
+    let mut body: Vec<(u16, To, To, u32)> = vec![(BPF_LD_W_ABS, To::Next, To::Next, 0)];
+    // On x86_64, numbers with this bit set are the x32 interface: refused whole.
+    if cfg!(target_arch = "x86_64") {
+        body.push((BPF_JGE_K, To::Refuse, To::Next, 0x4000_0000));
+    }
+    // Without clone3, libraries fall back to clone, whose flags can be read.
+    #[cfg(not(target_arch = "arm"))]
+    body.push((BPF_JEQ_K, To::NoSuchCall, To::Next, libc::SYS_clone3 as u32));
+    body.push((BPF_JEQ_K, To::CloneFlags, To::Next, libc::SYS_clone as u32));
+    for call in &calls {
+        body.push((BPF_JEQ_K, To::Refuse, To::Next, *call as u32));
+    }
+    // The endings, in order: allow, refuse, no such call, then the check of
+    // clone's flags (which ends by allowing or refusing).
+    let at_allow = body.len();
+    let ends = [at_allow, at_allow + 1, at_allow + 2, at_allow + 3];
+    // ends[0], allowing, is where the list falls through to.
     let mut program = vec![
         // Only this architecture's system call numbers mean what the list says.
         SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: 4 },
         SockFilter { code: BPF_JEQ_K, jt: 1, jf: 0, k: arch },
         SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
-        SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: 0 },
     ];
-    // On x86_64, numbers with this bit set are the x32 interface: refused whole.
-    let x32 = cfg!(target_arch = "x86_64");
-    if x32 {
-        program.push(SockFilter { code: BPF_JGE_K, jt: (count + 1) as u8, jf: 0, k: 0x4000_0000 });
+    let jump = |from: usize, to: To| -> Option<u8> {
+        let target = match to {
+            To::Next => return Some(0),
+            To::Refuse => ends[1],
+            To::NoSuchCall => ends[2],
+            To::CloneFlags => ends[3],
+        };
+        u8::try_from(target - from - 1).ok()
+    };
+    for (at, (code, yes, no, k)) in body.iter().enumerate() {
+        let (Some(jt), Some(jf)) = (jump(at, *yes), jump(at, *no)) else { return false };
+        program.push(SockFilter { code: *code, jt, jf, k: *k });
     }
-    for (at, call) in calls.iter().enumerate() {
-        program.push(SockFilter { code: BPF_JEQ_K, jt: (count - at) as u8, jf: 0, k: *call as u32 });
-    }
+    program.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW });
+    program.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | libc::EPERM as u32 });
+    program.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ENOSYS });
+    // clone: refused if it asks for any new namespace.
+    program.push(SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: ARG0_LOW });
+    program.push(SockFilter { code: BPF_JSET_K, jt: 1, jf: 0, k: CLONE_NEW_ANY });
     program.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW });
     program.push(SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | libc::EPERM as u32 });
     let prog = SockFprog { len: program.len() as u16, filter: program.as_ptr() };

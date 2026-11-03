@@ -8,6 +8,11 @@
 //! reach is anything a camera embeds inside the compressed pictures or sound
 //! themselves; removing that would take decoding and encoding the video again.
 //!
+//! Nor can it reach a whole track of something other than pictures and
+//! sound, such as the GPS track a drone or action camera records beside the
+//! video: its samples sit among the pictures. Such tracks are reported, so
+//! that a video with one is not kept unless it is encoded afresh.
+//!
 //! Input that does not look like the format it claims is passed through
 //! untouched rather than refused: this is a filter, not a validator.
 
@@ -45,6 +50,17 @@ impl Scrubber {
         match self {
             Scrubber::Mp4(mp4) => mp4.gave_up,
             Scrubber::WebM(webm) => webm.gave_up,
+        }
+    }
+
+    /// Whether the file has a track that is neither pictures nor sound:
+    /// GPS and sensor tracks (GoPro, DJI, Google, Apple), timecodes, text.
+    /// What such a track records is not described but carried as samples,
+    /// so blanking descriptions leaves it all in place.
+    pub fn other_tracks(&self) -> bool {
+        match self {
+            Scrubber::Mp4(mp4) => mp4.tracks.other,
+            Scrubber::WebM(_) => false,
         }
     }
 
@@ -94,6 +110,16 @@ pub(crate) struct Mp4 {
     next: Next,
     held: Vec<u8>,
     gave_up: bool,
+    tracks: Tracks,
+}
+
+/// What has been learned about the tracks while cleaning the index.
+#[derive(Default)]
+struct Tracks {
+    /// The kind of the track being looked at, from its handler.
+    kind: [u8; 4],
+    /// Whether any track is neither pictures (`vide`) nor sound (`soun`).
+    other: bool,
 }
 
 /// Boxes that exist to carry descriptions: user data, metadata, and
@@ -127,7 +153,7 @@ impl Mp4 {
                     self.held.extend_from_slice(&input[..want]);
                     input = &input[want..];
                     if self.held.len() as u64 == *total {
-                        clean_boxes(&mut self.held[8..], 0);
+                        clean_boxes(&mut self.held[8..], 0, *b"moov", &mut self.tracks);
                         out.append(&mut self.held);
                         self.next = Next::Header;
                     }
@@ -183,9 +209,10 @@ impl Mp4 {
 /// the stack.
 const MAX_DEPTH: usize = 12;
 
-/// Cleans a run of boxes held in memory, descending into those that hold
-/// the tracks. Stops quietly at anything malformed.
-fn clean_boxes(mut boxes: &mut [u8], depth: usize) {
+/// Cleans a run of boxes held in memory, the contents of a `parent` box,
+/// descending into those that hold the tracks. Stops quietly at anything
+/// malformed.
+fn clean_boxes(mut boxes: &mut [u8], depth: usize, parent: [u8; 4], tracks: &mut Tracks) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -202,7 +229,30 @@ fn clean_boxes(mut boxes: &mut [u8], depth: usize) {
                 header[4..8].copy_from_slice(b"free");
                 body.fill(0);
             }
-            b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"mvex" => clean_boxes(body, depth + 1),
+            b"trak" => {
+                tracks.kind = [0; 4];
+                clean_boxes(body, depth + 1, kind, tracks);
+                // A track that never said what it holds could hold anything.
+                tracks.other |= tracks.kind == [0; 4];
+            }
+            b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"mvex" => clean_boxes(body, depth + 1, kind, tracks),
+            // A handler: version and flags, a QuickTime component type, the
+            // kind of handler, 12 reserved bytes, then a name, often the
+            // name of the program that wrote the file.
+            b"hdlr" => {
+                if let Some(handler) = body.get(8..12) {
+                    if parent == *b"mdia" {
+                        tracks.kind = handler.try_into().expect("4 bytes");
+                        tracks.other |= !matches!(&tracks.kind, b"vide" | b"soun");
+                    }
+                }
+                if let Some(name) = body.get_mut(24..) {
+                    name.fill(0);
+                }
+            }
+            // The kinds of sample in a picture track each carry the name of
+            // the encoder that made them, often a camera's model.
+            b"stsd" if tracks.kind == *b"vide" => clean_sample_kinds(body),
             // When the file, the track and its media were made and changed.
             b"mvhd" | b"tkhd" | b"mdhd" => {
                 let times = if body.first() == Some(&1) { 4..20 } else { 4..12 };
@@ -216,11 +266,31 @@ fn clean_boxes(mut boxes: &mut [u8], depth: usize) {
     }
 }
 
+/// Blanks the encoder name in each kind of picture sample: after the
+/// version, flags and count, each is a box whose body holds 42 bytes of
+/// sizes and resolutions, then a 32-byte name.
+fn clean_sample_kinds(body: &mut [u8]) {
+    let Some(mut entries) = body.get_mut(8..) else { return };
+    while entries.len() >= 8 {
+        let size = u32::from_be_bytes(entries[..4].try_into().expect("4 bytes")) as usize;
+        if size < 8 || size > entries.len() {
+            return;
+        }
+        let (this, rest) = entries.split_at_mut(size);
+        if let Some(name) = this.get_mut(8 + 42..8 + 42 + 32) {
+            name.fill(0);
+        }
+        entries = rest;
+    }
+}
+
 // WebM (Matroska): a file is a sequence of elements, each an identifier of
 // 1 to 4 bytes, a size of 1 to 8 bytes and a body, and some contain elements.
 
 const SEGMENT: u32 = 0x1853_8067;
 const INFO: u32 = 0x1549_A966;
+const TRACKS: u32 = 0x1654_AE6B;
+const CHAPTERS: u32 = 0x1043_A770;
 const TAGS: u32 = 0x1254_C367;
 const ATTACHMENTS: u32 = 0x1941_A469;
 const VOID: u8 = 0xEC;
@@ -298,8 +368,10 @@ impl WebM {
                     self.held.extend_from_slice(&input[..want]);
                     input = &input[want..];
                     if self.held.len() as u64 == *total {
-                        if let Ok(Some((_, _, header))) = element(&self.held) {
-                            clean_info(&mut self.held[header..]);
+                        match element(&self.held) {
+                            Ok(Some((INFO, _, header))) => clean_info(&mut self.held[header..]),
+                            Ok(Some((TRACKS, _, header))) => clean_tracks(&mut self.held[header..]),
+                            _ => {}
                         }
                         out.append(&mut self.held);
                         self.next = Next::Header;
@@ -318,7 +390,8 @@ impl WebM {
                             continue;
                         }
                     };
-                    if id == INFO && !size.is_some_and(|body| header as u64 + body <= MAX_HELD) {
+                    let held = |size: Option<u64>| size.is_some_and(|body| header as u64 + body <= MAX_HELD);
+                    if matches!(id, INFO | TRACKS) && !held(size) {
                         self.gave_up = true;
                     }
                     self.next = match (id, size) {
@@ -327,8 +400,8 @@ impl WebM {
                             out.append(&mut self.held);
                             Next::Header
                         }
-                        (INFO, Some(body)) if header as u64 + body <= MAX_HELD => Next::Hold(header as u64 + body),
-                        (TAGS | ATTACHMENTS, Some(body)) => {
+                        (INFO | TRACKS, Some(body)) if held(size) => Next::Hold(header as u64 + body),
+                        (TAGS | ATTACHMENTS | CHAPTERS, Some(body)) => {
                             // Any header bytes beyond what a void's own
                             // header needs are already zeroed and counted
                             // into its size.
@@ -384,6 +457,37 @@ fn clean_info(mut body: &mut [u8]) {
     }
 }
 
+/// Cleans the body of the "tracks" element: the name each track was given,
+/// which recording programs fill with the device or the place.
+fn clean_tracks(mut body: &mut [u8]) {
+    const TRACK_ENTRY: u32 = 0xAE;
+    const NAME: u32 = 0x536E;
+    while let Ok(Some((id, Some(size), header))) = element(body) {
+        let Some(total) = usize::try_from(size).ok().and_then(|size| header.checked_add(size)) else { return };
+        if total > body.len() {
+            return;
+        }
+        let (this, rest) = body.split_at_mut(total);
+        if id == TRACK_ENTRY {
+            let mut entry = &mut this[header..];
+            while let Ok(Some((id, Some(size), header))) = element(entry) {
+                let Some(total) = usize::try_from(size).ok().and_then(|size| header.checked_add(size)) else { break };
+                if total > entry.len() {
+                    break;
+                }
+                let (field, more) = entry.split_at_mut(total);
+                if id == NAME {
+                    let (head, content) = field.split_at_mut(header);
+                    void_header(head, size);
+                    content.fill(0);
+                }
+                entry = more;
+            }
+        }
+        body = rest;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,8 +508,26 @@ mod tests {
         mp4_box(kind, &body)
     }
 
+    /// A handler box: version and flags, component type, handler type,
+    /// reserved bytes, then the name.
+    fn handler(kind: &[u8; 4], name: &[u8]) -> Vec<u8> {
+        mp4_box(b"hdlr", &[&[0; 4], b"mhlr".as_slice(), kind, &[0; 12], name].concat())
+    }
+
+    /// A track of `kind`, its pictures described by one `avc1` sample kind.
+    fn track(kind: &[u8; 4]) -> Vec<u8> {
+        let mut compressor = [0u8; 32];
+        compressor[0] = 14;
+        compressor[1..15].copy_from_slice(b"SECRET-ENCODER");
+        let entry = mp4_box(b"avc1", &[[1u8; 42].as_slice(), &compressor, &[0x00, 0x18, 0xff, 0xff]].concat());
+        let stsd = mp4_box(b"stsd", &[[0, 0, 0, 0, 0, 0, 0, 1].as_slice(), &entry].concat());
+        let minf = mp4_box(b"minf", &[mp4_box(b"dinf", &handler(b"alis", b"SECRET Alias Data Handler")), mp4_box(b"stbl", &stsd)].concat());
+        let mdia = mp4_box(b"mdia", &[header_box(b"mdhd"), handler(kind, b"SECRET-HANDLER\0"), minf].concat());
+        [header_box(b"tkhd"), mdia].concat()
+    }
+
     fn sample_mp4() -> Vec<u8> {
-        let track = [header_box(b"tkhd"), mp4_box(b"mdia", &[header_box(b"mdhd"), mp4_box(b"hdlr", b"vide-handler")].concat())].concat();
+        let track = track(b"vide");
         let moov = [
             header_box(b"mvhd"),
             mp4_box(b"udta", &mp4_box(b"\xa9xyz", b"+51.5007-000.1246/ SECRET-LOCATION")),
@@ -448,7 +570,7 @@ mod tests {
         // The pictures, the file type and the track structure are untouched.
         let pictures = original.windows(4).position(|w| w == b"mdat").unwrap();
         assert_eq!(cleaned[pictures..pictures + 5004], original[pictures..pictures + 5004]);
-        for kept in [b"ftyp".as_slice(), b"moov", b"mvhd", b"trak", b"tkhd", b"mdia", b"mdhd", b"vide-handler", b"isomiso2"] {
+        for kept in [b"ftyp".as_slice(), b"moov", b"mvhd", b"trak", b"tkhd", b"mdia", b"mdhd", b"hdlr", b"mhlrvide", b"avc1", b"stsd", b"isomiso2"] {
             assert!(contains(&cleaned, kept), "lost {:?}", String::from_utf8_lossy(kept));
         }
         assert!(!contains(&cleaned, b"udta") && !contains(&cleaned, b"uuid") && !contains(&cleaned, b"meta"));
@@ -477,6 +599,35 @@ mod tests {
         let file = [mp4_box(b"ftyp", b"isom"), mp4_box(b"moov", &nested)].concat();
         let cleaned = run(Scrubber::new("video/mp4"), &file, 65_536);
         assert_eq!(cleaned.len(), file.len());
+    }
+
+    #[test]
+    fn tracks_other_than_pictures_and_sound_are_reported() {
+        let mp4 = |tracks: &[Vec<u8>]| {
+            let traks: Vec<u8> = tracks.iter().flat_map(|t| mp4_box(b"trak", t)).collect();
+            [mp4_box(b"ftyp", b"isom"), mp4_box(b"moov", &[header_box(b"mvhd"), traks].concat()), mp4_box(b"mdat", &[9; 100])].concat()
+        };
+        let reported = |file: &[u8]| {
+            let mut scrubber = Scrubber::new("video/mp4");
+            scrubber.push(file, &mut Vec::new());
+            scrubber.other_tracks()
+        };
+        assert!(!reported(&mp4(&[track(b"vide"), track(b"soun")])), "pictures and sound are all an ordinary file has");
+        assert!(!reported(&sample_mp4()));
+        // GoPro and DJI GPS (`meta`), Google's camera motion (`camm`), a
+        // timecode, and a track that never says what it holds.
+        for odd in [track(b"meta"), track(b"camm"), track(b"tmcd"), header_box(b"tkhd")] {
+            assert!(reported(&mp4(&[track(b"vide"), odd.clone(), track(b"soun")])));
+            // However the file arrives.
+            let file = mp4(&[track(b"vide"), odd]);
+            let mut scrubber = Scrubber::new("video/mp4");
+            for piece in file.chunks(7) {
+                scrubber.push(piece, &mut Vec::new());
+            }
+            assert!(scrubber.other_tracks());
+        }
+        // A WebM's tracks are not looked at for this.
+        assert!(!Scrubber::new("video/webm").other_tracks());
     }
 
     #[test]
@@ -566,6 +717,50 @@ mod tests {
         assert_eq!((seen, rest.len()), (5, 0));
 
         for piece in [1, 2, 3, 7, 16, 100, 4096] {
+            assert_eq!(run(Scrubber::new("video/webm"), &original, piece), cleaned, "pieces of {piece}");
+        }
+    }
+
+    #[test]
+    fn a_webm_loses_its_track_names_and_chapters() {
+        let entry = |number: u8, name: &[u8]| {
+            ebml(&[0xAE], &[ebml(&[0xD7], &[number]), ebml(&[0x53, 0x6E], name), ebml(&[0x86], b"V_VP9")].concat())
+        };
+        let tracks = [entry(1, b"SECRET DJI Mavic"), entry(2, b"SECRET-MIC")].concat();
+        let pictures: Vec<u8> = (0..500u32).map(|n| (n * 7 % 251) as u8).collect();
+        let inside = [
+            ebml(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
+            ebml(&[0x10, 0x43, 0xA7, 0x70], b"chapter: SECRET arrival at the house"),
+            ebml(&[0x1F, 0x43, 0xB6, 0x75], &pictures),
+        ]
+        .concat();
+        let mut original = ebml(&[0x1A, 0x45, 0xDF, 0xA3], b"\x42\x82\x84webm");
+        original.extend_from_slice(&ebml(&[0x18, 0x53, 0x80, 0x67], &inside));
+
+        let cleaned = run(Scrubber::new("video/webm"), &original, original.len());
+        assert_eq!(cleaned.len(), original.len());
+        assert!(contains(&original, b"SECRET") && !contains(&cleaned, b"SECRET"));
+        assert!(contains(&cleaned, b"V_VP9"), "what the track holds is kept");
+        let at = original.windows(4).position(|w| w == [0x1F, 0x43, 0xB6, 0x75]).unwrap();
+        assert_eq!(cleaned[at..], original[at..], "the pictures changed");
+
+        // Each track entry still reads as a well-formed run of elements.
+        let start = cleaned.windows(4).position(|w| w == [0x16, 0x54, 0xAE, 0x6B]).unwrap() + 6;
+        let mut rest = &cleaned[start..start + tracks.len()];
+        while let Ok(Some((id, Some(size), header))) = element(rest) {
+            assert_eq!(id, 0xAE);
+            let mut inner = &rest[header..header + size as usize];
+            let mut seen = 0;
+            while let Ok(Some((_, Some(size), header))) = element(inner) {
+                inner = &inner[header + size as usize..];
+                seen += 1;
+            }
+            assert_eq!((seen, inner.len()), (3, 0));
+            rest = &rest[header + size as usize..];
+        }
+        assert!(rest.is_empty());
+
+        for piece in [1, 3, 64] {
             assert_eq!(run(Scrubber::new("video/webm"), &original, piece), cleaned, "pieces of {piece}");
         }
     }

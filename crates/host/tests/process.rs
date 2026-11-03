@@ -8,7 +8,17 @@ use tokio::net::TcpStream;
 use torus_core::{Align, Block, Page, Site, Theme};
 use torus_host_api::{Host, Sandbox, Target};
 
-const HOST: &str = env!("CARGO_BIN_EXE_torus-host");
+/// The host program Cargo built for these tests. Newer Cargo tells tests
+/// where it is when they run rather than when they are compiled.
+fn host_program() -> &'static Path {
+    static HOST: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        option_env!("CARGO_BIN_EXE_torus-host")
+            .map(Into::into)
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_torus-host").map(Into::into))
+            .expect("Cargo names the host program")
+    })
+}
 
 fn site(text: &str) -> Site {
     Site {
@@ -39,7 +49,7 @@ async fn fetch(address: &str) -> std::io::Result<String> {
 
 #[tokio::test]
 async fn host_serves_republishes_and_dies_with_its_owner() {
-    let host = Host::start(Path::new(HOST), None, None, Target::Loopback, site("first"), None).await.unwrap();
+    let host = Host::start(host_program(), None, None, Target::Loopback, site("first"), None).await.unwrap();
     let address = host.address().to_owned();
     assert!(fetch(&address).await.unwrap().contains("<p>first</p>"));
 
@@ -74,7 +84,7 @@ async fn host_serves_republishes_and_dies_with_its_owner() {
 async fn a_damaged_key_is_reported_not_served() {
     let dir = std::env::temp_dir().join(format!("torus-host-test-{}", std::process::id()));
     let target = Target::Onion { identity: vec![1, 2, 3], state_dir: dir.join("state"), cache_dir: dir.join("cache"), kept: None, kept_key: Vec::new() };
-    let error = Host::start(Path::new(HOST), None, None, target, site("x"), None).await.err().unwrap();
+    let error = Host::start(host_program(), None, None, target, site("x"), None).await.err().unwrap();
     assert!(error.contains("damaged"), "unexpected error: {error}");
 }
 
@@ -116,13 +126,13 @@ async fn a_confined_host_cannot_open_the_users_files() {
     let program = std::env::current_exe().unwrap();
 
     // Without confinement the same program opens the file without trouble.
-    let free = Host::start(Path::new(HOST), None, None, Target::Loopback, site("x"), None).await.unwrap();
+    let free = Host::start(host_program(), None, None, Target::Loopback, site("x"), None).await.unwrap();
     assert!(free.can_read(&secret).await.unwrap(), "the control case should be able to read the file");
     assert!(free.can_read(&program).await.unwrap(), "the control case should be able to read the program");
     drop(free);
 
     let sandbox = Sandbox { name: &container, folder: &folder };
-    let host = Host::start(Path::new(HOST), Some(sandbox), None, Target::Loopback, site("x"), None).await.unwrap();
+    let host = Host::start(host_program(), Some(sandbox), None, Target::Loopback, site("x"), None).await.unwrap();
     assert!(!host.can_read(&secret).await.unwrap(), "a confined host read a file in the user's temp folder");
     assert!(!host.can_read(&program).await.unwrap(), "a confined host read a program beside its own");
 
@@ -132,7 +142,7 @@ async fn a_confined_host_cannot_open_the_users_files() {
     assert!(host.can_read(&own).await.unwrap(), "a confined host could not read its own folder");
 
     drop(host);
-    torus_host_api::remove_container(&container, &[Path::new(HOST)]);
+    torus_host_api::remove_container(&container, &[host_program()]);
     let _ = std::fs::remove_dir_all(&folder);
     let _ = std::fs::remove_file(secret);
 }
@@ -153,7 +163,7 @@ fn a_converter_can_reach_neither_the_network_nor_files() {
 
     let container = format!("torus.test-conv-{}", std::process::id());
     // Any program will do as the one it may run; this test never converts.
-    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, Path::new(HOST), &sandbox_folder(&container)).unwrap();
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(host_program(), &container, host_program(), &sandbox_folder(&container)).unwrap();
     let path = secret.to_string_lossy().into_owned();
     to.write_all(&[torus_host::media::PROBE]).unwrap();
     to.write_all(&u32::from(port).to_le_bytes()).unwrap();
@@ -169,7 +179,7 @@ fn a_converter_can_reach_neither_the_network_nor_files() {
     assert_eq!(answer[7..], [0, 0, 0, 0, 1]);
 
     drop(keeper);
-    torus_host_api::remove_container(&format!("torus.test-conv-{}", std::process::id()), &[Path::new(HOST)]);
+    torus_host_api::remove_container(&format!("torus.test-conv-{}", std::process::id()), &[host_program()]);
     let _ = std::fs::remove_file(secret);
 }
 
@@ -219,7 +229,7 @@ async fn submissions_are_kept_across_host_restarts() {
     let _ = std::fs::remove_file(&file);
     let records = || Some(Records { file: file.clone(), key: vec![9; 32] });
 
-    let host = Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook.clone(), records()).await.unwrap();
+    let host = Host::start(host_program(), None, None, Target::Loopback, guestbook.clone(), records()).await.unwrap();
     let address = host.address().trim_start_matches("http://").to_owned();
     let mut stream = TcpStream::connect(&address).await.unwrap();
     let body = "_next=%2F&name=Persistent+visitor";
@@ -236,9 +246,9 @@ async fn submissions_are_kept_across_host_restarts() {
 
     // A host with the wrong key refuses to start rather than serve an empty site.
     let wrong = Some(Records { file: file.clone(), key: vec![1; 32] });
-    assert!(Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook.clone(), wrong).await.is_err());
+    assert!(Host::start(host_program(), None, None, Target::Loopback, guestbook.clone(), wrong).await.is_err());
 
-    let again = Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook, records()).await.unwrap();
+    let again = Host::start(host_program(), None, None, Target::Loopback, guestbook, records()).await.unwrap();
     assert!(fetch(again.address()).await.unwrap().contains("<h2>Persistent visitor</h2>"));
     let on_disk = std::fs::read(&file).unwrap();
     assert!(!on_disk.windows(10).any(|w| w == b"Persistent"));
@@ -261,7 +271,7 @@ async fn the_owner_can_list_and_remove_what_was_added() {
         fields: vec![Field { name: "name".into(), label: "Name".into(), kind: FieldKind::Text, required: true }],
     });
     guestbook.pages[0].blocks = vec![Block::Form { collection: "notes".into(), submit_label: "Sign".into(), open: false, prefill: false }];
-    let host = Host::start(Path::new(HOST), None, None, Target::Loopback, guestbook, None).await.unwrap();
+    let host = Host::start(host_program(), None, None, Target::Loopback, guestbook, None).await.unwrap();
     assert!(host.records("notes").await.unwrap().is_empty());
 
     let name = host.address().trim_start_matches("http://").to_owned();
@@ -310,7 +320,7 @@ fn a_real_video_is_encoded_afresh_in_the_sandbox() {
     assert!(video.windows(6).any(|w| w == b"SECRET"));
 
     let container = format!("torus.test-real-{}", std::process::id());
-    let (mut from, mut to, keeper) = torus_host_api::converter_alone(Path::new(HOST), &container, converter, &sandbox_folder(&container)).unwrap();
+    let (mut from, mut to, keeper) = torus_host_api::converter_alone(host_program(), &container, converter, &sandbox_folder(&container)).unwrap();
     // A request: re-encode whole (3), then the video in pieces, then the end.
     to.write_all(&[3, 0, 0, 0, 0]).unwrap();
     let sending = std::thread::spawn(move || {
@@ -353,7 +363,7 @@ fn a_real_video_is_encoded_afresh_in_the_sandbox() {
 /// own at this computer: only requests to the preview's own address are answered.
 #[tokio::test]
 async fn the_local_preview_answers_only_to_its_own_name() {
-    let host = Host::start(Path::new(HOST), None, None, Target::Loopback, site("private draft"), None).await.unwrap();
+    let host = Host::start(host_program(), None, None, Target::Loopback, site("private draft"), None).await.unwrap();
     let address = host.address().trim_start_matches("http://").to_owned();
     assert!(fetch(host.address()).await.unwrap().contains("private draft"));
     let mut stream = TcpStream::connect(&address).await.unwrap();

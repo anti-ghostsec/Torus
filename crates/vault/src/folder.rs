@@ -143,14 +143,15 @@ pub fn pack(folder: &Path, key: &[u8; 32], file: &Path) -> io::Result<()> {
     let mut temp = file.to_path_buf().into_os_string();
     temp.push(".new");
     let temp = PathBuf::from(temp);
-    let mut out = fs::File::create(&temp)?;
+    let mut out = crate::create_temp(&temp)?;
     out.write_all(&nonce)?;
     out.write_all(&sealed)?;
     out.sync_all()?;
     crate::hide_times(&out);
     drop(out);
     fs::rename(&temp, file)?;
-    Ok(())
+    // Without this, a power cut can bring back the previous copy.
+    crate::sync_folder_of(file)
 }
 
 /// Recreates `folder` from what [`pack`] wrote to `file`, after erasing

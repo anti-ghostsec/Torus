@@ -94,13 +94,24 @@ async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(S
             Ok((Serving::Loopback(Task(tokio::spawn(serve(listener, live)))), address))
         }
         Target::Onion { identity, state_dir, cache_dir, kept: file, kept_key } => {
-            let identity = Zeroizing::new(identity);
-            let identity = <[u8; 64]>::try_from(identity.as_slice())
-                .map(Zeroizing::new)
-                .map_err(|_| "the onion key is damaged".to_owned())?;
+            let identity = identity_from(identity)?;
             unpack(&state_dir, &cache_dir, file, kept_key, kept)?;
             let tor = Tor::connect(&state_dir, &cache_dir).await.map_err(|e| e.to_string())?;
             let onion = tor.launch("site", &identity, live).map_err(|e| e.to_string())?;
+            let address = onion.address().to_owned();
+            Ok((Serving::Onion { onion, _tor: tor, _keeping: keep_periodically(kept) }, address))
+        }
+        Target::Forward { identity, port, state_dir, cache_dir, kept: file, kept_key } => {
+            let identity = identity_from(identity)?;
+            if port == 0 {
+                return Err("the app's port is missing".into());
+            }
+            unpack(&state_dir, &cache_dir, file, kept_key, kept)?;
+            let tor = Tor::connect(&state_dir, &cache_dir).await.map_err(|e| e.to_string())?;
+            // Always this computer's own loopback address: only the port is
+            // the editor's to choose.
+            let to = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let onion = tor.launch_forward("site", &identity, to).map_err(|e| e.to_string())?;
             let address = onion.address().to_owned();
             Ok((Serving::Onion { onion, _tor: tor, _keeping: keep_periodically(kept) }, address))
         }
@@ -112,6 +123,11 @@ async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(S
             Ok((Serving::Relay { tor: std::sync::Arc::new(tor), node, _keeping: keep_periodically(kept) }, address))
         }
     }
+}
+
+fn identity_from(bytes: Vec<u8>) -> Result<Zeroizing<[u8; 64]>, String> {
+    let bytes = Zeroizing::new(bytes);
+    <[u8; 64]>::try_from(bytes.as_slice()).map(Zeroizing::new).map_err(|_| "the onion key is damaged".to_owned())
 }
 
 /// Unpacks Tor's bookkeeping, where the editor keeps it.

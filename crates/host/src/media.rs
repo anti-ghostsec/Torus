@@ -30,6 +30,24 @@ const STALLED: Duration = Duration::from_secs(30 * 60);
 /// However slow the device, no conversion runs for longer than this.
 const LONGEST: Duration = Duration::from_secs(4 * 24 * 60 * 60);
 const LONGEST_STILL: Duration = Duration::from_secs(10 * 60);
+/// The most of a video that is encoded, in seconds. A small file can claim
+/// to last for days, and encoding all of it would keep the computer busy
+/// for as long; nothing a visitor honestly uploads to a site runs longer.
+const LONGEST_VIDEO: &str = "7200";
+/// The largest encoding made, in bytes: twice the largest upload taken.
+/// The host stops wanting more long before this, but the encoder would
+/// carry on until the end unless told when to stop.
+/// Threads for one video: a quarter of the processors, at most four. A video
+/// is prepared in the background while the computer is used for other
+/// things, and the busiest uploads should never take the whole machine.
+fn encoder_threads() -> String {
+    let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (all / 4).clamp(1, 4).to_string()
+}
+
+fn largest_output() -> String {
+    (2 * torus_core::FieldKind::Video.max_bytes()).to_string()
+}
 
 fn send(to: &mut impl Write, data: &[u8]) -> io::Result<()> {
     for piece in data.chunks(PIECE) {
@@ -124,12 +142,15 @@ fn arguments(kind: u8, pixels: u32) -> Option<Vec<String>> {
     let video = |add: &mut dyn FnMut(&[&str]), scale: &str, quality: &str, sound: &str| {
         add(&["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]);
         add(&["-vf", scale, "-c:v", "libvpx-vp9", "-crf", quality, "-b:v", "0", "-deadline", "good", "-cpu-used", "6"]);
-        add(&["-row-mt", "1", "-tile-columns", "2", "-threads", "0", "-pix_fmt", "yuv420p"]);
+        let threads = encoder_threads();
+        add(&["-row-mt", "1", "-tile-columns", "2", "-threads", &threads, "-pix_fmt", "yuv420p"]);
         add(&["-c:a", "libopus", "-b:a", sound, "-ac", "2"]);
-        add(&["-bitexact", "-f", "webm", "pipe:1"]);
+        add(&["-t", LONGEST_VIDEO, "-fs", &largest_output()]);
+        // Nothing in the result says which encoder versions made it.
+        add(&["-flags:v", "+bitexact", "-flags:a", "+bitexact", "-fflags", "+bitexact", "-f", "webm", "pipe:1"]);
     };
     match (kind, pixels) {
-        (1, _) => add(&["-map", "0:v:0", "-vf", "thumbnail=90", "-frames:v", "1", "-an", "-sn", "-dn", "-map_metadata", "-1", "-f", "image2pipe", "-c:v", "png", "pipe:1"]),
+        (1, _) => add(&["-map", "0:v:0", "-vf", "thumbnail=90", "-frames:v", "1", "-an", "-sn", "-dn", "-map_metadata", "-1", "-flags:v", "+bitexact", "-fflags", "+bitexact", "-f", "image2pipe", "-c:v", "png", "pipe:1"]),
         (2, 360) => video(&mut add, "scale='if(gt(iw,ih),-2,360)':'if(gt(iw,ih),360,-2)'", "36", "64k"),
         (2, 720) => video(&mut add, "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'", "34", "96k"),
         // Every upload: the same size, up to 1080 pixels on the shorter

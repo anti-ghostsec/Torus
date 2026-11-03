@@ -1,0 +1,16 @@
+[package]
+name = "torus-gateway"
+description = "Puts a web app already running on this machine online as a Tor onion service, with Tor inside the process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "torus-gateway"
+path = "src/main.rs"
+
+[dependencies]
+torus-tor.workspace = true
+torus-onion-key.workspace = true
+tokio.workspace = true
+zeroize = "1"

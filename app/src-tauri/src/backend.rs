@@ -26,6 +26,10 @@ use torus_vault::{folder, Vault};
 use crate::money::{StoredMoney, Treasury};
 use zeroize::Zeroizing;
 
+/// A key as it is stored or sent: wiped from memory when dropped, so the
+/// copies made on every save do not pile up in freed memory.
+type Secret = Zeroizing<Vec<u8>>;
+
 /// What the vault file holds once decrypted.
 #[derive(Serialize, Deserialize, Default)]
 struct Payload {
@@ -42,15 +46,20 @@ struct Payload {
     /// Onion keys kept for later: found by a search, imported, or replaced
     /// on a site. None of them is any site's address now.
     #[serde(default)]
-    saved: Vec<Vec<u8>>,
+    saved: Vec<Secret>,
     /// The Monero wallet, once one has been made.
     #[serde(default)]
     money: Option<StoredMoney>,
+    /// Apps on this computer put online through Tor.
+    #[serde(default)]
+    apps: Vec<StoredApp>,
+    #[serde(default)]
+    next_app: u32,
     // Vaults written before multiple sites existed held exactly one.
     #[serde(default, skip_serializing)]
     site: Option<Site>,
     #[serde(default, skip_serializing)]
-    identity: Option<Vec<u8>>,
+    identity: Option<Secret>,
 }
 
 /// The sealed part of a site file: the site, and only the secrets the owner
@@ -58,15 +67,17 @@ struct Payload {
 #[derive(Serialize, Deserialize)]
 struct Exported {
     site: Site,
-    identity: Option<Vec<u8>>,
-    records_key: Option<Vec<u8>>,
-    seal_secret: Option<Vec<u8>>,
+    identity: Option<Secret>,
+    records_key: Option<Secret>,
+    seal_secret: Option<Secret>,
     /// Whether the site's encrypted folder follows the sealed part.
     content: bool,
 }
 
 /// The most beginnings one search looks for at once.
 const MAX_PREFIXES: usize = 16;
+/// Tor's own key file begins with this, then the 64-byte expanded key.
+const TOR_KEY_HEADER: &[u8; 32] = b"== ed25519v1-secret: type0 ==\0\0\0";
 /// Address file: `magic | sealed key`, the key padded so every file is alike.
 const KEY_MAGIC: &[u8; 8] = b"TORUSKY1";
 const KEY_FILE_PADDING: usize = 256;
@@ -82,16 +93,51 @@ struct Stored {
     id: u32,
     site: Site,
     /// The onion service's secret key. Present once the site has been published to Tor.
-    identity: Option<Vec<u8>>,
+    identity: Option<Secret>,
     /// The key that what visitors submit is encrypted with on disk.
     #[serde(default)]
-    records_key: Option<Vec<u8>>,
+    records_key: Option<Secret>,
     /// The secret that opens what visitors send to sealed collections.
     #[serde(default)]
-    seal_secret: Option<Vec<u8>>,
+    seal_secret: Option<Secret>,
     /// The key Tor's bookkeeping for this site is kept encrypted with.
     #[serde(default)]
-    tor_key: Option<Vec<u8>>,
+    tor_key: Option<Secret>,
+}
+
+/// An app already running on this computer (a web server on a port of its
+/// own), put online at an onion address of its own. Torus serves none of
+/// its pages: it only carries visitors' streams to it.
+#[derive(Serialize, Deserialize)]
+struct StoredApp {
+    id: u32,
+    name: String,
+    port: u16,
+    identity: Secret,
+    tor_key: Secret,
+}
+
+struct App {
+    id: u32,
+    name: String,
+    port: u16,
+    identity: Identity,
+    tor_key: Zeroizing<Vec<u8>>,
+}
+
+/// An app as the window sees it: no secrets.
+#[derive(Debug, Serialize)]
+pub struct AppListed {
+    pub id: u32,
+    pub name: String,
+    pub port: u16,
+    pub address: String,
+}
+
+impl App {
+    fn listed(&self) -> AppListed {
+        AppListed { id: self.id, name: self.name.clone(), port: self.port, address: torus_onion_key::address(&self.identity) }
+    }
 }
 
 struct Entry {
@@ -118,6 +164,8 @@ struct Session {
     auto_lock_minutes: u32,
     saved: Vec<Identity>,
     money: Option<StoredMoney>,
+    apps: Vec<App>,
+    next_app: u32,
 }
 
 impl Session {
@@ -128,18 +176,30 @@ impl Session {
             .map(|e| Stored {
                 id: e.id,
                 site: e.site.clone(),
-                identity: e.identity.as_ref().map(|key| key.to_vec()),
-                records_key: e.records_key.as_ref().map(|key| key.to_vec()),
-                seal_secret: e.seal_secret.as_ref().map(|key| key.to_vec()),
-                tor_key: e.tor_key.as_ref().map(|key| key.to_vec()),
+                identity: e.identity.as_ref().map(|key| Zeroizing::new(key.to_vec())),
+                records_key: e.records_key.as_ref().map(|key| Zeroizing::new(key.to_vec())),
+                seal_secret: e.seal_secret.as_ref().map(|key| Zeroizing::new(key.to_vec())),
+                tor_key: e.tor_key.as_ref().map(|key| Zeroizing::new(key.to_vec())),
             })
             .collect();
         let payload = Payload {
             sites,
             next_id: self.next_id,
             auto_lock_minutes: self.auto_lock_minutes,
-            saved: self.saved.iter().map(|key| key.to_vec()).collect(),
+            saved: self.saved.iter().map(|key| Zeroizing::new(key.to_vec())).collect(),
             money: self.money.clone(),
+            apps: self
+                .apps
+                .iter()
+                .map(|a| StoredApp {
+                    id: a.id,
+                    name: a.name.clone(),
+                    port: a.port,
+                    identity: Zeroizing::new(a.identity.to_vec()),
+                    tor_key: a.tor_key.clone(),
+                })
+                .collect(),
+            next_app: self.next_app,
             ..Payload::default()
         };
         let mut bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(Failure::new)?);
@@ -148,9 +208,14 @@ impl Session {
         self.vault.save(&bytes).map_err(Failure::new)
     }
 
+    /// Whether a key is some site's or app's address now.
+    fn in_use(&self, key: &Identity) -> bool {
+        self.sites.iter().filter_map(|e| e.identity.as_ref()).chain(self.apps.iter().map(|a| &a.identity)).any(|k| **k == **key)
+    }
+
     /// Keeps a key for later, unless it is already kept or in use.
     fn keep(&mut self, key: Identity) {
-        let known = self.saved.iter().chain(self.sites.iter().filter_map(|e| e.identity.as_ref())).any(|k| **k == *key);
+        let known = self.in_use(&key) || self.saved.iter().any(|k| **k == *key);
         if !known {
             self.saved.push(key);
         }
@@ -175,9 +240,31 @@ impl Session {
     }
 }
 
-fn identity_from(bytes: Vec<u8>) -> Result<Identity, Failure> {
-    let bytes = Zeroizing::new(bytes);
+fn identity_from(bytes: Secret) -> Result<Identity, Failure> {
     <[u8; 64]>::try_from(bytes.as_slice()).map(Zeroizing::new).map_err(|_| Failure::new("A stored onion key is damaged."))
+}
+
+/// Writes a file only its owner can read, never through a link left in its place.
+fn write_private(file: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Failure::new("That file is a link: choose the file itself."));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(file).map_err(Failure::new)?;
+    // An existing file keeps its mode: made private here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        out.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(Failure::new)?;
+    }
+    out.write_all(bytes).and_then(|_| out.sync_all()).map_err(Failure::new)
 }
 
 fn random_key() -> Result<Zeroizing<Vec<u8>>, Failure> {
@@ -257,6 +344,8 @@ impl Hosted {
 
 /// The shortest passphrase a vault may be made with.
 const MIN_PASSPHRASE: usize = 10;
+/// Minutes without use before a new vault locks itself; the owner can change it.
+const DEFAULT_AUTO_LOCK: u32 = 10;
 
 /// A search for an onion address that begins with chosen letters.
 struct Mining {
@@ -292,6 +381,11 @@ pub struct MineStatus {
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Hosted>>>;
+
+/// Which compartment a site belongs to (true: the decoy), and its number.
+/// Both compartments number their sites from 1, so the number alone would
+/// let one compartment see, stop or answer for the other's sites.
+type SiteKey = (bool, u32);
 
 /// Saves the wallet into the open vault.
 fn keep_money(session: Arc<Mutex<Option<Session>>>) -> crate::money::Keep {
@@ -349,10 +443,12 @@ pub struct Backend {
     /// The open compartment's Monero wallet.
     treasury: Arc<Treasury>,
     /// The local test server, and the site it serves.
-    local: tokio::sync::Mutex<Option<(u32, Host)>>,
+    local: tokio::sync::Mutex<Option<(SiteKey, Host)>>,
     /// One slot per site, each locked on its own: starting one site, which
     /// can take minutes, holds up nothing done with another.
-    hosted: Mutex<HashMap<u32, Slot>>,
+    hosted: Mutex<HashMap<SiteKey, Slot>>,
+    /// The same for apps on this computer, numbered apart from sites.
+    apps_hosted: Mutex<HashMap<SiteKey, Slot>>,
     /// The search for a chosen address, if one is under way or done.
     mining: Mutex<Option<Mining>>,
 }
@@ -411,13 +507,27 @@ impl Backend {
         Host::start(&self.host_program, sandbox, converter.as_deref(), target, site, records).await
     }
 
-    /// Answers a site's questions to the wallet: those of site `id` only.
+    /// Answers a site's questions to the wallet: those of site `id` only,
+    /// and only while its own compartment is open. A site left online while
+    /// the other compartment is unlocked is answered as if it had no wallet,
+    /// as while the vault is locked, so it never reaches the other's wallet.
     fn banker(&self, id: u32) -> torus_host_api::Banker {
         let treasury = self.treasury.clone();
+        let (open, ours) = (self.decoy.clone(), self.is_decoy());
         Arc::new(move |ask| {
             let treasury = treasury.clone();
-            Box::pin(async move { treasury.ask(id, ask).await })
+            let open = open.clone();
+            Box::pin(async move {
+                if open.load(Ordering::Relaxed) != ours {
+                    return torus_core::money::Told::Refused("This site has no wallet.".into());
+                }
+                treasury.ask(id, ask).await
+            })
         })
+    }
+
+    fn key(&self, id: u32) -> SiteKey {
+        (self.is_decoy(), id)
     }
 
     pub fn new(data_dir: PathBuf, tor_dir: PathBuf, host_program: PathBuf) -> Self {
@@ -439,6 +549,7 @@ impl Backend {
             treasury,
             local: Default::default(),
             hosted: Default::default(),
+            apps_hosted: Default::default(),
             mining: Mutex::new(None),
         };
         backend.erase_leftovers();
@@ -453,7 +564,10 @@ impl Backend {
         let folders: Vec<PathBuf> = roots
             .iter()
             .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("site-"))
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("site-") || name.starts_with("app-")
+            })
             .map(|entry| entry.path())
             .collect();
         for site in folders {
@@ -513,12 +627,14 @@ impl Backend {
     }
 
     fn slot(&self, id: u32) -> Slot {
-        self.hosted.lock().unwrap_or_else(|e| e.into_inner()).entry(id).or_default().clone()
+        let key = self.key(id);
+        self.hosted.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone()
     }
 
     /// The slot of a site that is online, if it is.
     fn existing_slot(&self, id: u32) -> Option<Slot> {
-        self.hosted.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+        let key = self.key(id);
+        self.hosted.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
     }
 
     pub fn vault_exists(&self) -> Result<bool, Failure> {
@@ -566,9 +682,9 @@ impl Backend {
             let entry = session.entry(id)?;
             Ok(Exported {
                 site: entry.site.clone(),
-                identity: if address { entry.identity.as_ref().map(|key| key.to_vec()) } else { None },
-                records_key: if content { entry.records_key.as_ref().map(|key| key.to_vec()) } else { None },
-                seal_secret: if content { entry.seal_secret.as_ref().map(|key| key.to_vec()) } else { None },
+                identity: if address { entry.identity.as_ref().map(|key| Zeroizing::new(key.to_vec())) } else { None },
+                records_key: if content { entry.records_key.as_ref().map(|key| Zeroizing::new(key.to_vec())) } else { None },
+                seal_secret: if content { entry.seal_secret.as_ref().map(|key| Zeroizing::new(key.to_vec())) } else { None },
                 content: content && entry.records_key.is_some(),
             })
         })?;
@@ -652,8 +768,8 @@ impl Backend {
             self.with_session(|session| {
                 let entry = session.entry(id)?;
                 entry.identity = identity;
-                entry.records_key = exported.records_key.map(Zeroizing::new);
-                entry.seal_secret = exported.seal_secret.map(Zeroizing::new);
+                entry.records_key = exported.records_key;
+                entry.seal_secret = exported.seal_secret;
                 session.persist()?;
                 Ok(session.listed().into_iter().find(|l| l.id == id).expect("just added"))
             })
@@ -697,7 +813,7 @@ impl Backend {
         // sets a decoy passphrase, so its presence reveals nothing.
         self.make_blank_alt()?;
         self.decoy.store(false, Ordering::Relaxed);
-        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new(), money: None };
+        let mut session = Session { vault, sites: Vec::new(), next_id: 1, auto_lock_minutes: DEFAULT_AUTO_LOCK, saved: Vec::new(), money: None, apps: Vec::new(), next_app: 1 };
         session.add(site);
         session.persist()?;
         let listed = session.listed();
@@ -716,8 +832,14 @@ impl Backend {
         let mut random = Zeroizing::new([0u8; 32]);
         getrandom::getrandom(random.as_mut()).map_err(Failure::new)?;
         let pass = torus_seal::to_hex(random.as_ref());
-        Vault::create(&self.alt_vault_path(), &pass, b"{}").map_err(Failure::new)?;
+        // Padded like every saved vault, so a blank decoy is the same size
+        // as one in use and its size never shows whether one is set.
+        let mut blank = Zeroizing::new(b"{}".to_vec());
+        torus_vault::pad_json(&mut blank);
+        Vault::create(&self.alt_vault_path(), &pass, &blank).map_err(Failure::new)?;
         let _ = folder::erase(&self.alt_sites_dir());
+        // The folder exists in use, so it exists blank too.
+        std::fs::create_dir_all(self.alt_sites_dir()).map_err(Failure::new)?;
         Ok(())
     }
 
@@ -758,9 +880,9 @@ impl Backend {
                 id: stored.id,
                 site: stored.site,
                 identity,
-                records_key: stored.records_key.map(Zeroizing::new),
-                seal_secret: stored.seal_secret.map(Zeroizing::new),
-                tor_key: stored.tor_key.map(Zeroizing::new),
+                records_key: stored.records_key,
+                seal_secret: stored.seal_secret,
+                tor_key: stored.tor_key,
             });
         }
         let next_id = sites.iter().map(|e| e.id + 1).max().unwrap_or(1).max(payload.next_id);
@@ -769,7 +891,13 @@ impl Backend {
         if let Err(e) = self.treasury.load(money.as_ref()) {
             return Err(Failure::new(e));
         }
-        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money };
+        let mut apps = Vec::new();
+        for stored in std::mem::take(&mut payload.apps) {
+            let StoredApp { id, name, port, identity, tor_key } = stored;
+            apps.push(App { id, name, port, identity: identity_from(identity)?, tor_key });
+        }
+        let next_app = apps.iter().map(|a| a.id + 1).max().unwrap_or(1).max(payload.next_app);
+        let session = Session { vault, sites, next_id, auto_lock_minutes: payload.auto_lock_minutes, saved, money, apps, next_app };
         let listed = session.listed();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
         self.treasury.ensure().map_err(Failure::new)?;
@@ -815,7 +943,7 @@ impl Backend {
         let alt = Vault::create(&self.alt_vault_path(), &passphrase, b"{}").map_err(Failure::new)?;
         // A blank install behind it: one empty starter site, so the decoy
         // looks like any new installation.
-        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: 0, saved: Vec::new(), money: None };
+        let mut session = Session { vault: alt, sites: Vec::new(), next_id: 1, auto_lock_minutes: DEFAULT_AUTO_LOCK, saved: Vec::new(), money: None, apps: Vec::new(), next_app: 1 };
         session.add(crate::backend::decoy_site());
         let _ = folder::erase(&self.alt_sites_dir());
         session.persist()
@@ -889,7 +1017,8 @@ impl Backend {
         let site = self.with_seal_key(id, site)?;
         checked(&site)?;
         let mut slot = self.local.lock().await;
-        if let Some((_, host)) = slot.as_ref().filter(|(serving, host)| *serving == id && !host.status().broken) {
+        let key = self.key(id);
+        if let Some((_, host)) = slot.as_ref().filter(|(serving, host)| *serving == key && !host.status().broken) {
             host.publish(site).await.map_err(Failure::new)?;
             return Ok(host.address().to_owned());
         }
@@ -901,7 +1030,7 @@ impl Backend {
         let host = self.start_host(None, Target::Loopback, site, None).await.map_err(Failure::new)?;
         host.answer_bank_with(self.banker(id));
         let address = host.address().to_owned();
-        *slot = Some((id, host));
+        *slot = Some((key, host));
         Ok(address)
     }
 
@@ -936,8 +1065,12 @@ impl Backend {
     /// The name of the sandbox a site's host process runs in. Each site
     /// gets its own, so sites are confined from one another as well as from
     /// the editor.
+    /// The sandbox a site's host runs in. The decoy's are apart from the
+    /// main ones, as the relay's are, so no sandbox is ever granted both
+    /// compartments' folders.
     fn container(&self, id: u32) -> Option<String> {
-        torus_host_api::sandbox_available().then(|| format!("{}-{id}", self.sandbox_prefix))
+        let alt = if self.is_decoy() { "-alt" } else { "" };
+        torus_host_api::sandbox_available().then(|| format!("{}{alt}-{id}", self.sandbox_prefix))
     }
 
     /// The one folder a site's host may keep files in: Tor's bookkeeping
@@ -1073,10 +1206,18 @@ impl Backend {
         self.with_host(id, "Publish the site to Tor first.", async |host| host.set_moderator(&account, on).await).await
     }
 
-    /// The sites currently on Tor. A site still being started is left out.
+    /// The open compartment's sites currently on Tor. A site still being
+    /// started is left out, and so is every site of the other compartment.
     pub fn onion_status(&self) -> Vec<OnionStatus> {
-        let slots: Vec<(u32, Slot)> =
-            self.hosted.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(id, slot)| (*id, slot.clone())).collect();
+        let decoy = self.is_decoy();
+        let slots: Vec<(u32, Slot)> = self
+            .hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((compartment, _), _)| *compartment == decoy)
+            .map(|((_, id), slot)| (*id, slot.clone()))
+            .collect();
         let mut all: Vec<OnionStatus> = slots
             .into_iter()
             .filter_map(|(id, slot)| {
@@ -1090,15 +1231,20 @@ impl Backend {
         all
     }
 
-    /// Takes one site off Tor, and stops its local test server.
+    /// Takes one of the open compartment's sites off Tor, and stops its
+    /// local test server.
     pub async fn stop(&self, id: u32) {
+        self.stop_key(self.key(id)).await;
+    }
+
+    async fn stop_key(&self, key: SiteKey) {
         {
             let mut local = self.local.lock().await;
-            if local.as_ref().is_some_and(|(serving, _)| *serving == id) {
+            if local.as_ref().is_some_and(|(serving, _)| *serving == key) {
                 *local = None;
             }
         }
-        let slot = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        let slot = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         if let Some(slot) = slot {
             let hosted = slot.lock().await.take();
             if let Some(hosted) = hosted {
@@ -1271,7 +1417,11 @@ impl Backend {
 
     fn saved_key(&self, address: &str) -> Result<Identity, Failure> {
         self.with_session(|session| {
-            let all = session.saved.iter().chain(session.sites.iter().filter_map(|e| e.identity.as_ref()));
+            let all = session
+                .saved
+                .iter()
+                .chain(session.sites.iter().filter_map(|e| e.identity.as_ref()))
+                .chain(session.apps.iter().map(|a| &a.identity));
             all.into_iter()
                 .find(|k| torus_onion_key::address(k) == address)
                 .cloned()
@@ -1330,7 +1480,7 @@ impl Backend {
             if inner.len() != KEY_FILE_PADDING || inner[64..].iter().any(|&b| b != 0) {
                 return Err(not_one());
             }
-            identity_from(inner[..64].to_vec())
+            identity_from(Zeroizing::new(inner[..64].to_vec()))
         })
         .await
         .map_err(Failure::new)??;
@@ -1340,6 +1490,193 @@ impl Backend {
             session.persist()
         })?;
         Ok(address)
+    }
+
+    /// Writes an address's key to `file` in the format of Tor itself (the
+    /// `hs_ed25519_secret_key` of a HiddenServiceDir), so the address can be
+    /// served by a Tor daemon or by Torus's gateway. Tor's format is not
+    /// encrypted, so the vault's own passphrase is asked for again first.
+    pub async fn export_tor_key(&self, address: String, file: PathBuf, passphrase: String) -> Result<(), Failure> {
+        let passphrase = Zeroizing::new(passphrase);
+        let path = self.active_vault_path()?;
+        tokio::task::spawn_blocking(move || Vault::open(&path, &passphrase).map(|_| ()))
+            .await
+            .map_err(Failure::new)?
+            .map_err(|_| Failure::new("That passphrase is not this vault's."))?;
+        let identity = self.saved_key(&address)?;
+        tokio::task::spawn_blocking(move || write_private(&file, &[&TOR_KEY_HEADER[..], &identity[..]].concat()))
+            .await
+            .map_err(Failure::new)?
+    }
+
+    /// Adds the key in a Tor `hs_ed25519_secret_key` file to the saved
+    /// addresses, and says which address it is.
+    pub fn import_tor_key(&self, file: PathBuf) -> Result<String, Failure> {
+        self.with_session(|_| Ok(()))?;
+        let bytes = Zeroizing::new(std::fs::read(&file).map_err(Failure::new)?);
+        let key = bytes
+            .strip_prefix(&TOR_KEY_HEADER[..])
+            .filter(|key| key.len() == 64)
+            .ok_or_else(|| Failure::new("This is not a Tor onion service key (hs_ed25519_secret_key)."))?;
+        let identity = identity_from(Zeroizing::new(key.to_vec()))?;
+        let address = torus_onion_key::address(&identity);
+        self.with_session(|session| {
+            session.keep(identity);
+            session.persist()
+        })?;
+        Ok(address)
+    }
+
+    // Apps on this computer
+
+    pub fn apps(&self) -> Result<Vec<AppListed>, Failure> {
+        self.with_session(|session| Ok(session.apps.iter().map(App::listed).collect()))
+    }
+
+    /// Adds an app listening on `port` of this computer, to be put online at
+    /// `address` (a saved address, which stops being a saved one) or, without
+    /// one, at a new address.
+    pub fn add_app(&self, name: String, port: u16, address: Option<String>) -> Result<AppListed, Failure> {
+        let name = name.trim().to_owned();
+        if name.is_empty() || name.chars().count() > 60 {
+            return Err(Failure::new("Give the app a name of up to 60 characters."));
+        }
+        if port == 0 {
+            return Err(Failure::new("Give the port the app listens on, from 1 to 65535."));
+        }
+        let tor_key = random_key()?;
+        self.with_session(|session| {
+            let identity = match address.filter(|a| !a.is_empty()) {
+                Some(address) => {
+                    let at = session
+                        .saved
+                        .iter()
+                        .position(|k| torus_onion_key::address(k) == address)
+                        .ok_or_else(|| Failure::new("There is no such saved address."))?;
+                    session.saved.remove(at)
+                }
+                None => torus_onion_key::new_identity().map_err(Failure::new)?,
+            };
+            let id = session.apps.iter().map(|a| a.id + 1).max().unwrap_or(1).max(session.next_app).max(1);
+            session.next_app = id + 1;
+            let app = App { id, name, port, identity, tor_key };
+            let listed = app.listed();
+            session.apps.push(app);
+            session.persist()?;
+            Ok(listed)
+        })
+    }
+
+    /// Takes an app offline and removes it. Its address is kept among the
+    /// saved addresses rather than lost.
+    pub async fn remove_app(&self, id: u32) -> Result<(), Failure> {
+        self.stop_app(id).await;
+        self.with_session(|session| {
+            let at = session.apps.iter().position(|a| a.id == id).ok_or_else(|| Failure::new("That app is not here any more."))?;
+            let app = session.apps.remove(at);
+            session.keep(app.identity);
+            session.persist()
+        })?;
+        if let Some(container) = self.app_container(id) {
+            let programs = [self.host_program.as_path()];
+            torus_host_api::remove_container(&container, &programs);
+        }
+        let _ = folder::erase(&self.app_dir(id));
+        Ok(())
+    }
+
+    fn app_key(&self, id: u32) -> SiteKey {
+        (self.is_decoy(), id)
+    }
+
+    fn app_dir(&self, id: u32) -> PathBuf {
+        self.sites_dir().join(format!("app-{id}"))
+    }
+
+    fn app_container(&self, id: u32) -> Option<String> {
+        let alt = if self.is_decoy() { "-alt" } else { "" };
+        torus_host_api::sandbox_available().then(|| format!("{}{alt}-app-{id}", self.sandbox_prefix))
+    }
+
+    /// Puts an app online at its address, through a confined host that
+    /// passes each visitor's stream to the app's port and does nothing else.
+    pub async fn publish_app(&self, id: u32) -> Result<String, Failure> {
+        let (identity, port, tor_key) = self.with_session(|session| {
+            let app = session.apps.iter().find(|a| a.id == id).ok_or_else(|| Failure::new("That app is not here any more."))?;
+            Ok((app.identity.clone(), app.port, app.tor_key.clone()))
+        })?;
+        let address = torus_onion_key::address(&identity);
+        let slot = self.apps_hosted.lock().unwrap_or_else(|e| e.into_inner()).entry(self.app_key(id)).or_default().clone();
+        let mut hosted = slot.lock().await;
+        if hosted.as_ref().and_then(|h| h.host.as_ref()).is_some_and(|host| !host.status().broken) {
+            return Ok(address);
+        }
+        if let Some(old) = hosted.take() {
+            old.retire().await;
+        }
+        let Some(container) = self.app_container(id) else {
+            return Err(Failure::new("This system cannot confine the program that faces the network, so apps are not put on Tor here."));
+        };
+        let dir = self.app_dir(id);
+        std::fs::create_dir_all(&dir).map_err(Failure::new)?;
+        let target = Target::Forward {
+            identity: identity.to_vec(),
+            port,
+            state_dir: dir.join("state"),
+            cache_dir: dir.join("cache"),
+            kept: Some(dir.join("tor-state.bin")),
+            kept_key: tor_key.to_vec(),
+        };
+        let host = self
+            .start_host(Some(Sandbox { name: &container, folder: &dir }), target, decoy_site(), None)
+            .await
+            .map_err(Failure::new)?;
+        let online = Hosted { host: Some(host), files_confined: true };
+        let host = online.host.as_ref().expect("set above");
+        // The same checks as for a site: confined, and at the key's address.
+        if host.can_read(&self.vault_path()?).await.map_err(Failure::new)? {
+            online.retire().await;
+            return Err(Failure::new("The sandbox check failed: the host process could read the vault. The app was not published."));
+        }
+        if host.address() != address {
+            online.retire().await;
+            return Err(Failure::new("The host process reported a different address than the app's key. The app was not published."));
+        }
+        *hosted = Some(online);
+        Ok(address)
+    }
+
+    pub async fn stop_app(&self, id: u32) {
+        let slot = self.apps_hosted.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.app_key(id));
+        if let Some(slot) = slot {
+            if let Some(hosted) = slot.lock().await.take() {
+                hosted.retire().await;
+            }
+        }
+    }
+
+    /// The open compartment's apps that are online, as for sites.
+    pub fn app_status(&self) -> Vec<OnionStatus> {
+        let decoy = self.is_decoy();
+        let slots: Vec<(u32, Slot)> = self
+            .apps_hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((compartment, _), _)| *compartment == decoy)
+            .map(|((_, id), slot)| (*id, slot.clone()))
+            .collect();
+        let mut all: Vec<OnionStatus> = slots
+            .into_iter()
+            .filter_map(|(id, slot)| {
+                let hosted = slot.try_lock().ok()?;
+                let online = hosted.as_ref()?;
+                let status = online.host.as_ref()?.status();
+                Some(OnionStatus { id, reachable: status.reachable, broken: status.broken, files_confined: online.files_confined })
+            })
+            .collect();
+        all.sort_by_key(|status| status.id);
+        all
     }
 
     /// How many idle minutes before the vault locks itself; 0 never.
@@ -1424,9 +1761,15 @@ impl Backend {
     async fn shutdown_hosts(&self) {
         self.mine_stop();
         *self.local.lock().await = None;
-        let ids: Vec<u32> = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        for id in ids {
-            self.stop(id).await;
+        let keys: Vec<SiteKey> = self.hosted.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+        for key in keys {
+            self.stop_key(key).await;
+        }
+        let apps: Vec<Slot> = self.apps_hosted.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, slot)| slot).collect();
+        for slot in apps {
+            if let Some(hosted) = slot.lock().await.take() {
+                hosted.retire().await;
+            }
         }
     }
 }

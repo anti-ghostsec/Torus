@@ -6,7 +6,17 @@ fn main() {
     // the editor's instructions for confining this process are in its
     // environment, and everything after this runs confined.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let _ = torus_host_api::confine_from_surroundings();
+    {
+        let isolation = torus_host_api::confine_from_surroundings();
+        // The converter reads what anonymous visitors upload. Unless it can
+        // neither open the owner's files nor reach the network, it does not
+        // run at all: a video it was handed by an attacker could otherwise
+        // carry the owner's files, or their address, back out.
+        if std::env::var_os(torus_host_api::CONFINE_OFFLINE).is_some() && !isolation.is_some_and(|i| i.files && i.syscalls) {
+            eprintln!("torus-host: this system cannot confine the video converter, so it does not run");
+            std::process::exit(78);
+        }
+    }
     torus_host_api::no_crash_dumps();
     // Started as a converter, this program serves nothing and has no network.
     if let Some(code) = torus_host::media::serve_if_converter() {

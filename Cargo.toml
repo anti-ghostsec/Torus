@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/deniable", "crates/runtime", "crates/tor", "crates/vault", "crates/host-api", "crates/host", "crates/onion-key", "crates/seal", "crates/wallet", "app/src-tauri"]
+members = ["crates/core", "crates/deniable", "crates/runtime", "crates/tor", "crates/vault", "crates/host-api", "crates/host", "crates/onion-key", "crates/seal", "crates/wallet", "crates/gateway", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.8"
@@ -29,6 +29,9 @@ overflow-checks = false
 debug = false
 
 [profile.release]
+# Amounts of money are added up in places: a sum that wrapped around would
+# be a wrong balance, worse than stopping.
+overflow-checks = true
 codegen-units = 1
 lto = true
 opt-level = 3

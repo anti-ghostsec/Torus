@@ -11,8 +11,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -30,7 +32,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use torus_core::{
@@ -78,6 +80,25 @@ const MAX_UPLOADS: usize = 3;
 const MAX_DECODES: usize = 2;
 /// How long a visitor may go without sending the next piece of a form.
 const BODY_IDLE: Duration = Duration::from_secs(120);
+/// How long a connection may sit with nothing moving either way while it
+/// waits on the visitor: for their next request, or for them to take more
+/// of an answer. A slow upload or download over Tor keeps moving, so this
+/// limits only visitors who hold a connection open and do nothing with it.
+const CONNECTION_IDLE: Duration = Duration::from_secs(120);
+/// How long a refused request's body is read for, so the browser can show
+/// the answer. Long enough for a small form, too short to hold a connection.
+const REFUSED_READ: Duration = Duration::from_secs(10);
+/// The most videos waiting to be encoded. Beyond it new videos are refused
+/// until the converter catches up, so a flood of uploads cannot queue up
+/// days of work.
+const MAX_WAITING_VIDEOS: usize = 8;
+/// What each part of a multipart form counts against [`MAX_FORM_BYTES`]
+/// beyond its name and value: its headers and the bookkeeping for it.
+const PART_COST: usize = 256;
+/// Names a form carries besides its fields: the page to return to, the
+/// session's token, what it adds to, the puzzle, and the password.
+const FORM_CONTROLS: [&str; 7] =
+    [NEXT_FIELD, TOKEN_FIELD, PARENT_FIELD, torus_core::PUZZLE_FIELD, torus_core::PUZZLE_ANSWER_FIELD, PASSWORD_FIELD, USER_NAME];
 
 /// An upload on its way in: how much of it has been received.
 struct Arriving {
@@ -289,9 +310,15 @@ where
     // Beyond the limit a connection is closed unanswered: answering would
     // take the very resources that are short.
     let Ok(_open) = live.0.connections.clone().try_acquire_owned() else { return };
+    let answering = Arc::new(Answering::default());
+    let stream = Idle::new(stream, answering.clone());
     let service = service_fn(move |req| {
         let live = live.clone();
-        async move { Ok::<_, Infallible>(respond(&live, req).await) }
+        let answering = answering.clone();
+        async move {
+            let _busy = Busy::start(answering);
+            Ok::<_, Infallible>(respond(&live, req).await)
+        }
     });
     let _ = http1::Builder::new()
         .auto_date_header(false)
@@ -302,6 +329,145 @@ where
         .header_read_timeout(Duration::from_secs(10))
         .serve_connection(TokioIo::new(stream), service)
         .await;
+}
+
+/// Whether a connection's request is being answered, and how many answers
+/// have ended, for [`Idle`] to tell waiting on the visitor from waiting on
+/// this server.
+#[derive(Default)]
+struct Answering {
+    now: AtomicUsize,
+    ended: AtomicU64,
+}
+
+/// Marks a request as being answered for as long as it is held.
+struct Busy(Arc<Answering>);
+
+impl Busy {
+    fn start(answering: Arc<Answering>) -> Self {
+        answering.now.fetch_add(1, Ordering::Relaxed);
+        Self(answering)
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.ended.fetch_add(1, Ordering::Relaxed);
+        self.0.now.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A connection that fails once nothing has moved either way for
+/// [`CONNECTION_IDLE`] while it waits on the visitor. Without it a visitor
+/// could hold one of the few connection slots for ever: by never reading
+/// an answer, or by going quiet between requests.
+///
+/// While a request is being answered, waiting to read is not counted: the
+/// answer may take a while (a large upload being rearranged, say), and the
+/// reads it makes of the request's body have limits of their own.
+struct Idle<S> {
+    inner: S,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    answering: Arc<Answering>,
+    /// How many answers had ended when this last looked.
+    ended: u64,
+}
+
+impl<S> Idle<S> {
+    fn new(inner: S, answering: Arc<Answering>) -> Self {
+        Self { inner, deadline: Box::pin(tokio::time::sleep(CONNECTION_IDLE)), answering, ended: 0 }
+    }
+
+    fn moved(&mut self) {
+        self.deadline.as_mut().reset(tokio::time::Instant::now() + CONNECTION_IDLE);
+    }
+
+    /// Called when the visitor has nothing to send or will take nothing
+    /// more: fails once that has gone on too long.
+    fn stalled(&mut self, cx: &mut Context<'_>, reading: bool) -> Poll<std::io::Error> {
+        // The clock starts again when an answer ends, however long it took.
+        let ended = self.answering.ended.load(Ordering::Relaxed);
+        if ended != self.ended {
+            self.ended = ended;
+            self.moved();
+        }
+        if reading && self.answering.now.load(Ordering::Relaxed) > 0 {
+            self.moved();
+            return Poll::Pending;
+        }
+        match std::future::Future::poll(self.deadline.as_mut(), cx) {
+            Poll::Ready(()) => Poll::Ready(std::io::ErrorKind::TimedOut.into()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn wrote(&mut self, cx: &mut Context<'_>, done: Poll<std::io::Result<usize>>) -> Poll<std::io::Result<usize>> {
+        match done {
+            Poll::Ready(Ok(count)) => {
+                if count > 0 {
+                    self.moved();
+                }
+                Poll::Ready(Ok(count))
+            }
+            Poll::Pending => self.stalled(cx, false).map(Err),
+            failed => failed,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Idle<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    this.moved();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => this.stalled(cx, true).map(Err),
+            failed => failed,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Idle<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let done = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.wrote(cx, done)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let done = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.wrote(cx, done)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Pending => this.stalled(cx, false).map(Err),
+            done => done,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending => this.stalled(cx, false).map(Err),
+            done => done,
+        }
+    }
 }
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -751,24 +917,46 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
         }
     });
     let mut parts = multer::Multipart::with_constraints(stream, boundary, multer::Constraints::new().size_limit(limit));
+    // Every part costs memory, even an empty one, so names and parts count
+    // against the text allowed too, and a form that sends many more parts
+    // than it has fields is not a browser's.
     let mut text_bytes = 0usize;
+    let mut parts_left = (4 * (fields.len() + FORM_CONTROLS.len())).max(32);
+    let known = |name: &str| FORM_CONTROLS.contains(&name) || fields.iter().any(|f| f.name == name);
 
     loop {
-        let mut part = match parts.next_field().await {
+        let next = tokio::time::timeout(BODY_IDLE, parts.next_field())
+            .await
+            .map_err(|_| bad("That submission took too long to arrive.\n"))?;
+        let mut part = match next {
             Ok(Some(part)) => part,
             Ok(None) => break,
             Err(multer::Error::StreamSizeExceeded { .. }) => return Err(too_large()),
             Err(_) => return Err(bad("That submission could not be read.\n")),
         };
         let name = part.name().unwrap_or("").to_owned();
+        text_bytes += name.len() + PART_COST;
+        if parts_left == 0 || text_bytes > MAX_FORM_BYTES {
+            return Err(too_large());
+        }
+        parts_left -= 1;
         let Some(field) = fields.iter().find(|f| f.name == name && f.kind.is_file()) else {
+            // Only multipart forms carry files, and only the forms that add
+            // to a collection or sign up do: what they send besides their
+            // fields is known. Anything else is read past, still counted.
+            let keep = known(&name);
             let mut value = Vec::new();
             while let Some(piece) = piece(&mut part).await? {
                 text_bytes += piece.len();
                 if text_bytes > MAX_FORM_BYTES {
                     return Err(too_large());
                 }
-                value.extend_from_slice(&piece);
+                if keep {
+                    value.extend_from_slice(&piece);
+                }
+            }
+            if !keep {
+                continue;
             }
             let value = String::from_utf8(value).map_err(|_| bad("That submission could not be read.\n"))?;
             submission.texts.push((name, value));
@@ -820,6 +1008,17 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 if !live.store().has_room_for(&site, needed) {
                     return Err(plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false));
                 }
+                let backlog = {
+                    let store = live.store();
+                    store.hold_videos && store.unconverted().len() >= MAX_WAITING_VIDEOS
+                };
+                if backlog {
+                    return Err(plain(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many videos are waiting to be prepared. Try again later.\n",
+                        false,
+                    ));
+                }
                 let busy = || plain(StatusCode::TOO_MANY_REQUESTS, "Too many uploads are in progress. Try again shortly.\n", false);
                 let _slot = live.0.uploads.try_acquire().map_err(|_| busy())?;
                 let mut writer = blobs::Writer::new(target.clone()).map_err(|_| unavailable())?;
@@ -848,8 +1047,18 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 writer.write(&cleaned).map_err(|_| too_large())?;
                 // Without a converter to encode it afresh, a video is kept
                 // only if all of it could be cleaned.
-                if scrubber.incomplete() && !live.store().hold_videos {
+                let held = live.store().hold_videos;
+                if scrubber.incomplete() && !held {
                     return Err(bad("That video could not be cleaned of what the camera recorded about it, so it was not kept.\n"));
+                }
+                // Tracks other than pictures and sound, such as the GPS
+                // track of a drone or action camera, keep what they record
+                // among the pictures, where blanking descriptions cannot
+                // reach. Only encoding the video afresh leaves them behind.
+                if scrubber.other_tracks() && !held {
+                    return Err(bad(
+                        "That video carries more than pictures and sound (for example a GPS track from a drone or action camera), so it was not kept. Export it again with only its picture and sound.\n",
+                    ));
                 }
                 let staged = writer.finish().map_err(|_| unavailable())?;
                 // An MP4 whose index came last gets it moved to the front,
@@ -933,9 +1142,16 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
     if collection.members_only && viewer.is_none() {
         return refuse_unread(req, plain(StatusCode::FORBIDDEN, "Sign in first.\n", false)).await;
     }
-    let allowed = live.store().allow(Budget::Posts);
-    if let Err(refused) = allowed {
-        return refuse_unread(req, refusal(refused)).await;
+    // The budget is shared by every visitor. Where a puzzle guards the
+    // form, it is spent only once the puzzle is solved, so junk sent in a
+    // loop cannot use it up for everyone; elsewhere it is spent before the
+    // body is read, so a refused upload is never received.
+    let puzzled = site.moderation.puzzle_collections.contains(&collection.name);
+    if !puzzled {
+        let allowed = live.store().allow(Budget::Posts);
+        if let Err(refused) = allowed {
+            return refuse_unread(req, refusal(refused)).await;
+        }
     }
     let mut submission = match read_submission(live, &collection.fields, req).await {
         Ok(submission) => submission,
@@ -948,8 +1164,14 @@ async fn submit(live: &Live, site: &Site, collection: &Collection, viewer: Optio
             return plain(StatusCode::FORBIDDEN, "That form has expired. Go back, reload the page and try again.\n", false);
         }
     }
-    if site.moderation.puzzle_collections.contains(&collection.name) && !puzzle_solved(live, &submission) {
-        return wrong_puzzle();
+    if puzzled {
+        if !puzzle_solved(live, &submission) {
+            return wrong_puzzle();
+        }
+        let allowed = live.store().allow(Budget::Posts);
+        if let Err(refused) = allowed {
+            return refusal(refused);
+        }
     }
     let fields = match record_fields(collection, &submission) {
         Ok(fields) => fields,
@@ -1103,9 +1325,15 @@ async fn remove(live: &Live, site: &Site, viewer: Option<Viewer>, path: &str, re
 
 /// Answers a request whose body will not be used. A small body is read to
 /// its end first, because a browser that is cut off while still sending may
-/// show a connection error instead of the answer.
+/// show a connection error instead of the answer. Only for a few seconds,
+/// though, and not at all when it says it is large: a visitor who claims a
+/// large body and never sends it must not hold the connection.
 async fn refuse_unread(req: Request<Incoming>, reply: Reply) -> Reply {
-    let _ = Limited::new(req.into_body(), 4 * MAX_FORM_BYTES).collect().await;
+    let limit = 4 * MAX_FORM_BYTES;
+    let announced = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if announced.is_none_or(|length| length <= limit as u64) {
+        let _ = tokio::time::timeout(REFUSED_READ, Limited::new(req.into_body(), limit).collect()).await;
+    }
     reply
 }
 
@@ -1148,15 +1376,26 @@ async fn sign_up(live: &Live, site: &Site, viewer: Option<Viewer>, req: Request<
     if viewer.is_some() {
         return bad("You are already signed in.\n");
     }
-    if let Err(refused) = live.store().allow(Budget::SignUps) {
-        return refusal(refused);
+    // As for posts: behind a puzzle, the shared budget is spent only once
+    // the puzzle is solved.
+    let puzzled = site.moderation.puzzle_sign_up;
+    if !puzzled {
+        if let Err(refused) = live.store().allow(Budget::SignUps) {
+            return refusal(refused);
+        }
     }
     let mut submission = match read_submission(live, &users.fields, req).await {
         Ok(submission) => submission,
         Err(reply) => return reply,
     };
-    if site.moderation.puzzle_sign_up && !puzzle_solved(live, &submission) {
-        return wrong_puzzle();
+    if puzzled {
+        if !puzzle_solved(live, &submission) {
+            return wrong_puzzle();
+        }
+        let allowed = live.store().allow(Budget::SignUps);
+        if let Err(refused) = allowed {
+            return refusal(refused);
+        }
     }
     let fields = match record_fields(users, &submission) {
         Ok(fields) => fields,

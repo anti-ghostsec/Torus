@@ -29,7 +29,7 @@ mod confine;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod unix_confine;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use unix_confine::{confine_from_surroundings, Isolation};
+pub use unix_confine::{confine_from_surroundings, Isolation, CONFINE_OFFLINE};
 
 /// Larger than any site; a frame beyond this is a bug or an attack.
 const MAX_FRAME: u32 = 256 * 1024 * 1024;
@@ -52,6 +52,20 @@ pub enum Target {
     /// folder, so nothing the host puts there can mislead it.
     Onion {
         identity: Vec<u8>,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+        #[serde(default)]
+        kept: Option<PathBuf>,
+        #[serde(default)]
+        kept_key: Vec<u8>,
+    },
+    /// No site of its own: an app already running on this computer, at
+    /// `port` on its loopback address, put online as a Tor onion service
+    /// at the address of `identity`. Visitors' streams are passed to the
+    /// app as they come; Tor's bookkeeping is kept as for an onion.
+    Forward {
+        identity: Vec<u8>,
+        port: u16,
         state_dir: PathBuf,
         cache_dir: PathBuf,
         #[serde(default)]

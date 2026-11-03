@@ -8,8 +8,11 @@
 
 use std::fmt;
 use std::collections::HashSet;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arti_client::config::onion_service::OnionServiceConfigBuilder;
 use arti_client::config::TorClientConfigBuilder;
@@ -18,6 +21,8 @@ use tor_rtcompat::PreferredRuntime;
 use torus_runtime::{serve_connection, Live};
 use futures::StreamExt;
 use safelog::DisplayRedacted;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tor_cell::relaycell::msg::{Connected, End};
 use tor_config::ExplicitOrAuto;
@@ -32,6 +37,19 @@ use zeroize::Zeroizing;
 /// The service's secret identity: an expanded Ed25519 key. Whoever holds
 /// these bytes owns the onion address.
 pub type Identity = Zeroizing<[u8; 64]>;
+
+/// Streams one rendezvous circuit may hold open at once; a circuit that asks
+/// for more is torn down. Browsers use about six per site, so only a client
+/// trying to exhaust the service gets near this (C Tor:
+/// HiddenServiceMaxStreams with HiddenServiceMaxStreamsCloseCircuit).
+const STREAMS_PER_CIRCUIT: u32 = 64;
+/// Streams one service serves at once, across every visitor. Past this, new
+/// streams are refused until some finish, rather than exhausting memory or
+/// file descriptors.
+const STREAMS_PER_SERVICE: usize = 1024;
+/// A forwarded stream with nothing sent either way for this long is closed,
+/// so silent connections cannot pile up on the app behind the gateway.
+const FORWARD_IDLE: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -148,10 +166,40 @@ impl Tor {
     /// app's services apart and never leaves the machine; it must stay paired
     /// with the same identity for as long as this connection lives.
     pub fn launch(&self, name: &str, identity: &Identity, live: Live) -> Result<Onion, Error> {
+        self.launch_with(name, identity, move |stream| serve_connection(stream, live.clone()))
+    }
+
+    /// Like [`launch`](Self::launch), but every visitor's stream to port 80 is
+    /// passed on to a server already listening at `target`, such as a web app
+    /// on this machine's loopback address. Nothing else is opened: the target
+    /// sees connections from this process only, never a visitor's address.
+    pub fn launch_forward(&self, name: &str, identity: &Identity, target: SocketAddr) -> Result<Onion, Error> {
+        if !target.ip().is_loopback() {
+            return Err(Error("a forwarded service must point at this machine's loopback address".into()));
+        }
+        self.launch_with(name, identity, move |stream| async move {
+            let Ok(Ok(local)) = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(target)).await else {
+                return;
+            };
+            let _ = local.set_nodelay(true);
+            forward(stream, local).await;
+        })
+    }
+
+    /// Starts an onion service at the address of `identity` and hands each
+    /// accepted stream to port 80 to `handle`. Streams to any other port are
+    /// refused.
+    pub fn launch_with<F, Fut>(&self, name: &str, identity: &Identity, handle: F) -> Result<Onion, Error>
+    where
+        F: Fn(arti_client::DataStream) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handle = Arc::new(handle);
         let service_config = OnionServiceConfigBuilder::default()
             .nickname(name.parse().map_err(|e| err("invalid service name", e))?)
             // Makes visitors solve a puzzle when the service is being flooded.
             .enable_pow(true)
+            .max_concurrent_streams_per_circuit(STREAMS_PER_CIRCUIT)
             .build()
             .map_err(|e| err("invalid onion service configuration", e))?;
         let address = address(identity)?;
@@ -172,16 +220,23 @@ impl Tor {
         known.insert(name.to_owned());
         drop(known);
 
+        let slots = Arc::new(Semaphore::new(STREAMS_PER_SERVICE));
         let task = tokio::spawn(async move {
             let mut streams = std::pin::pin!(handle_rend_requests(requests));
             while let Some(request) = streams.next().await {
                 let is_http = matches!(request.request(), IncomingStreamRequest::Begin(begin) if begin.port() == 80);
-                let live = live.clone();
+                let handle = handle.clone();
+                let slot = slots.clone().try_acquire_owned();
                 tokio::spawn(async move {
-                    if !is_http {
-                        let _ = request.reject(End::new_misc()).await;
-                    } else if let Ok(stream) = request.accept(Connected::new_empty()).await {
-                        serve_connection(stream, live).await;
+                    match slot {
+                        Ok(_slot) if is_http => {
+                            if let Ok(stream) = request.accept(Connected::new_empty()).await {
+                                handle(stream).await;
+                            }
+                        }
+                        _ => {
+                            let _ = request.reject(End::new_misc()).await;
+                        }
                     }
                 });
             }
@@ -189,6 +244,33 @@ impl Tor {
         Ok(Onion { address, service, task })
     }
 }
+/// Copies both ways until both sides have finished, or until neither has
+/// sent anything for [`FORWARD_IDLE`].
+async fn forward<A, B>(a: A, b: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+    let (mut a_buf, mut b_buf) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
+    let (mut a_open, mut b_open) = (true, true);
+    while a_open || b_open {
+        let idle = tokio::time::sleep(FORWARD_IDLE);
+        tokio::select! {
+            read = a_read.read(&mut a_buf), if a_open => match read {
+                Ok(0) | Err(_) => { a_open = false; let _ = b_write.shutdown().await; }
+                Ok(n) => if b_write.write_all(&a_buf[..n]).await.is_err() { return },
+            },
+            read = b_read.read(&mut b_buf), if b_open => match read {
+                Ok(0) | Err(_) => { b_open = false; let _ = a_write.shutdown().await; }
+                Ok(n) => if a_write.write_all(&b_buf[..n]).await.is_err() || a_write.flush().await.is_err() { return },
+            },
+            _ = idle => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +284,42 @@ mod tests {
         assert_eq!(address_a, address(&a).unwrap());
         assert_eq!(address_a.len(), 56 + ".onion".len());
         assert!(address_a.ends_with(".onion"));
+    }
+
+    /// Vanity keys are mined by adding to the scalar without clamping it
+    /// again. Arti must read them as the same key, or a mined address would
+    /// publish somewhere else.
+    #[test]
+    fn mined_keys_publish_at_the_address_they_were_mined_for() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let prefix = torus_onion_key::Prefix::new("ab").unwrap();
+        for _ in 0..8 {
+            let key = torus_onion_key::mine(&prefix, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap();
+            let mined = torus_onion_key::address(&key);
+            assert!(mined.starts_with("ab"));
+            assert_eq!(address(&key).unwrap(), mined);
+        }
+        let fresh = torus_onion_key::new_identity().unwrap();
+        assert_eq!(address(&fresh).unwrap(), torus_onion_key::address(&fresh));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarding_copies_both_ways_and_drops_silent_streams() {
+        let (visitor, near) = tokio::io::duplex(64);
+        let (far, app) = tokio::io::duplex(64);
+        let relay = tokio::spawn(forward(near, far));
+        let (mut visitor, mut app) = (visitor, app);
+        visitor.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut got = [0u8; 18];
+        app.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"GET / HTTP/1.1\r\n\r\n");
+        app.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+        let mut reply = [0u8; 17];
+        visitor.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"HTTP/1.1 200 OK\r\n");
+        // Then nothing, for longer than the limit: the relay gives up.
+        tokio::time::sleep(FORWARD_IDLE + Duration::from_secs(1)).await;
+        assert!(relay.is_finished());
     }
 
     #[test]

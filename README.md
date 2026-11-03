@@ -55,10 +55,39 @@ The builds aren't code-signed yet, so Windows SmartScreen warns the first time y
 | `crates/vault` | The encrypted single-file vault |
 | `crates/seal` | Post-quantum hybrid encryption for visitor submissions |
 | `crates/wallet` | The Monero wallet |
+| `crates/gateway` | `torus-gateway`: publishes any web app already running on the machine as an onion service, and mines vanity addresses from the command line |
 | `app/` | The Tauri editor app |
 | `patches/` | Patched copies of `wry`, `fs-mistrust` and `saturating-time` |
 
 Building it yourself is covered in [BUILDING.md](BUILDING.md).
+
+## Publishing another web app
+
+The editor can put a web app that already runs on this computer online at an onion
+address of its own: **Apps on this computer**, in the site settings. Give it a name and
+the port the app listens on, pick a new or saved address (mined, or imported from an
+address file or from Tor's own `hs_ed25519_secret_key`), and publish it. It runs in a
+confined host of its own, with its own Tor bookkeeping, like a site's.
+
+The same works without the editor: `torus-gateway` puts the app online as an onion
+service, with Tor inside the process and nothing listening for visitors:
+
+```sh
+cargo build --release -p torus-gateway
+torus-gateway address --key onion.key                 # prints the address (makes a key if needed)
+torus-gateway mine --key onion.key PREFIX...          # vanity address; --replace to overwrite
+torus-gateway serve --key onion.key --data tor --to 127.0.0.1:3000   # --with-parent: exit when stdin closes
+```
+
+The key file holds the service's secret identity (64 bytes, the same as the part of
+Tor's `hs_ed25519_secret_key` after its 32-byte header). Like Tor, the gateway refuses
+a key file other users of the machine could read. Only one gateway runs per Tor folder,
+and with `--with-parent` it never outlives the program that started it.
+
+Either way, Torus only carries visitors' connections: the app behind it is not confined
+or checked for leaks, so it must be safe to put online itself and listen on 127.0.0.1
+only. Each circuit may hold 64 streams at once and each service 1024; a forwarded stream
+silent for two minutes is closed.
 
 ## License
 

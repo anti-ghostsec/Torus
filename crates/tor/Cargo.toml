@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 torus-runtime.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 arti-client = { version = "0.47", default-features = false, features = [
     "tokio",
     # rustls rather than Windows' own TLS, which stalls on Tor handshakes.
@@ -44,3 +44,4 @@ torus-onion-key.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
 saturating-time = "0.5"
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

@@ -15,7 +15,17 @@ use tor_rtcompat::PreferredRuntime;
 use torus_core::starters::video_site;
 use torus_host_api::{Host, Records, Target};
 
-const HOST: &str = env!("CARGO_BIN_EXE_torus-host");
+/// The host program Cargo built for these tests. Newer Cargo tells tests
+/// where it is when they run rather than when they are compiled.
+fn host_program() -> &'static Path {
+    static HOST: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        option_env!("CARGO_BIN_EXE_torus-host")
+            .map(Into::into)
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_torus-host").map(Into::into))
+            .expect("Cargo names the host program")
+    })
+}
 
 struct Answer {
     head: String,
@@ -85,7 +95,7 @@ async fn a_sandboxed_video_site_works_over_tor() {
     let ffmpeg = Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) { "../../tools/ffmpeg/ffmpeg.exe" } else { "../../tools/ffmpeg/ffmpeg" });
     let converter = ffmpeg.is_file().then_some(ffmpeg.as_path());
     let sandbox = container.as_deref().map(|name| torus_host_api::Sandbox { name, folder: &folder });
-    let host = Host::start(Path::new(HOST), sandbox, converter, target, video_site(), Some(records)).await.unwrap();
+    let host = Host::start(host_program(), sandbox, converter, target, video_site(), Some(records)).await.unwrap();
     println!("address: {}", host.address());
     assert_eq!(host.address(), expected, "Tor published at a different address than the editor shows");
     if container.is_some() {
@@ -239,7 +249,7 @@ async fn a_sandboxed_video_site_works_over_tor() {
 
     drop(host);
     if let Some(name) = &container {
-        torus_host_api::remove_container(name, &[Path::new(HOST)]);
+        torus_host_api::remove_container(name, &[host_program()]);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

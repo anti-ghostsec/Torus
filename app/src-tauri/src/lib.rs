@@ -1,7 +1,7 @@
 mod backend;
 mod money;
 
-use backend::{Backend, Failure, Listed, MineStatus, OnionStatus, View};
+use backend::{AppListed, Backend, Failure, Listed, MineStatus, OnionStatus, View};
 use tauri::{Manager, State};
 use torus_core::Site;
 
@@ -230,6 +230,47 @@ async fn import_key(backend: State<'_, Backend>, file: std::path::PathBuf, passp
 }
 
 #[tauri::command]
+async fn export_tor_key(backend: State<'_, Backend>, address: String, file: std::path::PathBuf, passphrase: String) -> Result<(), Failure> {
+    backend.export_tor_key(address, file, passphrase).await
+}
+
+#[tauri::command(async)]
+fn import_tor_key(backend: State<'_, Backend>, file: std::path::PathBuf) -> Result<String, Failure> {
+    backend.import_tor_key(file)
+}
+
+#[tauri::command]
+fn apps(backend: State<'_, Backend>) -> Result<Vec<AppListed>, Failure> {
+    backend.apps()
+}
+
+#[tauri::command]
+fn add_app(backend: State<'_, Backend>, name: String, port: u16, address: Option<String>) -> Result<AppListed, Failure> {
+    backend.add_app(name, port, address)
+}
+
+#[tauri::command]
+async fn remove_app(backend: State<'_, Backend>, id: u32) -> Result<(), Failure> {
+    backend.remove_app(id).await
+}
+
+#[tauri::command]
+async fn publish_app(backend: State<'_, Backend>, id: u32) -> Result<String, Failure> {
+    backend.publish_app(id).await
+}
+
+#[tauri::command]
+async fn stop_app(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
+    backend.stop_app(id).await;
+    Ok(())
+}
+
+#[tauri::command]
+fn app_status(backend: State<'_, Backend>) -> Vec<OnionStatus> {
+    backend.app_status()
+}
+
+#[tauri::command]
 async fn stop(backend: State<'_, Backend>, id: u32) -> Result<(), ()> {
     backend.stop(id).await;
     Ok(())
@@ -259,6 +300,17 @@ fn data_root(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error:
     }
 }
 
+/// The app's own pages: `tauri://localhost` (or `http://tauri.localhost` on
+/// Windows and Android), and the development server while developing.
+fn is_app_page(url: &tauri::Url) -> bool {
+    match (url.scheme(), url.host_str()) {
+        ("tauri", Some("localhost")) => true,
+        ("http" | "https", Some("tauri.localhost")) => true,
+        ("http", Some("localhost")) => cfg!(debug_assertions) && url.port() == Some(1420),
+        _ => false,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     torus_host_api::no_crash_dumps();
@@ -277,7 +329,11 @@ pub fn run() {
             let builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
                 .data_directory(engine)
                 .incognito(true)
-                .disable_drag_drop_handler();
+                .disable_drag_drop_handler()
+                // The window shows the app and nothing else: a page loaded
+                // from anywhere would reach the network outside Tor.
+                .on_navigation(|url| is_app_page(url))
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
             #[cfg(desktop)]
             let builder = builder.title("Torus").inner_size(1280.0, 800.0).min_inner_size(960.0, 600.0);
             builder.build()?;
@@ -320,6 +376,14 @@ pub fn run() {
             use_saved,
             forget_saved,
             export_key,
+            export_tor_key,
+            import_tor_key,
+            apps,
+            add_app,
+            remove_app,
+            publish_app,
+            stop_app,
+            app_status,
             import_key,
             wallet,
             wallet_node,

@@ -364,7 +364,16 @@ async function render() {
   // A newer edit is already being rendered.
   if (seq !== renderSeq) return;
   sheet.textContent = (view.canvas?.css ?? "") + EDITOR_CSS;
-  pageEl.innerHTML = view.canvas?.html ?? "";
+  // Parsed in an inert template, and links lose their address before they
+  // reach the page: the editor never follows them, and a link left live
+  // could be looked up or opened outside Tor.
+  const inert = document.createElement("template");
+  inert.innerHTML = view.canvas?.html ?? "";
+  for (const link of inert.content.querySelectorAll<HTMLElement>("[href]")) {
+    link.dataset.href = link.getAttribute("href") ?? "";
+    link.removeAttribute("href");
+  }
+  pageEl.replaceChildren(inert.content);
   for (const block of pageEl.querySelectorAll<HTMLElement>("[data-b]")) block.draggable = true;
   for (const list of pageEl.querySelectorAll<HTMLElement>("[data-list]")) {
     list.classList.toggle("empty", !list.querySelector(":scope > [data-b]"));
@@ -379,6 +388,9 @@ function blockUnder(event: Event) {
   const found = tagged ? walk(tagged.dataset.b!) : null;
   return found && found.index !== null ? found.list[found.index] : null;
 }
+
+// Middle clicks and the like open links in new windows: never in the editor.
+pageEl.addEventListener("auxclick", (event) => event.preventDefault());
 
 pageEl.addEventListener("click", (event) => {
   // Never follow the page's own links inside the editor.
@@ -1106,6 +1118,7 @@ function renderSettings() {
   siteHost.append(starter);
 
   siteHost.append(addressMiner());
+  siteHost.append(appsBox());
   siteHost.append(walletBox());
 
   // Deleting a site destroys its onion key, so it takes two deliberate clicks.
@@ -1465,6 +1478,40 @@ function addressMiner() {
       showFailure(error);
     }
   };
+  // Tor's own key format, for a Tor daemon or Torus's gateway. It is not
+  // encrypted, so the vault's passphrase is asked for again.
+  const vaultPass = el("input") as HTMLInputElement;
+  vaultPass.type = "password";
+  vaultPass.autocomplete = "off";
+  vaultPass.placeholder = "this vault's passphrase";
+  const exportForTor = async (address: string) => {
+    if (!vaultPass.value) {
+      return showFailure({ message: "Type this vault's passphrase under Tor key files first: the file is not encrypted." } as Failure);
+    }
+    const file = await saveDialog({ defaultPath: "hs_ed25519_secret_key" });
+    if (!file) return;
+    try {
+      await invoke("export_tor_key", { address, file, passphrase: vaultPass.value });
+      vaultPass.value = "";
+      note = "Tor key file saved, readable only by you. It is not encrypted: anyone who gets it can take over the address.";
+      showStatus();
+    } catch (error) {
+      showFailure(error);
+    }
+  };
+  const bringTor = el("button", "", "Import a Tor key file");
+  bringTor.addEventListener("click", async () => {
+    const file = await openDialog({});
+    if (!file || Array.isArray(file)) return;
+    try {
+      const address = await invoke<string>("import_tor_key", { file });
+      note = `Imported ${address}. It is under Saved addresses. Delete the file it came from once you no longer need it.`;
+      showStatus();
+      void listSaved();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
   async function listSaved() {
     let addresses: string[] = [];
     try {
@@ -1477,7 +1524,9 @@ function addressMiner() {
       const row = el("div", "record");
       const out = el("button", "", "Export");
       out.addEventListener("click", () => void exportAddress(current.address!));
-      row.append(el("span", "", `This site: ${current.address}`), out);
+      const forTor = el("button", "", "Export for Tor");
+      forTor.addEventListener("click", () => void exportForTor(current.address!));
+      row.append(el("span", "", `This site: ${current.address}`), out, forTor);
       saved.append(row);
     }
     if (addresses.length === 0) saved.append(el("p", "hint", "No saved addresses."));
@@ -1496,6 +1545,8 @@ function addressMiner() {
       });
       const out = el("button", "", "Export");
       out.addEventListener("click", () => void exportAddress(address));
+      const forTor = el("button", "", "Export for Tor");
+      forTor.addEventListener("click", () => void exportForTor(address));
       const forget = el("button", "", "Forget");
       forget.addEventListener("click", async () => {
         if (!forget.dataset.armed) {
@@ -1506,7 +1557,7 @@ function addressMiner() {
         await invoke("forget_saved", { address }).catch(showFailure);
         void listSaved();
       });
-      row.append(el("span", "", address), take, out, forget);
+      row.append(el("span", "", address), take, out, forTor, forget);
       saved.append(row);
     }
   }
@@ -1542,12 +1593,147 @@ function addressMiner() {
       "hint",
       "An address file holds an address's secret key, sealed with the passphrase above. Whoever has the file and the passphrase can run a site at that address, and so can whoever made it: never use an address someone else found for you.",
     ),
+    el("h3", "", "Tor key files"),
+    field("Vault passphrase, to export", vaultPass),
+    bringTor,
+    el(
+      "p",
+      "hint",
+      "Tor's own key file (hs_ed25519_secret_key) moves an address to or from a Tor daemon's HiddenServiceDir or Torus's gateway. Unlike an address file it is not encrypted, so keep it somewhere only you can read and delete it once it has been moved.",
+    ),
   );
   void listSaved();
   void invoke<MineStatus | null>("mine_status").then((status) => {
     mineView?.(status);
     if (status && !status.found) pollMining();
   });
+  return box;
+}
+
+type AppEntry = { id: number; name: string; port: number; address: string };
+type AppStatus = { id: number; reachable: boolean; broken: boolean; files_confined: boolean };
+
+// Apps already running on this computer, put online through Tor the way
+// Torus's gateway does from the command line.
+function appsBox() {
+  const box = el("div", "apps");
+  const list = el("div", "saved");
+  const name = el("input") as HTMLInputElement;
+  name.placeholder = "e.g. Fauna";
+  const port = el("input") as HTMLInputElement;
+  port.type = "number";
+  port.min = "1";
+  port.max = "65535";
+  port.placeholder = "3000";
+  const address = el("select");
+  const add = el("button", "", "Add app");
+  // Apps whose host is being started: that can take minutes.
+  const starting = new Set<number>();
+
+  async function fillAddresses() {
+    let saved: string[] = [];
+    try {
+      saved = await invoke<string[]>("saved_addresses");
+    } catch {
+      return;
+    }
+    address.replaceChildren(new Option("A new address", ""));
+    for (const a of saved) address.append(new Option(a, a));
+  }
+
+  async function show() {
+    let apps: AppEntry[] = [];
+    let online: AppStatus[] = [];
+    try {
+      [apps, online] = await Promise.all([invoke<AppEntry[]>("apps"), invoke<AppStatus[]>("app_status")]);
+    } catch {
+      return;
+    }
+    list.replaceChildren();
+    if (apps.length === 0) list.append(el("p", "hint", "No apps yet."));
+    for (const app of apps) {
+      const status = online.find((s) => s.id === app.id);
+      const busy = starting.has(app.id);
+      const state = busy
+        ? "starting, which can take a few minutes"
+        : !status
+          ? "offline"
+          : status.broken
+            ? "stopped working: take it offline and publish it again"
+            : status.reachable
+              ? "live"
+              : "announcing itself to Tor";
+      const row = el("div", "record");
+      const toggle = el("button", "", status || busy ? "Take offline" : "Publish to Tor");
+      toggle.disabled = busy;
+      toggle.addEventListener("click", async () => {
+        try {
+          if (status) {
+            await invoke("stop_app", { id: app.id });
+          } else {
+            starting.add(app.id);
+            void show();
+            await invoke<string>("publish_app", { id: app.id });
+            note = `${app.name} is going online at http://${app.address}`;
+            showStatus();
+          }
+        } catch (error) {
+          showFailure(error);
+        } finally {
+          starting.delete(app.id);
+          void show();
+        }
+      });
+      const remove = el("button", "", "Remove");
+      remove.addEventListener("click", async () => {
+        if (!remove.dataset.armed) {
+          remove.dataset.armed = "1";
+          remove.textContent = "Click again: its address is kept under Saved addresses";
+          return;
+        }
+        await invoke("remove_app", { id: app.id }).catch(showFailure);
+        void show();
+        void fillAddresses();
+      });
+      row.append(el("span", "", `${app.name}, port ${app.port}: http://${app.address} (${state})`), toggle, remove);
+      list.append(row);
+    }
+  }
+
+  add.addEventListener("click", async () => {
+    const number = Number(port.value);
+    if (!Number.isInteger(number) || number < 1 || number > 65535) {
+      return showFailure({ message: "Type the port the app listens on, from 1 to 65535." } as Failure);
+    }
+    try {
+      const added = await invoke<AppEntry>("add_app", { name: name.value, port: number, address: address.value || null });
+      name.value = port.value = "";
+      note = `Added ${added.name} at http://${added.address}. Publish it to put it online.`;
+      showStatus();
+      void show();
+      void fillAddresses();
+    } catch (error) {
+      showFailure(error);
+    }
+  });
+
+  box.append(
+    el("h3", "", "Apps on this computer"),
+    el(
+      "p",
+      "hint",
+      "Puts a web app that already runs on this computer online at an onion address of its own, such as a forum or a booru on port 3000. Torus only carries visitors' connections to the app's port. It does not check or confine the app, so the app itself must be safe to put online, should listen on 127.0.0.1 only, and must never reveal this computer's address in what it sends.",
+    ),
+    list,
+    field("Name", name),
+    field("Port", port),
+    field("Address", address),
+    add,
+  );
+  void fillAddresses();
+  void show();
+  // Kept current while the settings are open.
+  const timer = window.setInterval(() => (box.isConnected ? void show() : window.clearInterval(timer)), 3000);
   return box;
 }
 

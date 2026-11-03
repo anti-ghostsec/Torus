@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -130,7 +130,7 @@ impl Vault {
         let mut temp = self.path.clone().into_os_string();
         temp.push(".new");
         let temp = PathBuf::from(temp);
-        let mut file = fs::File::create(&temp)?;
+        let mut file = create_temp(&temp)?;
         file.write_all(&self.header)?;
         file.write_all(&nonce)?;
         file.write_all(&body)?;
@@ -139,10 +139,7 @@ impl Vault {
         drop(file);
         fs::rename(&temp, &self.path)?;
         // The rename is only durable once the folder is written out.
-        #[cfg(unix)]
-        if let Some(dir) = self.path.parent() {
-            fs::File::open(dir)?.sync_all()?;
-        }
+        sync_folder_of(&self.path)?;
         Ok(())
     }
 }
@@ -214,6 +211,37 @@ pub fn pad_json(bytes: &mut Vec<u8>) {
     const STEP: usize = 64 * 1024;
     let padded = bytes.len().div_ceil(STEP).max(1) * STEP;
     bytes.resize(padded, b' ');
+}
+
+/// Opens a fresh file to write a replacement into, readable by its owner
+/// only. A file left there by an interrupted write is removed first, and
+/// whatever is put in its place is never written through: the file must be
+/// new, so a link someone planted is refused rather than followed.
+pub(crate) fn create_temp(path: &Path) -> io::Result<fs::File> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Makes a rename in `file`'s folder durable.
+pub(crate) fn sync_folder_of(file: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 fn random(buffer: &mut [u8]) -> Result<(), Error> {

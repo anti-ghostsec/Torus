@@ -25,7 +25,7 @@ torus-host-api.workspace = true
 torus-onion-key.workspace = true
 torus-vault.workspace = true
 serde_json.workspace = true
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 torus-seal.workspace = true
 torus-wallet = { path = "../../crates/wallet" }
 hex = "0.4"

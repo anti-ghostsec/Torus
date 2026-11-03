@@ -7617,6 +7617,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "torus-gateway"
+version = "0.1.8"
+dependencies = [
+ "tokio",
+ "torus-onion-key",
+ "torus-tor",
+ "zeroize",
+]
+
+[[package]]
 name = "torus-host"
 version = "0.1.8"
 dependencies = [
@@ -8937,6 +8947,7 @@ version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 
