@@ -42,6 +42,7 @@ The builds aren't code-signed yet, so Windows SmartScreen warns the first time y
 - Torus hasn't been audited by an independent security firm. Don't rely on it alone if being identified could put you in danger.
 - On Android systems without Landlock, a site's files can't be confined. The editor tells you when this happens.
 - Your device has to stay on and online for your sites to be reachable.
+- Hosting from home can be traced by timing. Someone who can watch your internet connection, or who already suspects you, can compare when your site goes offline or gets busy with when your connection does. Torus turns on Tor's defences against locating a service (vanguards), which make this harder, not impossible; power cuts and restarts that take the site down with your connection are the usual giveaway.
 
 ## Layout
 
