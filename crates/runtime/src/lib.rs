@@ -324,32 +324,40 @@ impl Live {
     /// Sets aside room for a file of up to `bytes` that is arriving, if the
     /// site has that much room besides what is already set aside.
     fn reserve(&self, site: &Site, bytes: u64) -> Option<Reserved> {
-        // Taken and checked under the store's lock, so two cannot both fit.
-        let store = self.store();
-        if !store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::Relaxed))) {
-            return None;
-        }
-        self.0.reserved.fetch_add(bytes, Ordering::Relaxed);
-        Some(Reserved { live: self.clone(), bytes })
+        self.set_aside(site, bytes).then(|| Reserved { live: self.clone(), bytes })
     }
 
     /// Sets aside more room for a file that is still arriving, up to `to`
     /// bytes in all, if the site has it.
     fn grow(&self, site: &Site, room: &mut Reserved, to: u64) -> bool {
         let Some(more) = to.checked_sub(room.bytes).filter(|more| *more > 0) else { return true };
-        let store = self.store();
-        if !store.has_room_for(site, more.saturating_add(self.0.reserved.load(Ordering::Relaxed))) {
+        if !self.set_aside(site, more) {
             return false;
         }
-        self.0.reserved.fetch_add(more, Ordering::Relaxed);
         room.bytes = to;
+        true
+    }
+
+    /// Adds `bytes` to the room set aside, if the site has that much room
+    /// besides its files and what is set aside already. The check and the
+    /// addition are made together under the store's lock, which every
+    /// addition takes, and files are added to the store under it too: two
+    /// uploads can never both see the same room free. Room is given back
+    /// (see [`Reserved`]) without the lock; that only ever makes more free.
+    fn set_aside(&self, site: &Site, bytes: u64) -> bool {
+        let store = self.store();
+        if !store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::SeqCst))) {
+            return false;
+        }
+        self.0.reserved.fetch_add(bytes, Ordering::SeqCst);
+        drop(store);
         true
     }
 
     /// Whether the site has room for `bytes` more, besides what is set aside.
     fn has_room(&self, site: &Site, bytes: u64) -> bool {
         let store = self.store();
-        store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::Relaxed)))
+        store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::SeqCst)))
     }
 }
 
@@ -932,7 +940,7 @@ struct Reserved {
 
 impl Drop for Reserved {
     fn drop(&mut self) {
-        self.live.0.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.live.0.reserved.fetch_sub(self.bytes, Ordering::SeqCst);
     }
 }
 
@@ -1140,13 +1148,18 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 if picture.is_empty() {
                     continue;
                 }
-                let room = live.reserve(&site, needed).ok_or_else(no_room)?;
-                submission.arrived.reserved.push(room);
+                let mut room = live.reserve(&site, needed).ok_or_else(no_room)?;
                 // Decoding is the costly step, so it runs off the request
                 // threads, and only a few at a time.
                 let _turn = live.0.decodes.acquire().await.map_err(|_| unavailable())?;
                 let cleaned = tokio::task::spawn_blocking(move || blobs::clean_image(&picture)).await.ok().flatten();
                 let (clean, content_type) = cleaned.ok_or_else(|| bad("That picture could not be read. Use PNG, JPEG, WebP or GIF.\n"))?;
+                // A picture encoded afresh can come out larger than it came
+                // in: what is kept must fit in what was set aside for it.
+                if !live.grow(&site, &mut room, clean.len() as u64) {
+                    return Err(no_room());
+                }
+                submission.arrived.reserved.push(room);
                 let staged = blobs::store(&target, &clean).map_err(|_| unavailable())?;
                 submission.arrived.files.push((name, staged, content_type));
             }
@@ -1787,6 +1800,40 @@ mod room {
         assert!(live.has_room(&site, whole / 2));
         drop(room);
         assert_eq!(live.0.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    /// Uploads growing their room at the same moment, from many threads,
+    /// never together hold more than the owner's limit.
+    #[test]
+    fn room_grown_at_once_never_passes_the_limit() {
+        let mut site = torus_core::starters::by_name("board").expect("a starter");
+        site.limits.storage_mb = 1;
+        let live = Live::new(site.clone());
+        let whole = site.limits.storage_bytes();
+        let step = 4096;
+        let rooms: Vec<Reserved> = std::thread::scope(|scope| {
+            let growing: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut room = live.reserve(&site, 0).expect("nothing always fits");
+                        loop {
+                            let to = room.bytes + step;
+                            if !live.grow(&site, &mut room, to) {
+                                break;
+                            }
+                        }
+                        room
+                    })
+                })
+                .collect();
+            growing.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let held: u64 = rooms.iter().map(|r| r.bytes).sum();
+        assert!(held <= whole, "{held} set aside of {whole}");
+        assert!(held > whole - step, "room was left unused");
+        assert_eq!(live.0.reserved.load(Ordering::SeqCst), held);
+        drop(rooms);
+        assert_eq!(live.0.reserved.load(Ordering::SeqCst), 0);
     }
 
     /// A visitor who sends a trickle is cut off once a whole window has
