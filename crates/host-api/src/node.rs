@@ -32,28 +32,30 @@ impl Node {
         self.host.ends_with(".onion")
     }
 
-    /// Refuses a login for a node on the open internet. Requests are plain
-    /// HTTP: to such a node they leave Tor at an exit relay, which would
-    /// read the login as it passes. To an onion service they never leave Tor,
-    /// and Tor encrypts them all the way.
+    /// Refuses a node on the open internet. Requests are plain HTTP: to
+    /// such a node they leave Tor at an exit relay, which could read them,
+    /// any login with them, and change the answers. To an onion service
+    /// they never leave Tor, and Tor encrypts them all the way.
     pub fn check(&self) -> Result<(), String> {
-        if self.login.is_some() && !self.is_onion() {
-            return Err(LOGIN_IN_THE_CLEAR.into());
+        if !self.is_onion() {
+            return Err(NOT_AN_ONION.into());
         }
         Ok(())
     }
 }
 
-/// Why a login is refused for a node on the open internet.
-pub const LOGIN_IN_THE_CLEAR: &str =
-    "A login is only sent to a node at an onion address: to any other node it would cross the open internet unencrypted. Remove the login, or use the node's onion address.";
+/// Why a node on the open internet is refused.
+pub const NOT_AN_ONION: &str = "The wallet only uses a Monero node at an onion address: a node on the open internet would be reached in plain HTTP through a Tor exit relay, which could read what is sent (a login included) and change the answers. Choose a node's onion address, or clear the choice to use one from the list.";
 
 /// Sends one request to the node over `stream` and returns its answer.
 pub async fn post<S>(mut stream: S, node: &Node, route: &str, body: &[u8], limit: usize) -> Result<Vec<u8>, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    node.check()?;
+    // Whatever reaches here: a login never goes anywhere but an onion.
+    if node.login.is_some() && !node.is_onion() {
+        return Err(NOT_AN_ONION.into());
+    }
     let route = format!("/{}", route.trim_start_matches('/'));
     if !route.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'.') {
         return Err("not a node request".into());
@@ -170,11 +172,12 @@ mod tests {
         assert!(Node::parse("x:0").is_none());
     }
 
-    /// A login goes to an onion service only, never past a Tor exit.
+    /// Only onion services are used, and a login never goes past a Tor exit.
     #[test]
     fn a_login_is_kept_off_the_open_internet() {
         assert!(Node::parse("user:pw@abcdef.onion:18089").unwrap().check().is_ok());
-        assert!(Node::parse("node.example:18081").unwrap().check().is_ok());
+        assert!(Node::parse("abcdef.onion:18089").unwrap().check().is_ok());
+        assert!(Node::parse("node.example:18081").unwrap().check().is_err());
         assert!(Node::parse("user:pw@node.example:18081").unwrap().check().is_err());
         assert!(Node::parse("user:pw@203.0.113.5:18081").unwrap().check().is_err());
 

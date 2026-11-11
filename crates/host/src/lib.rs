@@ -117,6 +117,7 @@ async fn start(target: Target, live: Live, kept: &mut Option<Kept>) -> Result<(S
         }
         Target::Relay { node, state_dir, cache_dir, kept: file, kept_key } => {
             let node = Node::parse(&node).ok_or_else(|| "that is not a node's address".to_owned())?;
+            node.check()?;
             unpack(&state_dir, &cache_dir, file, kept_key, kept)?;
             let tor = Tor::connect(&state_dir, &cache_dir).await.map_err(|e| e.to_string())?;
             let address = format!("{}:{}", node.host, node.port);

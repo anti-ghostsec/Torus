@@ -32,6 +32,15 @@ const STEP: usize = 200;
 /// each node it uses learns a little about which blocks it asks for, so
 /// the fewer the better. Nothing about who uses them reaches them: they
 /// are reached over Tor, and never learn where this computer is.
+/// Whether the wallet may use `node`: an address it can read, and an onion
+/// service (see [`torus_host_api::node::Node::check`]).
+fn usable_node(node: &str) -> Result<(), String> {
+    let Some(parsed) = torus_host_api::node::Node::parse(node) else {
+        return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
+    };
+    parsed.check()
+}
+
 const NODES: &[&str] = &[
     "plowsoffjexmxalw73tkjmf422gq6575fc7vicuu4javzn2ynnte6tyd.onion:18089",
     "plowsofe6cleftfmk2raiw5h2x66atrik3nja4bfd3zrfa2hdlgworad.onion:18089",
@@ -263,7 +272,10 @@ impl Treasury {
             daemon: tokio::sync::Mutex::new(None),
             others: Mutex::new(None),
             tip: Mutex::new(None),
-            trouble: Mutex::new(None),
+            // A node chosen before only onion addresses were taken is kept,
+            // not swapped for one from the list behind the owner's back, and
+            // is not used: the reason shows until another is chosen.
+            trouble: Mutex::new(stored.node.as_deref().and_then(|node| usable_node(node).err())),
         };
         *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(loaded));
         self.start_syncing();
@@ -344,10 +356,7 @@ impl Treasury {
         let node = if node.is_empty() {
             None
         } else {
-            let Some(parsed) = torus_host_api::node::Node::parse(&node) else {
-                return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
-            };
-            parsed.check()?;
+            usable_node(&node)?;
             Some(node)
         };
         *loaded.node.lock().unwrap_or_else(|e| e.into_inner()) = node;
@@ -412,6 +421,7 @@ impl Treasury {
             return Ok(daemon.clone());
         }
         let node = Self::node_of(loaded);
+        usable_node(&node)?;
         let route = (self.reach)(node, loaded.tor_key.clone()).await?;
         let reached = MoneroDaemon::new(route.node).await.map_err(|e| format!("The node did not answer as a Monero node does: {e:?}"))?;
         *loaded.others.lock().unwrap_or_else(|e| e.into_inner()) = Some(route.other);
@@ -832,6 +842,41 @@ mod tests {
         }
     }
 
+    /// The wallet uses onion services only, from the list or chosen.
+    #[test]
+    fn only_onion_nodes_are_used() {
+        for node in NODES {
+            assert_eq!(usable_node(node), Ok(()), "{node}");
+        }
+        assert!(usable_node("node.example:18081").is_err());
+        assert!(usable_node("203.0.113.5:18081").is_err());
+        assert!(usable_node("user:pw@node.example:18081").is_err());
+        assert!(usable_node("not a node").is_err());
+    }
+
+    /// A node on the open internet chosen before is kept, not swapped for
+    /// one from the list, and the reason it is not used is shown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_clearnet_node_is_reported_not_used() {
+        let kept: Arc<Mutex<Option<StoredMoney>>> = Arc::default();
+        let into = kept.clone();
+        let keep: Keep = Arc::new(move |stored| {
+            *into.lock().unwrap() = Some(stored);
+            Ok(())
+        });
+        let reach: Reach = Arc::new(|_, _| Box::pin(async { Err("no network in this test".to_owned()) }));
+        Treasury::new(keep.clone(), reach.clone()).ensure().unwrap();
+        let mut stored = kept.lock().unwrap().clone().unwrap();
+        stored.node = Some("node.example:18081".into());
+        let treasury = Treasury::new(keep, reach);
+        treasury.load(Some(&stored)).unwrap();
+        let summary = treasury.summary().await.unwrap();
+        assert_eq!(summary.node, "node.example:18081");
+        assert!(summary.chosen);
+        assert!(summary.trouble.is_some_and(|t| t.contains("onion address")));
+        treasury.unload();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn sites_users_deposit_tip_and_withdraw() {
         let Some(net) = network().await else { return };
@@ -854,7 +899,8 @@ mod tests {
         let treasury = make();
         treasury.ensure().unwrap();
         assert!(kept.lock().unwrap().is_some(), "kept in the vault at once");
-        treasury.set_node(format!("127.0.0.1:{port}")).await.unwrap();
+        // Any onion address: `reach` above goes to the test chain's node.
+        treasury.set_node(format!("{}.onion:{port}", "a".repeat(56))).await.unwrap();
         catch_up(&treasury).await;
 
         // Coins arrive in the owner's own account.
