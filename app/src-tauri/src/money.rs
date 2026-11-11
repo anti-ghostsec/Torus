@@ -343,9 +343,11 @@ impl Treasury {
         // Nothing: back to one chosen from the list.
         let node = if node.is_empty() {
             None
-        } else if torus_host_api::node::Node::parse(&node).is_none() {
-            return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
         } else {
+            let Some(parsed) = torus_host_api::node::Node::parse(&node) else {
+                return Err("That is not a node's address. Write it as host:port, such as an onion address and 18089.".into());
+            };
+            parsed.check()?;
             Some(node)
         };
         *loaded.node.lock().unwrap_or_else(|e| e.into_inner()) = node;

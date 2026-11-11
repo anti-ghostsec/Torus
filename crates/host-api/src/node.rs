@@ -26,13 +26,34 @@ impl Node {
         let fine = !host.is_empty() && host.len() <= 255 && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
         fine.then(|| Node { host: host.to_ascii_lowercase(), port, login })
     }
+
+    /// Whether the node is an onion service, reached without leaving Tor.
+    pub fn is_onion(&self) -> bool {
+        self.host.ends_with(".onion")
+    }
+
+    /// Refuses a login for a node on the open internet. Requests are plain
+    /// HTTP: to such a node they leave Tor at an exit relay, which would
+    /// read the login as it passes. To an onion service they never leave Tor,
+    /// and Tor encrypts them all the way.
+    pub fn check(&self) -> Result<(), String> {
+        if self.login.is_some() && !self.is_onion() {
+            return Err(LOGIN_IN_THE_CLEAR.into());
+        }
+        Ok(())
+    }
 }
+
+/// Why a login is refused for a node on the open internet.
+pub const LOGIN_IN_THE_CLEAR: &str =
+    "A login is only sent to a node at an onion address: to any other node it would cross the open internet unencrypted. Remove the login, or use the node's onion address.";
 
 /// Sends one request to the node over `stream` and returns its answer.
 pub async fn post<S>(mut stream: S, node: &Node, route: &str, body: &[u8], limit: usize) -> Result<Vec<u8>, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    node.check()?;
     let route = format!("/{}", route.trim_start_matches('/'));
     if !route.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'.') {
         return Err("not a node request".into());
@@ -147,5 +168,26 @@ mod tests {
         assert!(Node::parse("node.example").is_none());
         assert!(Node::parse("bad host:1").is_none());
         assert!(Node::parse("x:0").is_none());
+    }
+
+    /// A login goes to an onion service only, never past a Tor exit.
+    #[test]
+    fn a_login_is_kept_off_the_open_internet() {
+        assert!(Node::parse("user:pw@abcdef.onion:18089").unwrap().check().is_ok());
+        assert!(Node::parse("node.example:18081").unwrap().check().is_ok());
+        assert!(Node::parse("user:pw@node.example:18081").unwrap().check().is_err());
+        assert!(Node::parse("user:pw@203.0.113.5:18081").unwrap().check().is_err());
+
+        // Nothing is written to a stream for a node that would get it in the clear.
+        let node = Node::parse("user:pw@node.example:18081").unwrap();
+        let (mut near, far) = tokio::io::duplex(1024);
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let sent = runtime.block_on(async move {
+            assert!(post(far, &node, "json_rpc", b"{}", 100).await.is_err());
+            let mut sent = Vec::new();
+            near.read_to_end(&mut sent).await.unwrap();
+            sent
+        });
+        assert!(sent.is_empty(), "the login was sent");
     }
 }
