@@ -513,6 +513,7 @@ fn reach_node(layout: Layout, host_program: &Path, prefix: &str, second: Arc<Ato
     Arc::new(move |node, tor_key| {
         let second = second.load(Ordering::Relaxed);
         let sites = layout.sites(second);
+        let vault = layout.vault(second);
         let (program, container) = (program.clone(), format!("{prefix}-relay{}", layout.tag(second)));
         Box::pin(async move {
             if !torus_host_api::sandbox_available() {
@@ -529,6 +530,14 @@ fn reach_node(layout: Layout, host_program: &Path, prefix: &str, second: Arc<Ato
             };
             let sandbox = Sandbox { name: &container, folder: &dir };
             let host = Arc::new(Host::start(&program, Some(sandbox), None, target, decoy_site(), None).await?);
+            // The same checks as for a site, before the relay is used: it
+            // says it is confined, and it cannot open the vault. Dropping
+            // the host on failure stops it.
+            // Android systems older than Landlock cannot confine files, as for sites.
+            host.check_confinement().await?;
+            if host.can_read(&vault).await? && !cfg!(target_os = "android") {
+                return Err("The sandbox check failed: the relay could read the vault. The wallet does not use it.".to_owned());
+            }
             let to = host.clone();
             let node = torus_wallet::transport::Fetcher::new(move |route, body, limit| {
                 let host = to.clone();
@@ -1312,11 +1321,21 @@ impl Backend {
         // Its visitors reach the wallet, for this site's books only.
         host.answer_bank_with(self.banker(id));
         let mut online = Hosted { host: Some(host), files_confined: true };
+        let host = online.host.as_ref().expect("set above");
+        // It must say it is confined: a sandbox that failed to take hold
+        // would otherwise go unnoticed wherever the vault check below
+        // cannot see it, such as the system calls it may make.
+        let files_confined = match host.check_confinement().await {
+            Ok(files_confined) => files_confined,
+            Err(why) => {
+                online.retire().await;
+                return Err(Failure::new(format!("{why} The site was not published.")));
+            }
+        };
         // Trust nothing: ask the running host to open the vault. If it can,
         // its files are not confined.
-        let host = online.host.as_ref().expect("set above");
         let readable = host.can_read(&self.active_vault_path()?).await.map_err(Failure::new)?;
-        if readable {
+        if readable || !files_confined {
             // Android systems older than Landlock cannot confine files; the
             // host there is still confined in every other way, and what it
             // could read is encrypted. Anywhere else, the site goes offline.
@@ -1826,6 +1845,10 @@ impl Backend {
         let online = Hosted { host: Some(host), files_confined: true };
         let host = online.host.as_ref().expect("set above");
         // The same checks as for a site: confined, and at the key's address.
+        if let Err(why) = host.check_confinement().await {
+            online.retire().await;
+            return Err(Failure::new(format!("{why} The app was not published.")));
+        }
         if host.can_read(&self.active_vault_path()?).await.map_err(Failure::new)? {
             online.retire().await;
             return Err(Failure::new("The sandbox check failed: the host process could read the vault. The app was not published."));

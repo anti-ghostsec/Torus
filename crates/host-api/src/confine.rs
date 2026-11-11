@@ -130,6 +130,30 @@ fn allow_folder(folder: &Path, sid: &Sid) -> io::Result<()> {
     }
 }
 
+/// Whether this process runs inside an AppContainer, as Windows itself
+/// says: a host started confined finds itself so.
+pub(crate) fn in_app_container() -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let token = Handle(token);
+        let mut is_container = 0u32;
+        let mut size = 0u32;
+        let asked = GetTokenInformation(
+            token.0,
+            TokenIsAppContainer,
+            Some((&mut is_container as *mut u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+            &mut size,
+        );
+        asked.is_ok() && is_container != 0
+    }
+}
+
 /// Makes a folder readable and writable by the user running this program
 /// alone: inherited permissions are cut off, so neither other accounts nor
 /// sandboxes that every app package may use can look inside, wherever the

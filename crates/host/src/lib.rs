@@ -354,6 +354,7 @@ impl torus_runtime::Bank for Piped {
 fn answer(live: &Live, question: Command) -> Option<Event> {
     Some(match question {
         Command::Probe { path } => Event::Probed { readable: std::fs::File::open(path).is_ok() },
+        Command::Confinement => Event::Confined(torus_host_api::confinement()),
         Command::Records { collection } => Event::Listed { records: live.records(&collection) },
         Command::Remove { collection, id } => Event::Removed { removed: live.remove(&collection, &id) },
         Command::Approve { collection, id } => Event::Removed { removed: live.approve(&collection, &id) },

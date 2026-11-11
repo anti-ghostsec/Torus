@@ -125,14 +125,17 @@ async fn a_confined_host_cannot_open_the_users_files() {
     // A file that already exists outside any container: this test program.
     let program = std::env::current_exe().unwrap();
 
-    // Without confinement the same program opens the file without trouble.
+    // Without confinement the same program opens the file without trouble,
+    // and says it is not confined, which the editor refuses.
     let free = Host::start(host_program(), None, None, Target::Loopback, site("x"), None).await.unwrap();
     assert!(free.can_read(&secret).await.unwrap(), "the control case should be able to read the file");
     assert!(free.can_read(&program).await.unwrap(), "the control case should be able to read the program");
+    assert!(free.check_confinement().await.is_err(), "an unconfined host passed the confinement check");
     drop(free);
 
     let sandbox = Sandbox { name: &container, folder: &folder };
     let host = Host::start(host_program(), Some(sandbox), None, Target::Loopback, site("x"), None).await.unwrap();
+    assert_eq!(host.check_confinement().await, Ok(true), "a confined host did not say it was confined");
     assert!(!host.can_read(&secret).await.unwrap(), "a confined host read a file in the user's temp folder");
     assert!(!host.can_read(&program).await.unwrap(), "a confined host read a program beside its own");
 

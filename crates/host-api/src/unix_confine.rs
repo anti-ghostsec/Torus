@@ -332,6 +332,7 @@ pub fn confine_from_surroundings() -> Option<Isolation> {
     }
     let files = landlock(&read_write, &read_run, offline);
     let syscalls = seccomp(offline);
+    let _ = crate::CONFINED.set(crate::Confinement::Own { files, syscalls });
     Some(Isolation { files, syscalls })
 }
 

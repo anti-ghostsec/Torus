@@ -107,6 +107,8 @@ pub enum Command {
     /// Try to open a file for reading and report the outcome. The contents
     /// are never read or returned.
     Probe { path: PathBuf },
+    /// Say how this process is confined.
+    Confinement,
     /// List what visitors have added to a collection.
     Records { collection: String },
     /// Remove a record for good, with its files and whatever belongs to it.
@@ -151,6 +153,8 @@ pub enum Event {
     Status(Status),
     /// The answer to a `Probe`.
     Probed { readable: bool },
+    /// The answer to `Confinement`.
+    Confined(Confinement),
     /// The answer to `Records`.
     Listed { records: Vec<Record> },
     /// The answer to `Remove` and to `Approve`: whether there was such a record.
@@ -163,6 +167,47 @@ pub enum Event {
     Fetched { body: Result<HexBytes, String> },
     /// The answer to the `Ask` with the same number.
     Answer { seq: u64, answer: Box<Event> },
+}
+
+/// How a host process is confined, as it finds itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Confinement {
+    /// Nothing confines it.
+    None,
+    /// It confined itself as it started (Linux, Android), this far.
+    Own { files: bool, syscalls: bool },
+    /// It runs inside a Windows AppContainer.
+    Container,
+}
+
+/// How this process confined itself, once it has.
+static CONFINED: std::sync::OnceLock<Confinement> = std::sync::OnceLock::new();
+
+/// How this process is confined.
+pub fn confinement() -> Confinement {
+    #[cfg(windows)]
+    if confine::in_app_container() {
+        return Confinement::Container;
+    }
+    CONFINED.get().copied().unwrap_or(Confinement::None)
+}
+
+/// Whether a host confined as `confinement` may face the network. On
+/// success, says whether its files are confined too: they may not be only
+/// where `files_optional`, as on Android systems older than Landlock.
+pub fn judge_confinement(confinement: Confinement, files_optional: bool) -> Result<bool, String> {
+    match confinement {
+        Confinement::Container => Ok(true),
+        Confinement::Own { syscalls: true, files: true } => Ok(true),
+        Confinement::Own { syscalls: true, files: false } if files_optional => Ok(false),
+        Confinement::Own { syscalls: false, .. } => {
+            Err("The sandbox check failed: the host process could not restrict its system calls.".to_owned())
+        }
+        Confinement::Own { files: false, .. } => {
+            Err("The sandbox check failed: this system could not keep the host process away from your files.".to_owned())
+        }
+        Confinement::None => Err("The sandbox check failed: the host process is not confined.".to_owned()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +725,18 @@ impl Host {
         }
     }
 
+    /// Asks the host how it is confined, and refuses one that is not
+    /// confined enough to face the network. Says whether its files are
+    /// confined: on Android systems older than Landlock they cannot be,
+    /// and the host is still confined in every other way.
+    pub async fn check_confinement(&self) -> Result<bool, String> {
+        let confinement = match self.ask(Command::Confinement).await? {
+            Event::Confined(confinement) => confinement,
+            _ => return Err(GONE.to_owned()),
+        };
+        judge_confinement(confinement, cfg!(target_os = "android"))
+    }
+
     /// What visitors have added to a collection, oldest first.
     pub async fn records(&self, collection: &str) -> Result<Vec<Record>, String> {
         match self.ask(Command::Records { collection: collection.to_owned() }).await? {
@@ -880,6 +937,19 @@ pub fn remove_container(_container: &str, _programs: &[&Path]) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_confined_host_may_face_the_network() {
+        let own = |files, syscalls| Confinement::Own { files, syscalls };
+        assert_eq!(judge_confinement(Confinement::Container, false), Ok(true));
+        assert_eq!(judge_confinement(own(true, true), false), Ok(true));
+        assert!(judge_confinement(own(false, true), false).is_err());
+        assert_eq!(judge_confinement(own(false, true), true), Ok(false));
+        assert!(judge_confinement(own(true, false), true).is_err());
+        assert!(judge_confinement(Confinement::None, true).is_err());
+        // A process that was never told to confine itself says so.
+        assert_eq!(confinement(), Confinement::None);
+    }
 
     #[tokio::test]
     async fn relay_and_wallet_messages_cross_the_pipe() {
