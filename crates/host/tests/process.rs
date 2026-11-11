@@ -375,3 +375,35 @@ async fn the_local_preview_answers_only_to_its_own_name() {
     stream.read_to_string(&mut answer).await.unwrap();
     assert!(answer.starts_with("HTTP/1.1 421") && !answer.contains("private draft"), "{answer}");
 }
+
+/// Tor checks who can change its folders and those above them. It must
+/// still start inside the sandbox, where the user and group databases
+/// cannot be read: this test program runs itself again, confined as a host
+/// is, and sets Tor up there without connecting.
+#[tokio::test]
+async fn tor_checks_its_folders_inside_the_sandbox() {
+    const CHILD: &str = "TORUS_TEST_TOR_FOLDERS";
+    if let Some(folder) = std::env::var_os(CHILD) {
+        let folder = std::path::PathBuf::from(folder);
+        let isolation = torus_host_api::confine_from_surroundings().expect("told to confine");
+        assert!(isolation.files && isolation.syscalls, "not confined: {isolation:?}");
+        assert!(std::fs::File::open("/etc/passwd").is_err(), "the user database was readable");
+        torus_tor::check_folders(&folder.join("state"), &folder.join("cache")).expect("Tor refused its folders in the sandbox");
+        return;
+    }
+    if !files_can_be_confined() {
+        eprintln!("skipped: this kernel cannot confine files");
+        return;
+    }
+    let folder = sandbox_folder(&format!("torus.tor-folders-{}", std::process::id()));
+    let reads = ["/usr", "/lib", "/lib64", "/proc/meminfo", "/proc/cpuinfo", "/sys/devices/system/cpu", "/sys/fs/cgroup"];
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tor_checks_its_folders_inside_the_sandbox", "--nocapture", "--test-threads=1"])
+        .env(CHILD, &folder)
+        .env("TORUS_CONFINE_FILES", format!("{}\n/dev/null\n", folder.display()))
+        .env("TORUS_CONFINE_PROGRAMS", reads.join("\n"))
+        .status()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&folder);
+    assert!(status.success(), "Tor could not set up its folders in the sandbox");
+}

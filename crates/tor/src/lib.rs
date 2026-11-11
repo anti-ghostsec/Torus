@@ -142,6 +142,7 @@ impl Tor {
     pub async fn connect(state_dir: &Path, cache_dir: &Path) -> Result<Self, Error> {
         // rustls needs its cryptography chosen once per process; a second call is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
+        private_dirs(&[state_dir, cache_dir])?;
         let config = configure(state_dir, cache_dir)?;
         let client = TorClient::create_bootstrapped(config).await.map_err(|e| err("could not connect to Tor", e))?;
         Ok(Self { client, known: Mutex::default() })
@@ -265,15 +266,51 @@ where
     }
 }
 
+/// Sets Tor up on its folders as [`Tor::connect`] does, their checks
+/// included, without connecting: for checking those checks hold where Tor
+/// runs, such as inside the sandbox. Needs a Tokio runtime.
+#[doc(hidden)]
+pub fn check_folders(state_dir: &Path, cache_dir: &Path) -> Result<(), Error> {
+    private_dirs(&[state_dir, cache_dir])?;
+    let config = configure(state_dir, cache_dir)?;
+    TorClient::builder()
+        .config(config)
+        .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+        .create_unbootstrapped()
+        .map(|_| ())
+        .map_err(|e| err("Tor refused its folders", e))
+}
+
+/// Makes Tor's folders, readable by this user alone, as Arti requires of
+/// them. Folders made before Arti's checks were on may have been left
+/// readable by others; they are tightened, as they belong to this app.
+fn private_dirs(dirs: &[&Path]) -> Result<(), Error> {
+    for dir in dirs {
+        std::fs::create_dir_all(dir).map_err(|e| err("could not make Tor's folder", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| err("could not make Tor's folder private", e))?;
+        }
+    }
+    Ok(())
+}
+
 /// How Tor is set up for every connection this app makes.
 fn configure(state_dir: &Path, cache_dir: &Path) -> Result<TorClientConfig, Error> {
     let mut config = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
     config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
-    // Arti normally inspects the permissions of every folder above its
-    // own. On Windows that check verifies nothing, and inside the sandbox
-    // those folders cannot even be looked at (nor can /etc/passwd), so it
-    // only gets in the way.
-    config.storage().permissions().dangerously_trust_everyone();
+    // Arti checks, as Tor does, that its folders and every folder above
+    // them can be changed by no one but this user (or root), and that its
+    // own are private. That holds in the sandbox too: Landlock does not hide
+    // a folder's owner and mode, and where it keeps /etc/passwd and
+    // /etc/group from being read, the vendored fs-mistrust (src/lib.rs)
+    // trusts this user by number and no group, which is stricter. Android
+    // keeps apps' folders apart itself and fs-mistrust allows for its
+    // shared parent folders. On Windows only the kind of each folder is
+    // checked, and the vendored copy takes a folder as given where the
+    // AppContainer refuses to resolve it.
     // Full vanguards, as Tor recommends for onion services: fixed relays in
     // the second and third hop too, not only the second. Arti picks "lite"
     // unless told, and does not yet follow the network's own setting.
@@ -336,6 +373,25 @@ mod tests {
     fn tor_config_builds_without_passwd_or_group_databases() {
         let dir = std::env::temp_dir().join(format!("tor-config-test-{}", std::process::id()));
         assert!(configure(&dir.join("state"), &dir.join("cache")).is_ok());
+    }
+
+    /// Arti's folder checks are on: it starts on folders made private, and
+    /// refuses one that others could change.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tor_refuses_folders_others_can_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let start = |dir: &Path| check_folders(&dir.join("state"), &dir.join("cache"));
+        let dir = std::env::temp_dir().join(format!("tor-mistrust-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(start(&dir).is_ok(), "Tor refused private folders");
+
+        // A folder above Tor's own that anyone may change.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(start(&dir).is_err(), "Tor took folders anyone could change");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
