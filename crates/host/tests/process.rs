@@ -125,23 +125,27 @@ async fn a_confined_host_cannot_open_the_users_files() {
     // A file that already exists outside any container: this test program.
     let program = std::env::current_exe().unwrap();
 
-    // Without confinement the same program opens the file without trouble,
-    // and says it is not confined, which the editor refuses.
+    // Without confinement the same program opens the file without trouble.
     let free = Host::start(host_program(), None, None, Target::Loopback, site("x"), None).await.unwrap();
     assert!(free.can_read(&secret).await.unwrap(), "the control case should be able to read the file");
     assert!(free.can_read(&program).await.unwrap(), "the control case should be able to read the program");
-    assert!(free.check_confinement().await.is_err(), "an unconfined host passed the confinement check");
     drop(free);
 
+    // The check made before a confined host is started fails when the file
+    // it is asked to open is one it can reach: its own folder's.
+    let own = folder.join("note.txt");
+    std::fs::write(&own, "mine").unwrap();
     let sandbox = Sandbox { name: &container, folder: &folder };
-    let host = Host::start(host_program(), Some(sandbox), None, Target::Loopback, site("x"), None).await.unwrap();
-    assert_eq!(host.check_confinement().await, Ok(true), "a confined host did not say it was confined");
+    let refused = Host::start_confined(host_program(), sandbox, None, &own, Target::Loopback, site("x"), None).await;
+    assert!(refused.is_err(), "a host that could read the forbidden file was started");
+
+    let sandbox = Sandbox { name: &container, folder: &folder };
+    let (host, files) = Host::start_confined(host_program(), sandbox, None, &secret, Target::Loopback, site("x"), None).await.unwrap();
+    assert!(files, "a confined host did not say its files were confined");
     assert!(!host.can_read(&secret).await.unwrap(), "a confined host read a file in the user's temp folder");
     assert!(!host.can_read(&program).await.unwrap(), "a confined host read a program beside its own");
 
     // Its own folder is the one place it may use.
-    let own = folder.join("note.txt");
-    std::fs::write(&own, "mine").unwrap();
     assert!(host.can_read(&own).await.unwrap(), "a confined host could not read its own folder");
 
     drop(host);

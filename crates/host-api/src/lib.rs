@@ -218,6 +218,19 @@ pub struct Status {
     pub broken: bool,
 }
 
+/// Asks a host that has not been started yet one question, and waits for
+/// the answer: the only messages it takes before `Start`.
+async fn ask_before_start(stdin: &mut Input, stdout: &mut Output, seq: u64, question: Command) -> Result<Event, String> {
+    write_frame(stdin, &Command::Ask { seq, question: Box::new(question) }).await.map_err(|_| GONE.to_owned())?;
+    let answered = tokio::time::timeout(Duration::from_secs(20), read_frame::<_, Event>(stdout))
+        .await
+        .map_err(|_| "the host process did not answer".to_owned())?;
+    match answered {
+        Ok(Some(Event::Answer { seq: answered, answer })) if answered == seq => Ok(*answer),
+        _ => Err(GONE.to_owned()),
+    }
+}
+
 /// Bytes carried as hex: a list of numbers in JSON would be four times larger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -633,6 +646,46 @@ impl Host {
         Self::over(stdin, stdout, keeper, target, site, records).await
     }
 
+    /// Starts `program` confined in `sandbox`, and checks the confinement
+    /// before the host is given anything: before it has its target, its
+    /// site or a key, and so before it has touched Tor or the network. The
+    /// host must say it is confined, and must fail to open `forbidden` (the
+    /// vault). Otherwise it is stopped and this says why.
+    ///
+    /// Also returns whether the host's files are confined: on Android
+    /// systems older than Landlock they cannot be, and the host there is
+    /// still confined in every other way. Anywhere else they must be.
+    pub async fn start_confined(
+        program: &Path,
+        sandbox: Sandbox<'_>,
+        converter: Option<&Path>,
+        forbidden: &Path,
+        target: Target,
+        site: Site,
+        records: Option<Records>,
+    ) -> Result<(Self, bool), String> {
+        let (mut stdin, mut stdout, keeper) = confined(program, &sandbox, converter)?;
+        // On failure `keeper` is dropped, which ends the process.
+        let files_optional = cfg!(target_os = "android");
+        let confinement = match ask_before_start(&mut stdin, &mut stdout, 0, Command::Confinement).await? {
+            Event::Confined(confinement) => confinement,
+            _ => return Err(GONE.to_owned()),
+        };
+        let mut files = judge_confinement(confinement, files_optional)?;
+        let readable = match ask_before_start(&mut stdin, &mut stdout, 1, Command::Probe { path: forbidden.to_owned() }).await? {
+            Event::Probed { readable } => readable,
+            _ => return Err(GONE.to_owned()),
+        };
+        if readable {
+            if !files_optional {
+                return Err("The sandbox check failed: the host process could read the vault.".to_owned());
+            }
+            files = false;
+        }
+        let host = Self::over(stdin, stdout, keeper, target, site, records).await?;
+        Ok((host, files))
+    }
+
     /// Starts a site on a host reached over the given pipes, whatever is at
     /// their other end: a program, or a task inside this one. Dropping
     /// `keeper` must stop that host.
@@ -723,18 +776,6 @@ impl Host {
             Event::Probed { readable } => Ok(readable),
             _ => Err(GONE.to_owned()),
         }
-    }
-
-    /// Asks the host how it is confined, and refuses one that is not
-    /// confined enough to face the network. Says whether its files are
-    /// confined: on Android systems older than Landlock they cannot be,
-    /// and the host is still confined in every other way.
-    pub async fn check_confinement(&self) -> Result<bool, String> {
-        let confinement = match self.ask(Command::Confinement).await? {
-            Event::Confined(confinement) => confinement,
-            _ => return Err(GONE.to_owned()),
-        };
-        judge_confinement(confinement, cfg!(target_os = "android"))
     }
 
     /// What visitors have added to a collection, oldest first.

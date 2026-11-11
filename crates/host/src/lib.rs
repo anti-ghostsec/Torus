@@ -220,8 +220,25 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-
-    let Ok(Some(Command::Start { target, site, records })) = read_frame(&mut stdin).await else { return 2 };
+    // Before it is started, a host answers only how it is confined, so the
+    // editor can check that before giving it anything: no key, no site,
+    // and no Tor until then.
+    let (target, site, records) = loop {
+        match read_frame(&mut stdin).await {
+            Ok(Some(Command::Start { target, site, records })) => break (target, site, records),
+            Ok(Some(Command::Ask { seq, question })) => {
+                let answer = match *question {
+                    Command::Confinement => Event::Confined(torus_host_api::confinement()),
+                    Command::Probe { path } => Event::Probed { readable: std::fs::File::open(path).is_ok() },
+                    _ => return 2,
+                };
+                if write_frame(&mut stdout, &Event::Answer { seq, answer: Box::new(answer) }).await.is_err() {
+                    return 0;
+                }
+            }
+            _ => return 2,
+        }
+    };
     let live = match open(site, records) {
         Ok(live) => {
             // Where the editor started a converter beside this host, videos
