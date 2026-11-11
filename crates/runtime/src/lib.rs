@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -95,6 +95,15 @@ const BODY_IDLE: Duration = Duration::from_secs(120);
 /// or a picture's memory, for as long as they like. Tor carries far more
 /// than this, even on a poor connection.
 const MIN_RATE: u64 = 16 * 1024;
+/// The speed a whole upload is given time for, in bytes a second: slow
+/// for Tor, so an honest visitor on a poor connection still gets through,
+/// but fast enough that a visitor sending at [`MIN_RATE`] cannot keep an
+/// upload slot for days. A form announcing the most a site takes, a 1 GiB
+/// video by default, is given a little over two hours.
+const UPLOAD_RATE: u64 = 128 * 1024;
+/// Time every form is given on top, for Tor to settle and pictures to be
+/// decoded.
+const UPLOAD_GRACE: Duration = Duration::from_secs(10 * 60);
 /// How long the pace of a form is measured over before it is judged, so
 /// that a stalled circuit that recovers is not cut off.
 const PACE_WINDOW: Duration = Duration::from_secs(60);
@@ -944,11 +953,21 @@ impl Drop for Reserved {
     }
 }
 
-/// Keeps a form arriving at least at [`MIN_RATE`]. Only time spent waiting
-/// on the visitor counts, not time this server spends on what has arrived.
+/// How long a form of up to `bytes` may take to arrive, all of it.
+fn upload_time(bytes: u64) -> Duration {
+    UPLOAD_GRACE.saturating_add(Duration::from_secs(bytes / UPLOAD_RATE))
+}
+
+/// Keeps a form arriving at least at [`MIN_RATE`], and all of it within the
+/// time it was given (see [`upload_time`]), so that whatever a visitor does,
+/// the slot or memory it holds is given back in a bounded time. For the
+/// pace, only time spent waiting on the visitor counts, not time this
+/// server spends on what has arrived.
 struct Pace {
     /// Every byte of the body received so far.
     received: Arc<AtomicU64>,
+    /// When the whole form must have arrived.
+    deadline: tokio::time::Instant,
     /// Time spent waiting in the window being measured.
     waited: Duration,
     /// What had been received when that window began.
@@ -956,8 +975,8 @@ struct Pace {
 }
 
 impl Pace {
-    fn new(received: Arc<AtomicU64>) -> Self {
-        Self { received, waited: Duration::ZERO, counted: 0 }
+    fn new(received: Arc<AtomicU64>, allowed: Duration) -> Self {
+        Self { received, deadline: tokio::time::Instant::now() + allowed, waited: Duration::ZERO, counted: 0 }
     }
 
     /// Notes `waited` more time spent waiting, by the end of which
@@ -978,14 +997,18 @@ impl Pace {
     /// Waits for the next thing the visitor sends, refusing a visitor who
     /// has gone quiet or is sending too slowly.
     async fn wait<F: std::future::Future>(&mut self, next: F) -> Result<F::Output, Reply> {
-        let began = Instant::now();
-        let next = tokio::time::timeout(BODY_IDLE, next).await.map_err(|_| bad("That submission took too long to arrive.\n"))?;
+        let too_slow = || {
+            plain(StatusCode::REQUEST_TIMEOUT, "That submission arrived too slowly. Try again when the connection is better.\n", false)
+        };
+        let began = tokio::time::Instant::now();
+        let idle_until = began + BODY_IDLE;
+        let next = match tokio::time::timeout_at(idle_until.min(self.deadline), next).await {
+            Ok(next) => next,
+            Err(_) if self.deadline <= idle_until => return Err(too_slow()),
+            Err(_) => return Err(bad("That submission took too long to arrive.\n")),
+        };
         if !self.note(began.elapsed(), self.received.load(Ordering::Relaxed)) {
-            return Err(plain(
-                StatusCode::REQUEST_TIMEOUT,
-                "That submission arrived too slowly. Try again when the connection is better.\n",
-                false,
-            ));
+            return Err(too_slow());
         }
         Ok(next)
     }
@@ -1061,7 +1084,10 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
     let tracked = Tracked::begin(live, &req);
     let counter = tracked.as_ref().map(|t| t.arriving.clone());
     let received = Arc::new(AtomicU64::new(0));
-    let mut pace = Pace::new(received.clone());
+    // Given time for what the browser says it sends, never more than the
+    // most this form can take.
+    let most = file_room + 2 * MAX_FORM_BYTES as u64;
+    let mut pace = Pace::new(received.clone(), upload_time(announced.map_or(most, |a| a.min(most))));
     let stream = BodyStream::new(req.into_body()).filter_map(move |frame| {
         let (counter, received) = (counter.clone(), received.clone());
         async move {
@@ -1781,6 +1807,35 @@ mod room {
         assert_eq!(live.0.reserved.load(Ordering::Relaxed), 0);
     }
 
+    /// A visitor who keeps sending at the minimum pace is still cut off
+    /// once the time for the whole upload is up.
+    #[tokio::test]
+    async fn an_upload_is_cut_off_at_its_deadline() {
+        let received = Arc::new(AtomicU64::new(0));
+        let mut pace = Pace::new(received.clone(), Duration::from_millis(300));
+        let mut refused = None;
+        for piece in 0..100u64 {
+            // Each piece comes 10 ms after the last, far over the minimum pace.
+            let next = async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                received.fetch_add(MIN_RATE, Ordering::Relaxed);
+            };
+            if let Err(reply) = pace.wait(next).await {
+                refused = Some((piece, reply.status()));
+                break;
+            }
+        }
+        let (piece, status) = refused.expect("never cut off");
+        assert!((20..=30).contains(&piece), "cut off after {piece} pieces");
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+
+        // The time given grows with the size, from a fixed allowance.
+        assert_eq!(upload_time(0), UPLOAD_GRACE);
+        let gib = 1 << 30;
+        assert_eq!(upload_time(gib), UPLOAD_GRACE + Duration::from_secs(gib / UPLOAD_RATE));
+        assert!(upload_time(gib) < Duration::from_secs(3 * 3600));
+    }
+
     /// Room for a video grows as it arrives, never past the owner's limit,
     /// and is all given back at the end.
     #[test]
@@ -1841,7 +1896,7 @@ mod room {
     #[test]
     fn a_trickle_is_refused_and_a_steady_upload_is_not() {
         let window = PACE_WINDOW.as_secs();
-        let mut steady = Pace::new(Arc::default());
+        let mut steady = Pace::new(Arc::default(), Duration::from_secs(86_400));
         let mut total = 0;
         for _ in 0..10 * window {
             total += MIN_RATE;
@@ -1849,12 +1904,12 @@ mod room {
         }
 
         // Stalled for most of a window, then caught up within it.
-        let mut stalled = Pace::new(Arc::default());
+        let mut stalled = Pace::new(Arc::default(), Duration::from_secs(86_400));
         assert!(stalled.note(Duration::from_secs(window - 5), 0));
         assert!(stalled.note(Duration::from_secs(5), MIN_RATE * window));
 
         // A few bytes at a time, never idle long enough to be timed out.
-        let mut trickle = Pace::new(Arc::default());
+        let mut trickle = Pace::new(Arc::default(), Duration::from_secs(86_400));
         let mut total = 0;
         let mut refused = false;
         for _ in 0..2 * window {
