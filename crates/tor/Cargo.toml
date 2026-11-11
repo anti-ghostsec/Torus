@@ -29,6 +29,8 @@ tor-hscrypto = "0.47"
 tor-llcrypto = "0.47"
 tor-keymgr = "0.47"
 tor-config = "0.47"
+# Only to pin the vanguard mode, which Arti's own API leaves to the default.
+tor-guardmgr = { version = "0.47", features = ["vanguards"] }
 tor-proto = "0.47"
 tor-cell = "0.47"
 tor-rtcompat = "0.47"

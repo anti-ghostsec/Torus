@@ -7708,6 +7708,7 @@ dependencies = [
  "tokio",
  "tor-cell",
  "tor-config",
+ "tor-guardmgr",
  "tor-hscrypto",
  "tor-hsservice",
  "tor-keymgr",

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arti_client::config::onion_service::OnionServiceConfigBuilder;
-use arti_client::config::TorClientConfigBuilder;
+use arti_client::config::{TorClientConfig, TorClientConfigBuilder};
 use arti_client::TorClient;
 use tor_rtcompat::PreferredRuntime;
 use torus_runtime::{serve_connection, Live};
@@ -26,6 +26,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tor_cell::relaycell::msg::{Connected, End};
 use tor_config::ExplicitOrAuto;
+use tor_guardmgr::VanguardMode;
 use tor_hscrypto::pk::{HsIdKey, HsIdKeypair};
 use tor_hsservice::status::State;
 use tor_hsservice::{handle_rend_requests, RunningOnionService};
@@ -141,14 +142,7 @@ impl Tor {
     pub async fn connect(state_dir: &Path, cache_dir: &Path) -> Result<Self, Error> {
         // rustls needs its cryptography chosen once per process; a second call is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut config = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
-        config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
-        // Arti normally inspects the permissions of every folder above its
-        // own. On Windows that check verifies nothing, and inside the sandbox
-        // those folders cannot even be looked at (nor can /etc/passwd), so it
-        // only gets in the way.
-        config.storage().permissions().dangerously_trust_everyone();
-        let config = config.build().map_err(|e| err("invalid Tor configuration", e))?;
+        let config = configure(state_dir, cache_dir)?;
         let client = TorClient::create_bootstrapped(config).await.map_err(|e| err("could not connect to Tor", e))?;
         Ok(Self { client, known: Mutex::default() })
     }
@@ -271,6 +265,22 @@ where
     }
 }
 
+/// How Tor is set up for every connection this app makes.
+fn configure(state_dir: &Path, cache_dir: &Path) -> Result<TorClientConfig, Error> {
+    let mut config = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+    config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
+    // Arti normally inspects the permissions of every folder above its
+    // own. On Windows that check verifies nothing, and inside the sandbox
+    // those folders cannot even be looked at (nor can /etc/passwd), so it
+    // only gets in the way.
+    config.storage().permissions().dangerously_trust_everyone();
+    // Full vanguards, as Tor recommends for onion services: fixed relays in
+    // the second and third hop too, not only the second. Arti picks "lite"
+    // unless told, and does not yet follow the network's own setting.
+    config.vanguards().mode(ExplicitOrAuto::Explicit(VanguardMode::Full));
+    config.build().map_err(|e| err("invalid Tor configuration", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,9 +335,14 @@ mod tests {
     #[test]
     fn tor_config_builds_without_passwd_or_group_databases() {
         let dir = std::env::temp_dir().join(format!("tor-config-test-{}", std::process::id()));
-        let mut config = TorClientConfigBuilder::from_directories(&dir.join("state"), &dir.join("cache"));
-        config.storage().keystore().primary().kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
-        config.storage().permissions().dangerously_trust_everyone();
-        assert!(config.build().is_ok());
+        assert!(configure(&dir.join("state"), &dir.join("cache")).is_ok());
+    }
+
+    #[test]
+    fn vanguards_are_full() {
+        let dir = std::env::temp_dir().join(format!("tor-vanguards-test-{}", std::process::id()));
+        let config = configure(&dir.join("state"), &dir.join("cache")).unwrap();
+        let vanguards: &tor_guardmgr::VanguardConfig = config.as_ref();
+        assert_eq!(vanguards.mode(), VanguardMode::Full);
     }
 }
