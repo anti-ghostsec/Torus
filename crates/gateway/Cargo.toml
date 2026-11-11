@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 torus-tor.workspace = true
 torus-onion-key.workspace = true
+torus-host-api.workspace = true
 tokio.workspace = true
 zeroize = "1"

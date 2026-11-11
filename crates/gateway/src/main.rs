@@ -131,6 +131,11 @@ extern "C" {
     fn libc_getuid() -> u32;
 }
 
+/// On Windows a key's permissions are not checked when it is read: telling
+/// whether an access list lets anyone else in needs more than this program
+/// carries. Keys this program writes are made private as they are written
+/// (see [`write_key`]); one copied in from elsewhere keeps whatever access
+/// list it was given, so keep it in a folder only you can open.
 #[cfg(not(unix))]
 fn private_file(_: &Path, _: &File) -> Result<(), String> {
     Ok(())
@@ -149,7 +154,17 @@ fn private_dir(dir: &Path) -> Result<(), String> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("cannot protect {}: {e}", dir.display()))?;
     }
     #[cfg(not(unix))]
-    builder.create(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    {
+        let new = !dir.exists();
+        builder.create(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        // A folder made here gets nothing from the folders above: this user
+        // alone. One that was already there, which may be a folder of the
+        // user's own such as Documents, keeps its access list; the key
+        // written into it is made private by itself.
+        if new {
+            torus_host_api::make_private(dir).map_err(|e| format!("cannot protect {}: {e}", dir.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -170,6 +185,10 @@ fn write_key(path: &Path, key: &Identity) -> Result<(), String> {
         options.mode(0o600);
     }
     let mut file = options.open(&tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    // Windows has no mode to create it with: it is made private while still
+    // empty, before the key is written, and keeps that through the rename.
+    #[cfg(not(unix))]
+    torus_host_api::make_file_private(&tmp).map_err(|e| format!("cannot protect {}: {e}", tmp.display()))?;
     file.write_all(key.as_ref()).and_then(|_| file.sync_all()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("cannot save {}: {e}", path.display()))
 }

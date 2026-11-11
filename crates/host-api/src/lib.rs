@@ -931,6 +931,25 @@ pub fn make_private(folder: &Path) -> io::Result<()> {
 }
 
 
+/// Makes a file readable and writable by this user alone, whatever the
+/// folder it sits in passes on to it.
+pub fn make_file_private(file: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        confine::make_file_private(file)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
 #[cfg(not(windows))]
 pub fn remove_container(_container: &str, _programs: &[&Path]) {}
 

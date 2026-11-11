@@ -159,6 +159,17 @@ pub(crate) fn in_app_container() -> bool {
 /// sandboxes that every app package may use can look inside, wherever the
 /// folder sits.
 pub fn make_private(folder: &Path) -> io::Result<()> {
+    owner_only(folder, true)
+}
+
+/// The same for one file.
+pub fn make_file_private(file: &Path) -> io::Result<()> {
+    owner_only(file, false)
+}
+
+/// Leaves the user running this program the only one with any access to
+/// `path`, and, with `inherit`, to everything that will be put in it.
+fn owner_only(path: &Path, inherit: bool) -> io::Result<()> {
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::Win32::Security::Authorization::SET_ACCESS;
@@ -175,7 +186,7 @@ pub fn make_private(folder: &Path) -> io::Result<()> {
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: GENERIC_ALL.0,
             grfAccessMode: SET_ACCESS,
-            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            grfInheritance: if inherit { SUB_CONTAINERS_AND_OBJECTS_INHERIT } else { NO_INHERITANCE },
             Trustee: TRUSTEE_W {
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_USER,
@@ -187,7 +198,7 @@ pub fn make_private(folder: &Path) -> io::Result<()> {
         if SetEntriesInAclW(Some(&[entry]), None, &mut acl) != ERROR_SUCCESS {
             return Err(io::Error::other("could not describe the folder's permissions"));
         }
-        let path = wide(folder.as_os_str());
+        let path = wide(path.as_os_str());
         let set = SetNamedSecurityInfoW(
             PCWSTR(path.as_ptr()),
             SE_FILE_OBJECT,
@@ -199,7 +210,7 @@ pub fn make_private(folder: &Path) -> io::Result<()> {
         );
         LocalFree(Some(HLOCAL(acl.cast())));
         if set != ERROR_SUCCESS {
-            return Err(io::Error::other("could not make the folder private"));
+            return Err(io::Error::other("could not make it private"));
         }
         Ok(())
     }

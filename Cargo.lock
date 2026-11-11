@@ -7609,6 +7609,7 @@ name = "torus-gateway"
 version = "0.1.10"
 dependencies = [
  "tokio",
+ "torus-host-api",
  "torus-onion-key",
  "torus-tor",
  "zeroize",
