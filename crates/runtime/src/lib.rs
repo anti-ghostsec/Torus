@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -76,6 +76,11 @@ const SESSION_COOKIE: &str = "s";
 const MAX_CONNECTIONS: usize = 256;
 /// Large uploads being received at once. Each holds disk space until it ends.
 const MAX_UPLOADS: usize = 3;
+/// Pictures being received at once. A picture is read whole before it is
+/// decoded, so this is what bounds the memory pictures on their way in can
+/// hold: this many times the largest picture, whatever the number of
+/// connections.
+const MAX_PICTURES: usize = 8;
 /// Pictures being decoded at once. Decoding is the costliest thing a request can ask for.
 const MAX_DECODES: usize = 2;
 /// How many pages, feeds and puzzle pictures are made at once. They are
@@ -84,6 +89,18 @@ const MAX_DECODES: usize = 2;
 const MAX_RENDERS: usize = 2;
 /// How long a visitor may go without sending the next piece of a form.
 const BODY_IDLE: Duration = Duration::from_secs(120);
+/// The slowest a form may arrive, in bytes a second, over each
+/// [`PACE_WINDOW`] spent waiting for it. A visitor who sends a trickle,
+/// just fast enough never to be idle, would otherwise hold an upload slot,
+/// or a picture's memory, for as long as they like. Tor carries far more
+/// than this, even on a poor connection.
+const MIN_RATE: u64 = 16 * 1024;
+/// How long the pace of a form is measured over before it is judged, so
+/// that a stalled circuit that recovers is not cut off.
+const PACE_WINDOW: Duration = Duration::from_secs(60);
+/// Room for a video is set aside this much at a time, as it arrives, so
+/// that what a visitor says they will send holds no room for anyone else.
+const RESERVE_STEP: u64 = 64 * 1024 * 1024;
 /// How long a connection may sit with nothing moving either way while it
 /// waits on the visitor: for their next request, or for them to take more
 /// of an answer. A slow upload or download over Tor keeps moving, so this
@@ -160,6 +177,7 @@ struct Inner {
     work: tokio::sync::Notify,
     connections: Arc<Semaphore>,
     uploads: Semaphore,
+    pictures: Semaphore,
     decodes: Semaphore,
     renders: Semaphore,
     /// Bytes set aside for files still arriving, so that uploads at the
@@ -192,6 +210,7 @@ impl Live {
             work: tokio::sync::Notify::new(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             uploads: Semaphore::new(MAX_UPLOADS),
+            pictures: Semaphore::new(MAX_PICTURES),
             decodes: Semaphore::new(MAX_DECODES),
             renders: Semaphore::new(MAX_RENDERS),
             reserved: AtomicU64::new(0),
@@ -312,6 +331,25 @@ impl Live {
         }
         self.0.reserved.fetch_add(bytes, Ordering::Relaxed);
         Some(Reserved { live: self.clone(), bytes })
+    }
+
+    /// Sets aside more room for a file that is still arriving, up to `to`
+    /// bytes in all, if the site has it.
+    fn grow(&self, site: &Site, room: &mut Reserved, to: u64) -> bool {
+        let Some(more) = to.checked_sub(room.bytes).filter(|more| *more > 0) else { return true };
+        let store = self.store();
+        if !store.has_room_for(site, more.saturating_add(self.0.reserved.load(Ordering::Relaxed))) {
+            return false;
+        }
+        self.0.reserved.fetch_add(more, Ordering::Relaxed);
+        room.bytes = to;
+        true
+    }
+
+    /// Whether the site has room for `bytes` more, besides what is set aside.
+    fn has_room(&self, site: &Site, bytes: u64) -> bool {
+        let store = self.store();
+        store.has_room_for(site, bytes.saturating_add(self.0.reserved.load(Ordering::Relaxed)))
     }
 }
 
@@ -898,6 +936,53 @@ impl Drop for Reserved {
     }
 }
 
+/// Keeps a form arriving at least at [`MIN_RATE`]. Only time spent waiting
+/// on the visitor counts, not time this server spends on what has arrived.
+struct Pace {
+    /// Every byte of the body received so far.
+    received: Arc<AtomicU64>,
+    /// Time spent waiting in the window being measured.
+    waited: Duration,
+    /// What had been received when that window began.
+    counted: u64,
+}
+
+impl Pace {
+    fn new(received: Arc<AtomicU64>) -> Self {
+        Self { received, waited: Duration::ZERO, counted: 0 }
+    }
+
+    /// Notes `waited` more time spent waiting, by the end of which
+    /// `received` bytes had arrived in all. False once a whole window has
+    /// gone by with less than [`MIN_RATE`] arriving in it.
+    fn note(&mut self, waited: Duration, received: u64) -> bool {
+        self.waited += waited;
+        if self.waited < PACE_WINDOW {
+            return true;
+        }
+        let bytes = received.saturating_sub(self.counted);
+        let fast_enough = u128::from(bytes) * 1000 >= u128::from(MIN_RATE) * self.waited.as_millis();
+        self.waited = Duration::ZERO;
+        self.counted = received;
+        fast_enough
+    }
+
+    /// Waits for the next thing the visitor sends, refusing a visitor who
+    /// has gone quiet or is sending too slowly.
+    async fn wait<F: std::future::Future>(&mut self, next: F) -> Result<F::Output, Reply> {
+        let began = Instant::now();
+        let next = tokio::time::timeout(BODY_IDLE, next).await.map_err(|_| bad("That submission took too long to arrive.\n"))?;
+        if !self.note(began.elapsed(), self.received.load(Ordering::Relaxed)) {
+            return Err(plain(
+                StatusCode::REQUEST_TIMEOUT,
+                "That submission arrived too slowly. Try again when the connection is better.\n",
+                false,
+            ));
+        }
+        Ok(next)
+    }
+}
+
 impl Arrived {
     fn take(&mut self, field: &str) -> Option<(Staged, &'static str)> {
         let at = self.files.iter().position(|(name, ..)| name == field)?;
@@ -967,11 +1052,14 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
     // Counted as it arrives, so the frame under the form can say how far it has got.
     let tracked = Tracked::begin(live, &req);
     let counter = tracked.as_ref().map(|t| t.arriving.clone());
+    let received = Arc::new(AtomicU64::new(0));
+    let mut pace = Pace::new(received.clone());
     let stream = BodyStream::new(req.into_body()).filter_map(move |frame| {
-        let counter = counter.clone();
+        let (counter, received) = (counter.clone(), received.clone());
         async move {
             match frame {
                 Ok(frame) => frame.into_data().ok().map(|data| {
+                    received.fetch_add(data.len() as u64, Ordering::Relaxed);
                     if let Some(counter) = &counter {
                         counter.received.fetch_add(data.len() as u64, Ordering::Relaxed);
                     }
@@ -988,11 +1076,11 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
     let mut text_bytes = 0usize;
     let mut parts_left = (4 * (fields.len() + FORM_CONTROLS.len())).max(32);
     let known = |name: &str| FORM_CONTROLS.contains(&name) || fields.iter().any(|f| f.name == name);
+    let busy = || plain(StatusCode::TOO_MANY_REQUESTS, "Too many uploads are in progress. Try again shortly.\n", false);
+    let no_room = || plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false);
 
     loop {
-        let next = tokio::time::timeout(BODY_IDLE, parts.next_field())
-            .await
-            .map_err(|_| bad("That submission took too long to arrive.\n"))?;
+        let next = pace.wait(parts.next_field()).await?;
         let mut part = match next {
             Ok(Some(part)) => part,
             Ok(None) => break,
@@ -1011,7 +1099,7 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
             // fields is known. Anything else is read past, still counted.
             let keep = known(&name);
             let mut value = Vec::new();
-            while let Some(piece) = piece(&mut part).await? {
+            while let Some(piece) = piece(&mut part, &mut pace).await? {
                 text_bytes += piece.len();
                 if text_bytes > MAX_FORM_BYTES {
                     return Err(too_large());
@@ -1034,18 +1122,25 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
         let needed = announced.map_or(max, |announced| announced.min(max));
         match field.kind {
             FieldKind::Image => {
-                let mut picture = Vec::new();
-                while let Some(piece) = piece(&mut part).await? {
+                // A file input left empty still sends a part, with nothing in it.
+                let Some(first) = piece(&mut part, &mut pace).await? else { continue };
+                // Taken before any of the picture is held, and held until
+                // it has been decoded and dropped.
+                let _held = live.0.pictures.try_acquire().map_err(|_| busy())?;
+                let mut picture = first.to_vec();
+                if picture.len() as u64 > max {
+                    return Err(too_large());
+                }
+                while let Some(piece) = piece(&mut part, &mut pace).await? {
                     if (picture.len() + piece.len()) as u64 > max {
                         return Err(too_large());
                     }
                     picture.extend_from_slice(&piece);
                 }
-                // A file input left empty still sends a part, with nothing in it.
                 if picture.is_empty() {
                     continue;
                 }
-                let room = live.reserve(&site, needed).ok_or_else(|| plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false))?;
+                let room = live.reserve(&site, needed).ok_or_else(no_room)?;
                 submission.arrived.reserved.push(room);
                 // Decoding is the costly step, so it runs off the request
                 // threads, and only a few at a time.
@@ -1060,7 +1155,7 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 let mut start = Vec::new();
                 let mut ended = false;
                 while start.len() < 12 && !ended {
-                    match piece(&mut part).await? {
+                    match piece(&mut part, &mut pace).await? {
                         Some(piece) => start.extend_from_slice(&piece),
                         None => ended = true,
                     }
@@ -1069,8 +1164,12 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                     continue;
                 }
                 let content_type = blobs::video_type(&start).ok_or_else(|| bad("That is not an MP4 or WebM video.\n"))?;
-                let room = live.reserve(&site, needed).ok_or_else(|| plain(StatusCode::INSUFFICIENT_STORAGE, "This site has no room for more files.\n", false))?;
-                submission.arrived.reserved.push(room);
+                // A video that plainly will not fit is refused now rather
+                // than at the end. Room is set aside only as it arrives.
+                if !live.has_room(&site, needed) {
+                    return Err(no_room());
+                }
+                let mut room = live.reserve(&site, RESERVE_STEP.min(max)).ok_or_else(no_room)?;
                 let backlog = {
                     let store = live.store();
                     store.hold_videos && store.unconverted().len() >= MAX_WAITING_VIDEOS
@@ -1082,7 +1181,6 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                         false,
                     ));
                 }
-                let busy = || plain(StatusCode::TOO_MANY_REQUESTS, "Too many uploads are in progress. Try again shortly.\n", false);
                 let _slot = live.0.uploads.try_acquire().map_err(|_| busy())?;
                 let mut writer = blobs::Writer::new(target.clone()).map_err(|_| unavailable())?;
                 // Blanks what the camera or editor recorded about itself, as the file streams past.
@@ -1092,11 +1190,14 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                 scrubber.push(&start, &mut cleaned);
                 writer.write(&cleaned).map_err(|_| too_large())?;
                 while !ended {
-                    match piece(&mut part).await? {
+                    match piece(&mut part, &mut pace).await? {
                         Some(piece) => {
                             size += piece.len() as u64;
                             if size > max {
                                 return Err(too_large());
+                            }
+                            if size > room.bytes && !live.grow(&site, &mut room, size.saturating_add(RESERVE_STEP).min(max)) {
+                                return Err(no_room());
                             }
                             cleaned.clear();
                             scrubber.push(&piece, &mut cleaned);
@@ -1124,6 +1225,7 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
                     ));
                 }
                 let staged = writer.finish().map_err(|_| unavailable())?;
+                submission.arrived.reserved.push(room);
                 // An MP4 whose index came last gets it moved to the front,
                 // so that playback can start before the whole file is fetched.
                 let staged = if content_type == "video/mp4" {
@@ -1142,11 +1244,8 @@ async fn read_submission(live: &Live, fields: &[Field], req: Request<Incoming>) 
 }
 
 /// The next piece of one part of a multipart form.
-async fn piece(part: &mut multer::Field<'_>) -> Result<Option<Bytes>, Reply> {
-    tokio::time::timeout(BODY_IDLE, part.chunk())
-        .await
-        .map_err(|_| bad("That submission took too long to arrive.\n"))?
-        .map_err(|_| bad("That submission could not be read.\n"))
+async fn piece(part: &mut multer::Field<'_>, pace: &mut Pace) -> Result<Option<Bytes>, Reply> {
+    pace.wait(part.chunk()).await?.map_err(|_| bad("That submission could not be read.\n"))
 }
 
 /// Turns a submission into a record's fields, or says what is wrong with it.
@@ -1667,5 +1766,54 @@ mod room {
         assert!(live.reserve(&site, whole / 2).is_some(), "room given back was not reusable");
         drop(second);
         assert_eq!(live.0.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    /// Room for a video grows as it arrives, never past the owner's limit,
+    /// and is all given back at the end.
+    #[test]
+    fn room_grows_as_a_file_arrives() {
+        let mut site = torus_core::starters::by_name("board").expect("a starter");
+        site.limits.storage_mb = 1;
+        let live = Live::new(site.clone());
+        let whole = site.limits.storage_bytes();
+        let mut room = live.reserve(&site, whole / 4).expect("room for a quarter");
+        assert!(live.grow(&site, &mut room, whole / 2), "half did not fit");
+        assert!(live.grow(&site, &mut room, whole / 4), "asking for less than is held is no change");
+        assert_eq!(room.bytes, whole / 2);
+        let other = live.reserve(&site, whole / 2).expect("room for the other half");
+        assert!(!live.grow(&site, &mut room, whole / 2 + 1), "grew past the limit");
+        assert!(!live.has_room(&site, 1));
+        drop(other);
+        assert!(live.has_room(&site, whole / 2));
+        drop(room);
+        assert_eq!(live.0.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    /// A visitor who sends a trickle is cut off once a whole window has
+    /// gone by too slowly; one who keeps up, or stalls and catches up, is not.
+    #[test]
+    fn a_trickle_is_refused_and_a_steady_upload_is_not() {
+        let window = PACE_WINDOW.as_secs();
+        let mut steady = Pace::new(Arc::default());
+        let mut total = 0;
+        for _ in 0..10 * window {
+            total += MIN_RATE;
+            assert!(steady.note(Duration::from_secs(1), total), "a steady upload was refused");
+        }
+
+        // Stalled for most of a window, then caught up within it.
+        let mut stalled = Pace::new(Arc::default());
+        assert!(stalled.note(Duration::from_secs(window - 5), 0));
+        assert!(stalled.note(Duration::from_secs(5), MIN_RATE * window));
+
+        // A few bytes at a time, never idle long enough to be timed out.
+        let mut trickle = Pace::new(Arc::default());
+        let mut total = 0;
+        let mut refused = false;
+        for _ in 0..2 * window {
+            total += MIN_RATE / 4;
+            refused |= !trickle.note(Duration::from_secs(1), total);
+        }
+        assert!(refused, "a trickle was let through");
     }
 }
