@@ -28,6 +28,11 @@ debug-assertions = false
 overflow-checks = false
 debug = false
 
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 # Amounts of money are added up in places: a sum that wrapped around would
 # be a wrong balance, worse than stopping.
