@@ -133,7 +133,7 @@ jobs:
           # Signed with Torus's key, not some other one.
           certs=$("$BT/apksigner" verify --print-certs "Torus_${TAG#v}_arm64.apk")
           printf '%s\n' "$certs"
-          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer.*certificate SHA-256 digest: //p' | head -1)
+          got=$(printf '%s\n' "$certs" | sed -n 's/^.*[Ss]igner.*certificate SHA-256 digest: //p' | head -1)
           echo "Signing certificate SHA-256: $got"
           [ "$got" = "$(tr -d '[:space:]' < app/src-tauri/gen/android/release-cert.sha256)" ] || { echo "::error::Signed with $got, not Torus's release key" >&2; exit 1; }
 
