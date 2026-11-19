@@ -2,12 +2,13 @@
 # Android app and publishes them as a GitHub release. Runs when a version tag
 # (v1.2.3) is pushed, or by hand.
 #
-# To sign the Android app with your own key, add these repository secrets:
-#   ANDROID_KEYSTORE_BASE64  the keystore file, base64-encoded
-#   ANDROID_KEYSTORE_PASSWORD
-#   ANDROID_KEY_ALIAS
-# Without them the APK is signed with a throwaway key made for that run, so a
-# later release cannot be installed over it.
+# The Android app is signed with Torus's release key, from these repository
+# secrets:
+#   ANDROID_KEYSTORE_BASE64    the PKCS12 keystore, base64-encoded
+#   ANDROID_KEYSTORE_PASSWORD  its password (also the key's); the key's alias is torus
+# Without them the release fails: an APK signed with any other key can't be
+# installed over the one before. The signed APK must carry the certificate
+# whose SHA-256 is in app/src-tauri/gen/android/release-cert.sha256.
 name: Release
 
 on:
@@ -30,7 +31,18 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       NDK_VERSION: 29.0.14206865
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # No release without the signing key: checked before hours of building.
+      - name: Release key present
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Set the ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD secrets: no release without Torus's key."
+            exit 1
+          fi
 
       - name: Free disk space
         run: |
@@ -43,12 +55,12 @@ jobs:
           sudo apt-get install -y mingw-w64 nsis nasm yasm pkg-config autoconf automake libtool \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: "21"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -65,7 +77,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Video converter (FFmpeg) for Linux, Windows and Android
         run: |
@@ -104,24 +116,24 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
-          BT="$ANDROID_HOME/build-tools/37.0.0"
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
-          else
-            echo "::warning::No signing key in the repository secrets; using a throwaway key."
-            KEYSTORE_PASSWORD=$(openssl rand -hex 16)
-            KEY_ALIAS=torus
-            keytool -genkeypair -keystore release.jks -alias "$KEY_ALIAS" -keyalg RSA -keysize 4096 \
-              -validity 10000 -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -dname "CN=Torus"
+          set -eu
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Set the ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD secrets: no release without Torus's key."
+            exit 1
           fi
+          BT="$ANDROID_HOME/build-tools/37.0.0"
+          ks="$RUNNER_TEMP/release.p12"
+          trap 'rm -f "$ks" aligned.apk' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$ks"
           APK=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*release-unsigned.apk' | head -1)
           "$BT/zipalign" -f -p 4 "$APK" aligned.apk
-          "$BT/apksigner" sign --ks release.jks --ks-key-alias "$KEY_ALIAS" --ks-pass "pass:$KEYSTORE_PASSWORD" \
+          "$BT/apksigner" sign --ks "$ks" --ks-key-alias torus --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD \
             --out "Torus_${TAG#v}_arm64.apk" aligned.apk
-          "$BT/apksigner" verify "Torus_${TAG#v}_arm64.apk"
-          rm -f release.jks aligned.apk
+          # Signed with Torus's key, not some other one.
+          got=$("$BT/apksigner" verify --print-certs "Torus_${TAG#v}_arm64.apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          echo "Signing certificate SHA-256: $got"
+          [ "$got" = "$(tr -d '[:space:]' < app/src-tauri/gen/android/release-cert.sha256)" ] || { echo "::error::Signed with $got, not Torus's release key" >&2; exit 1; }
 
       - name: Publish the release
         env:
